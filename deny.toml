@@ -6,7 +6,7 @@ yanked = "warn"
 # Everything below arrives with the egui/eframe windowing stack and none of it is on the
 # path of a .wav or .mp3: the two quick-xml vulnerabilities need untrusted XML, which
 # this app never parses, and the unmaintained crates are Windows/Linux glue. Revisit
-# when egui moves past 0.30 (roadmap: gaps, item 11).
+# when egui moves past 0.30 (roadmap: the platform-coverage gap).
 ignore = [
     "RUSTSEC-2024-0436", # paste, unmaintained (pulled in by the font stack)
     "RUSTSEC-2026-0192", # quick-xml: quadratic duplicate-attribute check

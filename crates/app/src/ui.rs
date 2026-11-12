@@ -23,6 +23,8 @@ pub struct Prepared {
     pub cutoff_hz: u32,
     pub render_secs: f64,
     pub audio_secs: f64,
+    pub peak_before: f32,
+    pub limited_samples: usize,
 }
 
 /// Progress the worker thread publishes while it runs.
@@ -203,6 +205,16 @@ impl PlayerApp {
             .weak()
             .size(11.0),
         );
+        if prepared.limited_samples > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "peaks limited: {:.2} -> full scale, {} samples above the knee",
+                    prepared.peak_before, prepared.limited_samples
+                ))
+                .weak()
+                .size(11.0),
+            );
+        }
         ui.label(
             egui::RichText::new("the top band is generated, not recovered")
                 .weak()

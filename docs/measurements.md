@@ -146,6 +146,38 @@ A 30.72 s stereo 48 kHz clip (the `music_cut16k` fixture tiled six times), rende
 window itself is not verified visually here (the agent has no screen-recording
 permission), only that the process runs clean.
 
+## Real music: three MP3s from a user's library (2026-11-12)
+
+Synthetic fixtures do not overshoot, do not have 44.1 kHz sources and do not have real
+spectra. These three do:
+
+| track | bitrate | source | detected cutoff | energy above 21 kHz |
+|---|---|---|---|---|
+| EP Hope Is the Thing With Feathers | 192 kbps | 44.1 kHz stereo, 175.6 s | 14062 Hz | 0.0256 % |
+| PROI PROI | 126 kbps | 44.1 kHz stereo, 235.1 s | 13734 Hz | 0.0006 % |
+| Weight of the World | 192 kbps | 44.1 kHz stereo, 344.2 s | 12632 Hz | 0.0009 % |
+
+All three are band-limited by a wide margin (the full-band threshold is 1 %), so all
+three get enhanced. The 44.1 → 48 kHz resample path is exercised for the first time and
+the duration is preserved to the frame.
+
+Render, first track: **136.9 s of wall clock for 175.6 s of audio**, including the 8 s
+worker start. That is RTF 0.78, against 0.543 for the worker alone: the difference is
+decode, 44.1 → 48 kHz resampling, the Chebyshev preprocess and the WAV write.
+
+And the finding that matters: **the model overshoots full scale.** Peak was **1.36**
+(2.7 dB over), with 10,014 samples past ±1.0 in a 2-minute track. Nothing was limiting
+it, so playback would have clipped. `limit.rs` now applies a soft knee above 0.9:
+after it, peak **0.999**, zero samples at or past full scale, 53,294 samples shaped
+(0.6 % of the file) and RMS 0.2712 instead of 0.2714 — the level did not move.
+
+| | before the limiter | after |
+|---|---|---|
+| peak | 1.3622 | 0.999 |
+| samples ≥ full scale | 10,014 | 0 |
+| RMS | 0.2714 | 0.2712 |
+| samples the knee touched | — | 53,294 (0.6 %) |
+
 Borrowed from P1, and **not** transferable to M1:
 
 | number | value | source |

@@ -149,7 +149,9 @@ release where it should land.
    cache container from ADR-003 does not exist yet. WAV is also 3× larger.
 2. **No loudness match.** Measured +0.57 dB on a steady track, so the A/B switch steps in
    level as well as in brightness. That makes the comparison slightly dishonest and it is
-   exactly what E2-6 was written for.
+   exactly what E2-6 was written for. (Peak protection is now in place: a soft knee above
+   0.9, because the model overshot full scale by 2.7 dB on real music. That fixes
+   distortion, not the level step.)
 3. **No low-band preservation.** The model regenerates the whole waveform: level-matched,
    the output differs from the input by −18.7 dB RMS below 12 kHz and gains +2.9 dB in
    4–12 kHz. Upstream's `mel_replace_ops` splices the input back below the cutoff; try it
@@ -160,26 +162,30 @@ release where it should land.
    device path are what make streaming possible; only the scheduler is missing.
 6. **No visual feedback of its own.** No spectrum and no waveform (ADR-005 called for a
    spectrum). The window is text, a button and a bar.
+7. **No full-scale policy beyond the limiter.** The original is played as decoded, so a
+   master that already peaks above 1.0 clips at the device exactly as it would in any
+   player; the enhanced side is limited to 0.999 while the original is not, which can make
+   the toggle differ by a few tenths of a dB on hot material.
 
 **v0.3, or when the prototype becomes something to hand over**
 
-7. **No cache.** Every play re-renders. A second play of the same file costs the same as
+8. **No cache.** Every play re-renders. A second play of the same file costs the same as
     the first, and the seed policy (ADR-006) is only useful once the result is stored.
-8. **Setup is verified in pieces, not end to end.** The uv download, the HF listing, the
+9. **Setup is verified in pieces, not end to end.** The uv download, the HF listing, the
    state machine and the weights script each have evidence; nobody has run the full 6 GB
    install on a clean machine. The `git+` install of the inference package is untested.
-9. **The worker is not supervised.** If it dies mid-render the app errors out; there is no
+10. **The worker is not supervised.** If it dies mid-render the app errors out; there is no
    restart, and a wedged model with no output blocks the render thread forever.
-10. **Platform coverage is one machine.** CoreAudio only; the uv archive path is
+11. **Platform coverage is one machine.** CoreAudio only; the uv archive path is
     macOS/Linux (Windows needs a `.zip`); 44.1 kHz device output is resampled but 96 kHz
     and mono devices are untested.
-11. **Metadata is the filename.** No title, artist or duration from tags, no drag and drop.
+12. **Metadata is the filename.** No title, artist or duration from tags, no drag and drop.
 
 **Explicitly parked**
 
-12. Playlists, library view, EQ, export UI, system-wide sink, live capture: unchanged from
+13. Playlists, library view, EQ, export UI, system-wide sink, live capture: unchanged from
     the MVP cut below, and none of them are blocked by the gaps above.
-13. `flacify probe --rtf` still defaults to 0.3. The app now knows how to measure this for
+14. `flacify probe --rtf` still defaults to 0.3. The app now knows how to measure this for
     real (the render prints its own RTF); folding that into a saved hardware profile is
     v0.2 work.
 

@@ -7,6 +7,7 @@
 
 mod decode;
 mod device;
+mod limit;
 mod player;
 mod render;
 mod setup;
@@ -123,13 +124,15 @@ fn worker_config(paths: &setup::Paths) -> Result<WorkerConfig> {
 }
 
 fn probe(path: &Path, rtf: f64) -> Result<()> {
-    let (track, analysis) = render::load(path)?;
+    let loaded = render::load(path)?;
+    let (track, analysis) = (&loaded.track, &loaded.analysis);
     let seconds = track.frames as f64 / f64::from(SAMPLE_RATE);
     let plan = plan(&Probe::from_rtf(rtf), 5.12, Some(seconds));
 
     println!("file      {}", path.display());
     println!(
-        "format    48000 Hz, 2 ch, {} frames ({seconds:.2} s)",
+        "format    {}, {} frames ({seconds:.2} s)",
+        loaded.format_label(),
         track.frames
     );
     println!(
@@ -279,7 +282,9 @@ fn prepare(
     let fail = |error: anyhow::Error| format!("{error:#}");
 
     progress.set_status("decoding");
-    let (track, analysis) = render::load(file).map_err(fail)?;
+    let render::Loaded {
+        track, analysis, ..
+    } = render::load(file).map_err(fail)?;
     progress.set_total(track.frames);
     progress.set_done(track.frames);
     let audio_secs = track.frames as f64 / f64::from(SAMPLE_RATE);
@@ -292,6 +297,8 @@ fn prepare(
             cutoff_hz: analysis.cutoff_hz,
             render_secs: 0.0,
             audio_secs,
+            peak_before: 0.0,
+            limited_samples: 0,
         });
     }
 
@@ -301,7 +308,7 @@ fn prepare(
     ));
     progress.set_done(0);
     let started = Instant::now();
-    let planar = render::enhance(
+    let rendered = render::enhance(
         &track,
         Some(analysis.cutoff_hz),
         config,
@@ -314,7 +321,9 @@ fn prepare(
     Ok(ui::Prepared {
         track_name: file_name(file),
         original: track.interleaved(),
-        enhanced: Some(render::interleave_stereo(&planar, track.frames)),
+        enhanced: Some(render::interleave_stereo(&rendered.planar, track.frames)),
+        peak_before: rendered.limit.peak_before,
+        limited_samples: rendered.limit.limited_samples,
         cutoff_hz: analysis.cutoff_hz,
         render_secs,
         audio_secs,

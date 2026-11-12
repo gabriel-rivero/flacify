@@ -629,18 +629,19 @@ fn is_executable(path: &Path) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return false;
     };
+    // Written this way so both platform branches are one expression: the `if`/`return`
+    // shape left a `bool` literal behind on Windows and clippy 1.100 called it.
     if !metadata.is_file() {
         return false;
     }
     #[cfg(unix)]
-    {
+    let executable = {
         use std::os::unix::fs::PermissionsExt;
         metadata.permissions().mode() & 0o111 != 0
-    }
+    };
     #[cfg(not(unix))]
-    {
-        true
-    }
+    let executable = true;
+    executable
 }
 
 /// The release archive for this platform.

@@ -16,4 +16,3 @@ path = "src/bin/fake_worker.rs"
 [dependencies]
 flacify-core.workspace = true
 thiserror.workspace = true
-tracing.workspace = true

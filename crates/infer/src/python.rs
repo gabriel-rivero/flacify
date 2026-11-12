@@ -438,7 +438,8 @@ impl Connection {
             Ok(Some(status)) => {
                 self.wrap_up();
                 Err(Error::Inference(format!(
-                    "the worker exited before the request: {status}{}",
+                    "the worker exited before the request: {}{}",
+                    exit_label(status),
                     self.stderr_note()
                 )))
             }
@@ -455,7 +456,7 @@ impl Connection {
         let fate = match status {
             Some(status) => {
                 self.wrap_up();
-                format!("the worker exited: {status}")
+                format!("the worker exited: {}", exit_label(status))
             }
             None => "the worker is still running".to_string(),
         };
@@ -559,6 +560,15 @@ fn drain_stderr(stderr: std::process::ChildStderr, tail: &Mutex<VecDeque<String>
 }
 
 /// Check that a window reply has the shape of the window that was asked for.
+/// `exit code 7` on every platform. `ExitStatus` renders as "exit status: 7" on unix
+/// and "exit code: 7" on Windows, and this string ends up in a user-facing error.
+fn exit_label(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "killed by a signal".to_string(),
+    }
+}
+
 fn check_window_reply(reply: &Reply, request: &Request) -> Result<()> {
     if reply.channels != request.channels || reply.frames != request.frames {
         return Err(Error::Inference(format!(

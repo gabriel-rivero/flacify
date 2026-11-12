@@ -115,7 +115,7 @@ fn given_the_worker_exits_mid_session_when_the_next_window_runs_then_it_is_an_in
     let err = worker.run(&input, &noise, 2, WINDOW).unwrap_err();
     match &err {
         Error::Inference(message) => {
-            assert!(message.contains("exit status: 7"), "{message}");
+            assert!(message.contains("exit code 7"), "{message}");
             assert!(message.contains("exiting after 1 window"), "{message}");
         }
         other => panic!("expected an inference error, got {other:?}"),
@@ -133,7 +133,7 @@ fn given_the_worker_exits_mid_session_when_the_next_window_runs_then_it_is_an_in
         err.to_string().contains("exited before the request"),
         "{err}"
     );
-    assert!(err.to_string().contains("exit status: 7"), "{err}");
+    assert!(err.to_string().contains("exit code 7"), "{err}");
     worker.shutdown();
 }
 

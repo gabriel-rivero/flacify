@@ -20,7 +20,10 @@ confidence-threshold = 0.9
 
 [bans]
 multiple-versions = "warn"
+# The three workspace crates depend on each other by path; a path dep with no version
+# requirement is a wildcard, and they are never published.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

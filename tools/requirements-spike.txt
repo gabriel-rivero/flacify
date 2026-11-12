@@ -1,18 +1,29 @@
 # Dependencies for the ONNX export spike only. Nothing here ships: the app's runtime
 # has no Python, and the exported .onnx file is the artifact these produce.
 #
-#   python3 -m venv .venv && . .venv/bin/activate
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu   # or cu124/mps
-#   pip install -r tools/requirements-spike.txt
-#   git clone https://github.com/jakeoneijk/FlashSR_Inference ./flashsr
+# These versions are the ones verified on 2026-11-12 (Python 3.12, Apple M5 Max):
+# torch 2.15.0, onnx 1.23.2, onnxruntime 1.31.1, librosa 1.0.1.
 #
-# The FlashSR inference package itself is not on PyPI:
-#   pip install git+https://github.com/jakeoneijk/FlashSR_Inference
-# or clone it and pass --flashsr-dir ./flashsr.
+#   uv venv --python 3.12 .venv && . .venv/bin/activate
+#   pip install -r tools/requirements-spike.txt
+#   git clone https://github.com/jakeoneijk/FlashSR_Inference tools/flashsr
+#   pip install -e tools/flashsr --no-deps
+#
+# The weights are a separate download, in the dataset repo `jakeoneijk/FlashSR_weights`:
+#   student_ldm.pth 1.03 GB, sr_vocoder.pth 0.63 GB, vae.pth 1.66 GB
 
 torch>=2.0
 onnx>=1.16
 onnxruntime>=1.18
+
+# torch's dynamo exporter needs onnxscript, and dynamo is the only exporter that can
+# write this graph: 2.5 GB of weights is past protobuf's 2 GB limit, so they have to
+# go to a sidecar .onnx.data file.
+onnxscript>=0.1
+
+# Only for the fp16 experiment in docs/measurements.md (converting the exported graph;
+# torch's own exporter has no fp16 flag that keeps the reference comparable).
+onnxconverter-common>=1.15
 
 numpy
 scipy>=1.10
@@ -22,3 +33,10 @@ einops
 pyyaml
 tqdm
 huggingface_hub>=0.20
+
+# Upstream's UtilAudio imports all three at module load and prints a misleading
+# "import error: torch" when torchaudio is missing. Nothing in the export needs them,
+# but a clean import makes a real failure visible.
+torchaudio
+pydub
+psutil

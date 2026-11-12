@@ -197,13 +197,21 @@ engine asks the graph instead of assuming the audio length.
 
 | decision | choice | reason |
 |---|---|---|
-| graph format | ONNX, opset 17 | widest EP coverage; verifiable artifacts |
-| shapes | static per export: `cond` and the output are `2×245760`, noise is the latent grid | CoreML prefers static; enables shape-specific kernels |
-| dtype | fp32 export, fp16 weights+compute on CoreML | bf16 is a CUDA win; CoreML wants fp16 |
+| graph format | ONNX, **opset 18** | the dynamo exporter needs 18+ and the TorchScript one cannot write a graph past protobuf's 2 GB; weights go to a `flashsr.onnx.data` sidecar (measured: 8.5 MB graph + 2.46 GB data) |
+| shapes | static per export: `cond` and the output are `2×245760`, noise is the latent grid (`2×16×64×32` as exported) | CoreML prefers static; enables shape-specific kernels |
+| dtype | fp32 export; fp16 tried for CoreML and measured, see below | bf16 is a CUDA win; CoreML wants fp16 |
 | VAE encode | posterior **mean**, not `sample()` | `sample()` is a second unseeded RNG; ADR-006 wants one explicit noise input |
 | window flexibility | **one graph, fixed 5.12 s** | 4 window sizes = 4 graphs ≈ 4× disk. See below |
 | EP order (macOS) | CoreML → CPU | no CUDA exists on Apple Silicon |
 | EP order (Win/Linux) | TensorRT → CUDA → DirectML → CPU | consumers rarely have a CUDA toolkit |
+
+**Measured outcome (2026-11-12, M5 Max).** The numeric gate passes and the throughput
+gate fails, on every ONNX Runtime configuration tried: CPU EP RTF 21.5, CoreML with fp32
+NeuralNetwork 31.1, fp16 NeuralNetwork 21.7, fp16 MLProgram + ALL units 15.2, against a
+gate of 1.5. PyTorch on Metal runs the same weights at RTF 0.51. The model is fast enough;
+ONNX Runtime is what is slow, and the CoreML EP mostly fell back to CPU. The numbers and
+the method are in [`measurements.md`](measurements.md); the open decision is backlog
+E1-4 to E1-6.
 
 **The window-size cost.** Supporting 0.64 / 1.28 / 2.56 / 5.12 s at full quality
 means either dynamic axes (CoreML EP handles these poorly) or four copies of a

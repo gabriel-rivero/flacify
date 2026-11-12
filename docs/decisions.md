@@ -30,18 +30,35 @@ dropped; the code path is shared, so it stays honest.
 
 ## ADR-002 — ONNX Runtime as the inference backend
 
-**Status:** proposed, closed by the v0.0 spike
+**Status:** **reopened** by its own spike (2026-11-12). The numeric half passed, the
+throughput half failed on every configuration tried.
 **Context:** The PoC needs Python, torch, librosa, scipy and 3.3 GB of weights. A
 player that installs its own dependencies cannot ship that.
 
-**Decision:** export one static-shape ONNX graph and run it through `ort`, with
-CoreML EP on macOS and DirectML/CUDA on Windows and Linux. Alternative runtimes are
-measured in the same spike (candle + Metal, MLX) and this ADR is rewritten with the
-numbers.
+**Decision (as written before the spike):** export one static-shape ONNX graph and run
+it through `ort`, with CoreML EP on macOS and DirectML/CUDA on Windows and Linux.
+Alternative runtimes are measured in the same spike (candle + Metal, MLX) and this ADR
+is rewritten with the numbers.
 
 **Consequences:** No Python at runtime; ~40 MB dylib instead of ~7 GB. New risk: EP
 coverage and per-node CPU fallback. The export becomes a build artifact that must be
 verified numerically, not just executed.
+
+**Outcome of the spike (M5 Max, 2026-11-12, numbers in `measurements.md`):**
+
+| criterion | target | measured |
+|---|---|---|
+| ONNX vs PyTorch, per window | ≤ −40 dB | **−74.07 dB** on the export fixture, **−47.78 dB** worst of four tracks: pass |
+| sustained RTF | ≤ 1.5 | 21.5 (CPU EP), 31.1 (CoreML fp32), 21.7 (CoreML fp16), 15.2 (CoreML fp16 MLProgram): **fail** |
+| same weights under PyTorch/Metal | — | RTF **0.51**: the hardware is not the problem |
+
+The graph is numerically sound and executable, which was the export question. What fails
+is ONNX Runtime itself on this hardware: it is 30 to 60x slower than PyTorch, and the
+CoreML EP largely falls back to CPU. The decision therefore stands open: either ONNX
+Runtime is dropped for a runtime that can reach Metal (libtorch via `tch`, candle, MLX),
+or the graph is split so the heavy convolutions are not interleaved with the ops CoreML
+refuses. Backlog E1-4 to E1-6 carry the options; v0.0 does not pass until one of them
+does.
 
 ---
 

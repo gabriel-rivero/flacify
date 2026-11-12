@@ -20,13 +20,14 @@ doc line that would have been wrong. No issue closes on "works on my machine".
 
 | # | title | acceptance |
 |---|---|---|
-| E1-1 | `tools/export_onnx.py`: FlashSR → ONNX, fixed shapes `1×2×245760`, fp32 | file loads in `onnxruntime` Python and produces audio |
-| E1-2 | Fold the one-step scheduler into the graph; noise becomes an input | same noise tensor → identical output to PyTorch, ≤ −40 dB |
-| E1-3 | Numeric comparison harness (PyTorch vs ONNX, 5 tracks, fixed seed) | fails loudly below −40 dB; JSON report per track |
-| E1-4 | `ort` session in Rust, all EPs enumerated, partition logged | prints which EP runs which node, with a CPU-node count |
-| E1-5 | Sustained RTF benchmark on the M5 Max (10-window median + 60 s run) | `rtf_p50`, `rtf_p95`, `rtf_sustained`, peak memory in one JSON |
-| E1-6 | 30 s of audio through the Rust path to `cpal` | audible output, no dropout, RTF logged |
-| E1-7 | Close ADR-002 with the measured winner (CoreML / candle-Metal / MLX) | numbers in the ADR, not adjectives |
+| E1-1 | `tools/export_onnx.py`: FlashSR → ONNX, fixed shapes `1×2×245760`, fp32 | **done**: loads in onnxruntime and produces audio; graph is opset 18 with a 2.46 GB external-data sidecar |
+| E1-2 | Fold the one-step scheduler into the graph; noise becomes an input | **done**: same noise tensor → −74.07 dB vs PyTorch |
+| E1-3 | Numeric comparison harness (PyTorch vs ONNX, tracks, fixed seed) | **done, 4 synthetic tracks**: worst −47.78 dB, all pass; E8-1's real corpus still needed for the five-track claim |
+| E1-4 | Pick a runtime that reaches the GPU: ONNX Runtime is 30–60x slower than PyTorch/Metal (E1-5) | sustained RTF ≤ 1.5 on the M5 Max through the chosen runtime |
+| E1-5 | Sustained RTF benchmark, all candidate runtimes, one JSON each | **done for the ONNX path** (`tools/bench_onnx.py`): CPU 21.5, CoreML 31.1 / 21.7 / 15.2, PyTorch MPS 0.51 |
+| E1-6 | Split the graph if the runtime survives: encode, unet, decode+vocoder as separate graphs | each graph's EP partition logged; the STFT/mel front-end is not interleaved with convolutions |
+| E1-7 | 30 s of audio through the Rust path to `cpal` | audible output, no dropout, RTF logged |
+| E1-8 | Close ADR-002 with the measured winner (CoreML / candle-Metal / MLX / libtorch) | numbers in the ADR, not adjectives |
 
 ## E2 — Core DSP (v0.1)
 
@@ -117,22 +118,25 @@ doc line that would have been wrong. No issue closes on "works on my machine".
 
 ## State of the scaffold (2026-11-12)
 
-What actually exists, with its evidence. Everything here is uncommitted and the repo has
-no git history yet.
+What actually exists, with its evidence. The Rust workspace and the export are
+committed and pushed to `gabriel-rivero/flacify`; CI is green on all three jobs.
 
 | issue | state | evidence |
 |---|---|---|
 | E0-1 | **done** | `cargo test --workspace` green with no GPU, no device, no model: 19 lib + 1 fixture + 11 pipeline + 8 infer tests |
-| E0-2 | **drafted, unverified** | `.github/workflows/ci.yml` exists and has never run on GitHub |
+| E0-2 | **done** | `.github/workflows/ci.yml` green on GitHub (build/lint/test, tooling parse, cargo-deny); the first two runs caught a real `cargo-deny` bans failure on the path dependencies |
 | E0-3 | partial | `LICENSE` (MIT) only; no CONTRIBUTING or templates |
-| E0-4 | **done** | `docs/measurements.md`; the model numbers are explicitly marked unmeasured, not guessed |
+| E0-4 | **done** | `docs/measurements.md`, including the numbers the spike produced |
 | E2-1 | **done** | `crates/core/src/upscaler.rs`; identity run reproduces the input within one ULP |
 | E2-2 | **done** | exact-length test over lengths 1…5000 × overlaps 0/1/7/512 × chunk sizes 1…4096 |
 | E2-3 | **done** | `curve_rise[i] + curve_fall[i] == 1` tested; overlap-add covered by the identity test |
 | E2-4 | partial | ported and matches scipy's detected cutoff on the four fixtures, not yet a 20-file corpus |
 | E2-5 | **done** | both stages within −132 dB of scipy on all four fixtures; the SOS matrix matches to 3e-16 |
 | E2-8 | **done** | two renders from the same seed are bit-identical; noise from Irwin–Hall, no libm |
-| E1-1, E1-2, E1-3 | **written, never run** | `tools/export_onnx.py`, `tools/compare_onnx.py`, `tools/flashsr_onnx.py`; no torch on this machine, so the -40 dB gate has no number yet |
+| E1-1, E1-2 | **done** | `tools/out/flashsr.onnx`: opset 18, 4706 nodes, 8.5 MB + 2.46 GB external; −74.07 dB vs PyTorch at fixed noise |
+| E1-3 | **done on 4 fixtures** | worst track −47.78 dB, gate −40; five real tracks need E8-1 |
+| E1-5 | **done for ONNX and eager PyTorch** | CPU 21.5, CoreML 31.1 / 21.7 / 15.2, PyTorch CPU 6.1, PyTorch MPS **0.51** |
+| E1-4, E1-6, E1-7, E1-8 | **open, and now blocking** | no runtime measured so far reaches the RTF ≤ 1.5 gate except PyTorch/Metal, which is not the planned backend |
 
 The three pipeline bugs the tests caught, recorded so they are not reintroduced: the
 windower drained a whole window per render instead of `step`; `finish` lost samples when

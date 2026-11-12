@@ -3,8 +3,11 @@
 A desktop player that reconstructs the high frequencies an MP3 threw away, and lets
 you hear the difference on a single keystroke.
 
-Status: **early scaffold**. The Rust workspace builds and its FlashSR preprocessing port
-matches scipy to −132 dB; there is no model, no audio output and no UI yet. The working
+Status: **early scaffold, with the runtime question open.** The Rust workspace builds and
+its FlashSR preprocessing port matches scipy to −132 dB. The ONNX export passes its
+numeric gate (−74 dB vs PyTorch, worst track −48 dB) but ONNX Runtime runs it 30 to 60x
+slower than PyTorch on the same Apple Silicon, so the inference-backend decision is
+reopened (ADR-002, backlog E1-4). There is no audio output and no UI yet. The working
 reference implementation is the Python PoC,
 [`gabriel-rivero/flashsr-stream`](https://github.com/gabriel-rivero/flashsr-stream).
 This repo is the Rust rewrite.

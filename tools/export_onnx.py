@@ -63,7 +63,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--report", default=str(TOOLS / "out" / "export_report.json"))
     ap.add_argument("--channels", type=int, default=2)
     ap.add_argument("--seed", type=int, default=1234)
-    ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument(
+        "--opset",
+        type=int,
+        default=18,
+        help="ONNX opset; the dynamo exporter needs 18 or newer and silently raises "
+        "anything lower, then tries to convert back, which fails on this graph",
+    )
     ap.add_argument(
         "--gate-db",
         type=float,
@@ -100,6 +106,83 @@ def fixture_cond(channels: int):
     return stereo[:channels], "synthetic"
 
 
+def external_data_path(out_path: Path) -> Path:
+    """Where the dynamo exporter puts initializers past protobuf's 2 GB limit."""
+    return out_path.with_name(out_path.name + ".data")
+
+
+def sha256_of(path: Path) -> str:
+    """Chunked so a multi-gigabyte graph does not have to fit in memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 24), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def export_graph(module, inputs, out_path: Path, opset: int) -> str:
+    """Write the ONNX graph and say which exporter produced it.
+
+    torch's TorchScript exporter serialises the whole ModelProto through protobuf,
+    which is capped at 2 GB. FlashSR's weights are 3.3 GB, so that path cannot write
+    this graph at all; the dynamo exporter can, putting the weights in a sidecar
+    `flashsr.onnx.data`. Dynamo goes first and TorchScript stays as a fallback, so a
+    smaller model, or a torch that predates dynamo, still exports.
+    """
+    import torch
+
+    errors: list[str] = []
+    if h._torch_at_least(2, 6):
+        try:
+            torch.onnx.export(
+                module,
+                inputs,
+                str(out_path),
+                input_names=["cond", "noise"],
+                output_names=["audio"],
+                opset_version=opset,
+                dynamo=True,
+                external_data=True,
+            )
+            require_written(out_path)
+            return "dynamo"
+        except SystemExit as exc:
+            # Upstream helpers call exit() on a type mismatch, which would otherwise
+            # end the process with a clean code and no model to show for it.
+            errors.append(f"dynamo: upstream called exit({exc.code}) during export")
+            out_path.unlink(missing_ok=True)
+            external_data_path(out_path).unlink(missing_ok=True)
+        except Exception as exc:  # noqa: BLE001 - a failed attempt is what fallback is for
+            errors.append(f"dynamo: {type(exc).__name__}: {exc}")
+            out_path.unlink(missing_ok=True)
+            external_data_path(out_path).unlink(missing_ok=True)
+
+    try:
+        torch.onnx.export(
+            module,
+            inputs,
+            str(out_path),
+            input_names=["cond", "noise"],
+            output_names=["audio"],
+            opset_version=opset,
+            do_constant_folding=True,
+            dynamo=False,
+        )
+        require_written(out_path)
+        return "torchscript"
+    except SystemExit as exc:
+        errors.append(f"torchscript: upstream called exit({exc.code}) during export")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"torchscript: {type(exc).__name__}: {exc}")
+    raise RuntimeError("both ONNX exporters failed: " + " | ".join(errors))
+
+
+def require_written(out_path: Path) -> None:
+    """An exporter that returns without a file has failed, whatever it returned."""
+    if not out_path.is_file() or out_path.stat().st_size == 0:
+        raise RuntimeError(f"{out_path} was not written")
+
+
 def export(args: argparse.Namespace) -> tuple[int, dict]:
     import numpy as np
 
@@ -112,6 +195,7 @@ def export(args: argparse.Namespace) -> tuple[int, dict]:
     pkg_dir = h.resolve_package_dir(args.flashsr_dir)
     model = h.load_model(model_dir, pkg_dir, args.device)
     patched = h.force_deterministic_vae(model)
+    patched_mel = h.patch_mel_front_end()
     module = h.make_sampler_module(model)
 
     shape = h.latent_shape(model, args.channels, h.WINDOW, args.device)
@@ -125,21 +209,22 @@ def export(args: argparse.Namespace) -> tuple[int, dict]:
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(
-        module,
-        (cond, noise),
-        str(out_path),
-        input_names=["cond", "noise"],
-        output_names=["audio"],
-        opset_version=args.opset,
-        do_constant_folding=True,
-        **({"dynamo": False} if h._torch_at_least(2, 6) else {}),
-    )
+    backend = export_graph(module, (cond, noise), out_path, args.opset)
 
     import onnx
 
-    graph = onnx.load(str(out_path))
-    onnx.checker.check_model(graph)
+    # The weights are ~2.5 GB, past protobuf's 2 GB limit, so they live in a sidecar
+    # `.data` file. Read the graph structure without it for the histogram, but check the
+    # model by path: the checker resolves external data relative to the file and cannot
+    # verify a bare ModelProto that has none loaded.
+    graph = onnx.load(str(out_path), load_external_data=False)
+    onnx.checker.check_model(str(out_path))
+    # torch's dynamo exporter raises the opset to 18 whatever is asked for, so record
+    # what the file actually contains rather than what was requested.
+    exported_opset = max(
+        (entry.version for entry in graph.opset_import if entry.domain in ("", "ai.onnx")),
+        default=args.opset,
+    )
     histogram: dict[str, int] = {}
     for node in graph.graph.node:
         histogram[node.op_type] = histogram.get(node.op_type, 0) + 1
@@ -167,7 +252,8 @@ def export(args: argparse.Namespace) -> tuple[int, dict]:
         "torch": torch.__version__,
         "onnx": onnx.__version__,
         "onnxruntime": ort.__version__,
-        "opset": args.opset,
+        "opset": exported_opset,
+        "opset_requested": args.opset,
         "device": args.device,
         "seed": args.seed,
         "channels": args.channels,
@@ -175,12 +261,16 @@ def export(args: argparse.Namespace) -> tuple[int, dict]:
         "cond_source": cond_source,
         "latent_shape": list(shape),
         "output_shape": list(onnx_out.shape),
-        "onnx_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
+        "onnx_sha256": sha256_of(out_path),
+        "onnx_bytes": out_path.stat().st_size,
+        "external_data_bytes": sidecar.stat().st_size if (sidecar := external_data_path(out_path)).is_file() else 0,
+        "export_backend": backend,
         "node_count": sum(histogram.values()),
         "op_histogram": dict(sorted(histogram.items(), key=lambda kv: -kv[1])),
         "nondeterministic_ops": nondeterministic,
         "portability_risk_ops": risky,
         "deterministic_vae": patched,
+        "traceable_mel_front_end": patched_mel,
         "eager_vs_upstream_db": round(eager_level, 2),
         "onnx_vs_upstream_db": round(level, 2),
         "max_abs_diff": diff,
@@ -218,7 +308,8 @@ def main(argv: list[str]) -> int:
     Path(args.report).parent.mkdir(parents=True, exist_ok=True)
     Path(args.report).write_text(json.dumps(report, indent=2) + "\n")
 
-    print(f"wrote      {args.out}")
+    print(f"wrote      {args.out}  ({report['onnx_bytes'] / 1e9:.2f} GB + "
+          f"{report['external_data_bytes'] / 1e9:.2f} GB external, {report['export_backend']})")
     print(f"opset      {report['opset']}   nodes {report['node_count']}")
     print(f"latent     {report['latent_shape']}   output {report['output_shape']}")
     print(f"cond       {report['cond_source']}")

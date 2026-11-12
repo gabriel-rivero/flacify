@@ -7,7 +7,7 @@ date. If a number is not here, it is either borrowed (and says so) or it does no
 
 | # | what | specs |
 |---|---|---|
-| M1 | development laptop (2026-11-12, all Rust numbers) | Apple M5 Max, 32-core GPU, 36 GB, macOS 27.2.1, Rust 1.99.1 |
+| M1 | development laptop (2026-11-12, every number below except P1's) | Apple M5 Max, 32-core GPU, 36 GB, macOS 27.2.1, Rust 1.99.1, Python 3.12.13, torch 2.15.0, onnxruntime 1.31.1 |
 | P1 | the PoC's machine (PoC numbers only) | RTX 4060 Ti 8 GB, Ryzen 9 5900XT, 39 GB, Linux, torch 2.15.0+cu132 |
 
 ## Preprocessing port (Rust vs scipy)
@@ -50,12 +50,63 @@ source and a band-limited one.
 | `cargo test --workspace` | 39 passed, 0 failed | M1, 2026-11-12 |
 | breakdown | 19 core lib, 1 fixture, 11 pipeline, 8 infer | same |
 
-## The model on this hardware
+## The ONNX export (E1)
 
-**Not measured.** There is no ONNX export yet (`tools/export_onnx.py` has never run;
-this machine had no torch until 2026-11-12), so FlashSR's RTF, peak memory and
-CoreML execution-provider coverage on M1 are all **unknown**. ADR-002's kill criteria
-(sustained RTF ≤ 1.5, ≤ −40 dB ONNX-vs-PyTorch) therefore have no number.
+`tools/export_onnx.py` ran for the first time on 2026-11-12 against the real weights.
+It exports with torch's **dynamo** exporter, because the TorchScript exporter serialises
+the whole `ModelProto` through protobuf and this graph is 2.46 GB of weights, past the
+2 GB cap. Weights go to a sidecar `flashsr.onnx.data`.
+
+| metric | value |
+|---|---|
+| export gate, fixture window (`music_cut16k`) | **−74.07 dB** vs eager PyTorch (gate −40) |
+| the explicit-noise wrapper itself | −289.8 dB vs upstream `FlashSR.forward` |
+| graph | opset 18, 4706 nodes, 8.5 MB graph + 2.46 GB external data |
+| inputs | `cond` f32[2, 245760], `noise` f32[2, 16, 64, 32] |
+| output | f32[2, 245760], finite |
+| random ops left in the graph | none |
+| ops a backend may refuse | `STFT` (the mel front-end) |
+| VAE encode | posterior mean; `DiagonalGaussianDistribution.sample` patched |
+
+Per-track comparison, `tools/compare_onnx.py`, one window from each fixture:
+
+| track | cutoff | ONNX vs PyTorch |
+|---|---|---|
+| `music_cut16k` | 15328 Hz | −70.26 dB |
+| `music_cut20k` | 19148 Hz | −91.10 dB |
+| `music_cut8k` | 7640 Hz | **−47.78 dB** (worst) |
+| `music_fullband` | 22851 Hz | −101.87 dB |
+
+All four pass the −40 dB gate; the worst has 7.8 dB of margin. E1-3 asks for five real
+tracks, and these are four synthetic fixtures, so `compare_onnx.py` reports the whole
+gate as not passed (`tracks_required: 5`) even though every row passes. The gate is
+advisory until E8-1's corpus exists.
+
+## Throughput on this hardware (the runtime gate)
+
+One 5.12 s stereo window, medians of repeated runs, same weights throughout.
+
+| path | seconds / window | RTF | gate ≤ 1.5 |
+|---|---|---|---|
+| ONNX Runtime, CPU EP | 110.0 | **21.5** | fail |
+| ONNX Runtime, CoreML EP, fp32, NeuralNetwork | 159.4 | **31.1** | fail |
+| ONNX Runtime, CoreML EP, fp16, NeuralNetwork | 110.9 | **21.7** | fail |
+| ONNX Runtime, CoreML EP, fp16, MLProgram, ALL units | 78.4 | **15.2** | fail |
+| PyTorch eager, CPU | 31.3 | **6.1** | fail |
+| PyTorch eager, MPS | 2.59 | **0.51** | **pass** |
+
+Two facts matter here:
+
+1. **The hardware is fast enough.** The same model, same weights, runs a window in
+   2.59 s under PyTorch on Metal (RTF 0.51), which is 3x inside the gate.
+2. **The ONNX Runtime path is 30 to 60x slower than PyTorch on the same machine**, and
+   the CoreML execution provider never really engaged: with fp16 under the default
+   NeuralNetwork format it produced load 2.2 s and exactly the CPU EP's 110.9 s, i.e. it
+   fell back to CPU for the whole graph. MLProgram + ALL compute units is the best
+   ONNX configuration measured and still 10x short.
+
+So ADR-002's numeric gate passes and its throughput gate fails. The runtime choice, not
+the model, is what failed.
 
 Borrowed from P1, and **not** transferable to M1:
 

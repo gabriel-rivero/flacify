@@ -12,6 +12,8 @@ the single largest technical risk and it is why v0.0 exists. Mitigation: numeric
 (≤ −40 dB per window against a fixed-seed PyTorch render), plus a spectrogram
 difference image a human looks at once per export. Trigger: you cannot get below
 −30 dB on one of the five tracks.
+**Measured 2026-11-12: retired for this graph.** −74.07 dB on the export fixture,
+−47.78 dB on the worst of four tracks, no random ops left in the graph.
 
 **R2 — Apple Silicon is not fast enough (M/H).** RTF on the M5 Max is unknown. The
 4060 Ti numbers do not transfer: different width, different precision, different EP.
@@ -19,6 +21,10 @@ If sustained RTF lands above 1.0, real-time playback is dead and this becomes a
 background renderer with a player attached. That is still a good product, but it is a
 different roadmap. Mitigation: measure in week one, on 60 s of continuous inference,
 not one window. Trigger: sustained RTF > 1.2.
+**Measured 2026-11-12: the hardware is fine, the runtime is not.** PyTorch on Metal runs
+a window in 2.59 s (RTF 0.51). Every ONNX Runtime configuration tried lands at RTF 15.2
+to 31.1 on the same weights. R2's trigger has fired, but on the backend rather than the
+laptop, which is what R8 predicted.
 
 **R3 — The model is stochastic and nobody noticed (M/H).** The one-step sampler draws
 fresh noise per call, so the PoC renders a slightly different track every run.

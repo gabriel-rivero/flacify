@@ -150,6 +150,59 @@ def force_deterministic_vae(model) -> str:
     return "FlashSR.AudioSR.autoencoder.DiagonalGaussianDistribution"
 
 
+def patch_mel_front_end() -> str:
+    """Make the mel front-end traceable. Three edits, none of which change output.
+
+    `UtilAudioMelSpec` is built for eager PyTorch:
+      * `get_hifigan_mel_spec` opens with two `if torch.min(audio) < -1.: print(...)`
+        guards, and a Python `if` on tensor data is precisely what `torch.export`
+        refuses to trace;
+      * `spec_to_mel_spec` and `dynamic_range_compression` dispatch with
+        `type(x) == torch.Tensor`, an exact-type test that is False for the FakeTensor
+        and FunctionalTensor a traced graph carries, so both fall into an `else` that
+        calls `exit()` — which is how an export dies with a clean exit code and no
+        model.
+
+    The replacements use `isinstance` and keep every branch identical. Returns the
+    patched class, for the report.
+    """
+    import numpy as np
+    import torch
+    from TorchJaekwon.Util.UtilAudioMelSpec import UtilAudioMelSpec
+
+    if getattr(UtilAudioMelSpec, "_flacify_mode", False):
+        return "TorchJaekwon.Util.UtilAudioMelSpec.UtilAudioMelSpec"
+
+    def get_hifigan_mel_spec(self, audio, return_type="Tensor"):
+        if isinstance(audio, np.ndarray):
+            audio = torch.FloatTensor(audio)
+        while len(audio.shape) < 2:
+            audio = audio.unsqueeze(0)
+        spectrogram = self.stft_torch(audio)["mag"]
+        mel_spec = self.spec_to_mel_spec(spectrogram)
+        log_scale_mel = self.dynamic_range_compression(mel_spec)
+        if return_type == "ndarray":
+            return log_scale_mel.cpu().detach().numpy()
+        return log_scale_mel
+
+    def spec_to_mel_spec(self, stft_mag):
+        if isinstance(stft_mag, np.ndarray):
+            return np.matmul(self.mel_basis_np, stft_mag)
+        self.mel_basis_tensor = self.mel_basis_tensor.to(stft_mag.device)
+        return torch.matmul(self.mel_basis_tensor, stft_mag)
+
+    def dynamic_range_compression(self, x, C=1, clip_val=1e-5):
+        if isinstance(x, np.ndarray):
+            return np.log(np.clip(x, a_min=clip_val, a_max=None) * C)
+        return torch.log(torch.clamp(x, min=clip_val) * C)
+
+    UtilAudioMelSpec.get_hifigan_mel_spec = get_hifigan_mel_spec  # type: ignore[method-assign]
+    UtilAudioMelSpec.spec_to_mel_spec = spec_to_mel_spec  # type: ignore[method-assign]
+    UtilAudioMelSpec.dynamic_range_compression = dynamic_range_compression  # type: ignore[method-assign]
+    UtilAudioMelSpec._flacify_mode = True
+    return "TorchJaekwon.Util.UtilAudioMelSpec.UtilAudioMelSpec"
+
+
 def make_sampler_module(model):
     """One DPMSolver step, as an `nn.Module` whose noise is an input.
 
@@ -177,7 +230,25 @@ def make_sampler_module(model):
             self.model = model
             self.scheduler = scheduler
 
+        def _reset_scheduler(self) -> None:
+            """Undo the state DPMSolverMultistepScheduler carries between calls.
+
+            `lower_order_nums` and `_step_index` persist, so a second call on a 1-step
+            schedule takes the second-order branch and indexes `sigmas[2]` of a 2-entry
+            array. This is exactly what `set_timesteps` resets, but assigned directly:
+            `set_timesteps` calls `.numpy()` on config tensors and cannot run inside a
+            traced graph.
+            """
+            self.scheduler.lower_order_nums = 0
+            # A 1-step schedule always steps from index 0. Setting it here also skips
+            # `_init_step_index`, which calls `index_for_timestep` -> `torch.nonzero`,
+            # a data-dependent shape that torch.export refuses to trace.
+            self.scheduler._step_index = 0
+            self.scheduler._begin_index = None
+            self.scheduler.model_outputs = [None] * self.scheduler.config.solver_order
+
         def forward(self, cond, noise):
+            self._reset_scheduler()
             _, latent_cond, extra = self.model.preprocess(x_start=None, cond=cond)
             x = noise * self.scheduler.init_noise_sigma
             for t in self.scheduler.timesteps:

@@ -68,10 +68,13 @@ def band_limit(window):
     usable low band, which `cheby1` rejects at Nyquist, so that case passes through.
     """
     import numpy as np
+    import torch
     from FlashSR.Util.UtilAudioSR import UtilAudioSR
     from FlashSR.Util.UtilAudioLowPassFilter import UtilAudioLowPassFilter
 
-    cutoff = int(UtilAudioSR.find_cutoff_freq(window))
+    # `find_cutoff_freq` takes a tensor (it runs a torch STFT and reads channel 0);
+    # `lowpass` takes numpy. Upstream does the same conversion in `FlashSR.forward`.
+    cutoff = int(UtilAudioSR.find_cutoff_freq(torch.from_numpy(window)))
     if cutoff >= h.SAMPLE_RATE // 2 or cutoff < 1:
         return window, cutoff, False
     filtered = UtilAudioLowPassFilter.lowpass(
@@ -132,14 +135,18 @@ def main(argv: list[str]) -> int:
             f"{row['db']:+7.2f} dB  max {row['max_abs_diff']:.3e}  {status}"
         )
 
-    worst = min(row["db"] for row in rows)
+    # dB values are negative, so the worst track is the largest, not the smallest.
+    worst = max(row["db"] for row in rows)
     report = {
         "onnx": str(Path(args.onnx).resolve()),
         "seed": args.seed,
         "gate_db": args.gate_db,
         "latent_shape": list(shape),
         "tracks": rows,
+        "tracks_required": 5,
         "worst_db": worst,
+        # `passed` is the whole gate, sample size included; the per-track `passed` flags
+        # above are the numeric answer. With four fixtures this is False until E8-1.
         "passed": all(row["passed"] for row in rows) and len(rows) >= 5,
     }
     if len(rows) < 5:

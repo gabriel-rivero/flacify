@@ -53,6 +53,9 @@ impl Controls {
     }
 }
 
+/// Cheap to clone: the buffers are shared and only the ramp state is copied, which is
+/// what lets the device open a second stream if the first buffer size is refused.
+#[derive(Clone)]
 pub struct Mixer {
     original: Arc<[f32]>,
     enhanced: Option<Arc<[f32]>>,

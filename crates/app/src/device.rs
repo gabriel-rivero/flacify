@@ -52,15 +52,38 @@ impl AudioEngine {
 
         let (mixer, controls) = Mixer::new(original, enhanced, device_channels, device_rate);
         let mut config: cpal::StreamConfig = supported.into();
-        config.buffer_size = cpal::BufferSize::Fixed(PREFERRED_BUFFER_FRAMES);
 
-        let stream = match sample_format {
-            cpal::SampleFormat::F32 => build::<f32>(&device, &config, mixer, device_channels),
-            cpal::SampleFormat::I16 => build::<i16>(&device, &config, mixer, device_channels),
-            cpal::SampleFormat::U16 => build::<u16>(&device, &config, mixer, device_channels),
-            other => anyhow::bail!("the output device wants {other}, which is not wired up yet"),
+        // A fixed buffer size is a request, not a guarantee: WASAPI in shared mode and
+        // some ALSA configurations refuse it. Ask for the small one, fall back to
+        // whatever the device wants, and report the second failure with both contexts.
+        let mut stream = None;
+        let mut first_error = None;
+        for buffer_size in [
+            cpal::BufferSize::Fixed(PREFERRED_BUFFER_FRAMES),
+            cpal::BufferSize::Default,
+        ] {
+            config.buffer_size = buffer_size;
+            match open(
+                &device,
+                &config,
+                sample_format,
+                mixer.clone(),
+                device_channels,
+            ) {
+                Ok(opened) => {
+                    stream = Some(opened);
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "output stream refused a {:?} buffer", buffer_size);
+                    first_error = first_error.or(Some(error));
+                }
+            }
         }
-        .context("building the output stream")?;
+        let stream = stream.ok_or_else(|| {
+            let error = first_error.unwrap_or_else(|| anyhow::anyhow!("no output stream"));
+            anyhow::anyhow!("{error:#}")
+        })?;
 
         stream.play().context("starting playback")?;
         Ok(Self {
@@ -69,6 +92,29 @@ impl AudioEngine {
             device_rate,
             device_channels,
         })
+    }
+}
+
+/// One attempt with one sample format.
+fn open(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    format: cpal::SampleFormat,
+    mixer: Mixer,
+    channels: usize,
+) -> Result<cpal::Stream> {
+    match format {
+        cpal::SampleFormat::I8 => build::<i8>(device, config, mixer, channels),
+        cpal::SampleFormat::I16 => build::<i16>(device, config, mixer, channels),
+        cpal::SampleFormat::I32 => build::<i32>(device, config, mixer, channels),
+        cpal::SampleFormat::I64 => build::<i64>(device, config, mixer, channels),
+        cpal::SampleFormat::U8 => build::<u8>(device, config, mixer, channels),
+        cpal::SampleFormat::U16 => build::<u16>(device, config, mixer, channels),
+        cpal::SampleFormat::U32 => build::<u32>(device, config, mixer, channels),
+        cpal::SampleFormat::U64 => build::<u64>(device, config, mixer, channels),
+        cpal::SampleFormat::F32 => build::<f32>(device, config, mixer, channels),
+        cpal::SampleFormat::F64 => build::<f64>(device, config, mixer, channels),
+        other => anyhow::bail!("the output device wants {other}, which is not wired up yet"),
     }
 }
 

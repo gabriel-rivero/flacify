@@ -11,6 +11,15 @@ fetches CPython 3.12, pip installs the pinned wheels, and the weights download f
 upstream. About 6 GB, once. This is time-boxed scaffolding for evaluating the product,
 not a shipping design, and the rule above is unchanged for v1.
 
+PyPI's `torch` is CPU-only on Windows and Linux. A CUDA build comes from PyTorch's own
+index and costs about 2.5 GB more, so it is opt-in per machine rather than assumed:
+
+```sh
+FLACIFY_TORCH_INDEX=https://download.pytorch.org/whl/cu124 flacify setup
+```
+
+The chosen index is recorded in the wheels receipt, so changing it re-runs that step.
+
 ## Rust crates
 
 | crate | why | risk |

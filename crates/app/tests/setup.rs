@@ -233,9 +233,11 @@ fn given_an_empty_home_when_ensure_runs_then_every_step_executes_in_order() {
     ensure_with(&paths, &runner, progress).expect("a fresh install");
 
     let commands = runner.take_commands();
+    // torch, then the rest of the wheels, then the two downloads; python and venv run
+    // the interpreter and the environment they set up.
     assert_eq!(
         commands.len(),
-        5,
+        6,
         "one command per networked step: {commands:#?}"
     );
     assert!(position(&commands, "python install") < position(&commands, "venv --python"));

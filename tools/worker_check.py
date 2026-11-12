@@ -24,7 +24,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model-dir", default=str(Path.home() / "models" / "flashsr"))
     ap.add_argument("--flashsr-dir", default=None)
-    ap.add_argument("--device", default="mps", choices=["mps", "cpu"])
+    ap.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--gate-db", type=float, default=-60.0)

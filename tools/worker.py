@@ -19,7 +19,7 @@ Protocol, little-endian:
 
 Commands: HELLO = 1, WINDOW = 2, SHUTDOWN = 3.
 
-    FLASHSR_MODEL_DIR=~/models/flashsr python3 tools/worker.py --device mps
+    FLASHSR_MODEL_DIR=~/models/flashsr python3 tools/worker.py --device auto
 """
 
 from __future__ import annotations
@@ -54,19 +54,34 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model-dir", default=os.environ.get("FLASHSR_MODEL_DIR", str(Path.home() / "models" / "flashsr")))
     ap.add_argument("--flashsr-dir", default=os.environ.get("FLASHSR_PKG_DIR"))
-    ap.add_argument("--device", default="mps", choices=["mps", "cpu"])
+    ap.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cuda", "mps", "cpu"],
+        help="auto picks cuda, then mps, then cpu",
+    )
     return ap.parse_args(argv)
 
 
 def pick_device(requested: str):
+    """`cuda`, then `mps`, then `cpu`; a request that cannot be honoured says so."""
     import torch
 
-    if requested == "mps":
-        if not torch.backends.mps.is_available():
-            log("mps is not available; falling back to cpu")
-            return torch.device("cpu"), "cpu"
-        return torch.device("mps"), "mps"
-    return torch.device("cpu"), "cpu"
+    available = []
+    if torch.cuda.is_available():
+        available.append("cuda")
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        available.append("mps")
+
+    if requested == "auto":
+        chosen = available[0] if available else "cpu"
+    elif requested in available:
+        chosen = requested
+    else:
+        log(f"{requested} is not available here (have {available or ['cpu']}); using cpu")
+        chosen = "cpu"
+    return torch.device(chosen), chosen
 
 
 class Worker:
@@ -134,6 +149,12 @@ class Worker:
         return audio[..., :frames].float().cpu().numpy().tobytes()
 
 
+def reply(stream_out, cmd: int, status: int, window_id: int, channels: int, frames: int, payload: bytes = b"") -> None:
+    """One reply, flushed: the reader blocks on the header and must not wait for a buffer."""
+    stream_out.write(REPLY.pack(REPLY_MAGIC, cmd, status, window_id, channels, frames, len(payload)) + payload)
+    stream_out.flush()
+
+
 def read_exact(stream, size: int) -> bytes | None:
     chunks = bytearray()
     while len(chunks) < size:
@@ -162,13 +183,11 @@ def serve(worker: Worker, stream_in, stream_out) -> int:
             return 0
 
         if cmd == CMD_HELLO:
-            body = json.dumps(worker.hello()).encode()
-            stream_out.write(REPLY.pack(REPLY_MAGIC, cmd, 0, window_id, 0, 0, len(body)) + body)
+            reply(stream_out, cmd, 0, window_id, 0, 0, json.dumps(worker.hello()).encode())
             continue
 
         if cmd != CMD_WINDOW:
-            body = f"unknown command {cmd}".encode()
-            stream_out.write(REPLY.pack(REPLY_MAGIC, cmd, 1, window_id, 0, 0, len(body)) + body)
+            reply(stream_out, cmd, 1, window_id, 0, 0, f"unknown command {cmd}".encode())
             continue
 
         expected_noise = len(worker.latent_shape(channels, frames))
@@ -189,15 +208,12 @@ def serve(worker: Worker, stream_in, stream_out) -> int:
                 )
             audio = worker.window(payload, noise, channels, frames)
         except Exception as exc:  # a bad window must not kill the session
-            body = f"{type(exc).__name__}: {exc}".encode()
-            stream_out.write(REPLY.pack(REPLY_MAGIC, cmd, 1, window_id, 0, 0, len(body)) + body)
+            reply(stream_out, cmd, 1, window_id, 0, 0, f"{type(exc).__name__}: {exc}".encode())
             log(f"window {window_id} failed: {exc}")
             continue
 
         elapsed = time.perf_counter() - t0
-        stream_out.write(
-            REPLY.pack(REPLY_MAGIC, cmd, 0, window_id, channels, frames, len(audio)) + audio
-        )
+        reply(stream_out, cmd, 0, window_id, channels, frames, audio)
         windows += 1
         audio_secs = frames / worker.h.SAMPLE_RATE
         log(
@@ -209,11 +225,11 @@ def serve(worker: Worker, stream_in, stream_out) -> int:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
 
-    # Take the real descriptors first, then point the process's stdout at stderr so
-    # nothing upstream can write into the protocol stream.
-    stream_in = os.fdopen(os.dup(0), "rb", buffering=0)
-    stream_out = os.fdopen(os.dup(1), "wb", buffering=0)
-    os.dup2(2, 1)
+    # stdout carries the protocol. Hold the real buffer, then point `sys.stdout` at the
+    # log, so upstream's prints and tqdm cannot land inside a header. Rebinding the name
+    # rather than swapping the file descriptor keeps this working on Windows too.
+    stream_in = sys.stdin.buffer
+    stream_out = sys.stdout.buffer
     sys.stdout = sys.stderr
 
     worker = Worker(args)

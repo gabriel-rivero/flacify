@@ -97,11 +97,30 @@ const PYTHON_WHEELS: &[&str] = &[
     "einops",
 ];
 
+/// Where the torch wheel comes from.
+///
+/// PyPI's torch is CPU-only on Windows and Linux; a CUDA build lives on PyTorch's own
+/// index and is about 2.5 GB larger. Opting in is per machine:
+///
+/// ```text
+/// FLACIFY_TORCH_INDEX=https://download.pytorch.org/whl/cu124
+/// ```
+///
+/// macOS needs none of this: its PyPI wheel already has Metal.
+fn torch_index() -> Option<String> {
+    std::env::var("FLACIFY_TORCH_INDEX")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// What the wheels receipt records. Comparing this string is how a change to
-/// `PYTHON_WHEELS` re-runs the step on an install that already exists — without it, a
-/// missing wheel is invisible because the receipt file is still there.
+/// `PYTHON_WHEELS` (or to the torch index) re-runs the step on an install that already
+/// exists — without it, a missing wheel is invisible because the receipt file is still
+/// there.
 pub fn wheels_manifest() -> String {
-    PYTHON_WHEELS.join("\n") + "\n"
+    let index = torch_index().unwrap_or_default();
+    format!("torch-index {index}\n{}\n", PYTHON_WHEELS.join("\n"))
 }
 
 /// Same idea for the embedded sidecar sources.
@@ -406,7 +425,9 @@ fn install_uv(paths: &Paths, runner: &dyn Runner, uv: &mut Option<PathBuf>) -> R
         return Ok(());
     }
     let url = uv_release_url()?;
-    let archive = paths.runtime_dir().join("uv.tar.gz");
+    let archive = paths
+        .runtime_dir()
+        .join(if cfg!(windows) { "uv.zip" } else { "uv.tar.gz" });
     let bin_dir = paths.runtime_dir().join("bin");
     let archive_arg = archive.to_string_lossy().into_owned();
     let bin_arg = bin_dir.to_string_lossy().into_owned();
@@ -422,16 +443,12 @@ fn install_uv(paths: &Paths, runner: &dyn Runner, uv: &mut Option<PathBuf>) -> R
             url.as_str(),
         ],
     )?;
-    runner.run(
-        Path::new("tar"),
-        &[
-            "-xzf",
-            archive_arg.as_str(),
-            "-C",
-            bin_arg.as_str(),
-            "--strip-components=1",
-        ],
-    )?;
+    // The unix archives wrap everything in one directory; the Windows zip does not.
+    let mut tar_args = vec!["-xf", archive_arg.as_str(), "-C", bin_arg.as_str()];
+    if !cfg!(windows) {
+        tar_args.push("--strip-components=1");
+    }
+    runner.run(Path::new("tar"), &tar_args)?;
 
     let managed = paths.uv_binary();
     match runner.size(&managed) {
@@ -475,9 +492,26 @@ fn create_venv(paths: &Paths, runner: &dyn Runner, uv: &Option<PathBuf>) -> Resu
 fn install_wheels(paths: &Paths, runner: &dyn Runner, uv: &Option<PathBuf>) -> Result<()> {
     let uv = require_uv(uv)?;
     let python = paths.venv_python().to_string_lossy().into_owned();
+    let index = torch_index();
+
+    // torch goes first and alone, because --index-url applies to the whole command and
+    // PyTorch's index does not carry the rest of these wheels.
+    let mut torch_args: Vec<&str> = vec!["pip", "install", "--python", python.as_str(), "torch"];
+    if let Some(url) = index.as_deref() {
+        torch_args.push("--index-url");
+        torch_args.push(url);
+    }
+    runner.run(uv, &torch_args)?;
+
     let mut args: Vec<&str> = vec!["pip", "install", "--python", python.as_str()];
-    args.extend(PYTHON_WHEELS);
+    args.extend(
+        PYTHON_WHEELS
+            .iter()
+            .copied()
+            .filter(|wheel| *wheel != "torch"),
+    );
     runner.run(uv, &args)?;
+
     runner.write(&paths.wheels_receipt(), wheels_manifest().as_bytes())
 }
 
@@ -609,12 +643,17 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// The release archive for this platform. Windows users install uv or set `FLACIFY_UV`.
+/// The release archive for this platform.
+///
+/// Windows publishes a `.zip` and the others a `.tar.gz`; both are unpacked with `tar`,
+/// which on Windows 10 and later is bsdtar and reads zip archives. That keeps one code
+/// path instead of a PowerShell branch.
 fn uv_release_url() -> Result<String> {
     let triple = uv_triple()
         .context("no uv release archive for this platform; install uv on PATH or set FLACIFY_UV")?;
+    let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
     Ok(format!(
-        "https://github.com/astral-sh/uv/releases/latest/download/uv-{triple}.tar.gz"
+        "https://github.com/astral-sh/uv/releases/latest/download/uv-{triple}.{extension}"
     ))
 }
 
@@ -627,6 +666,10 @@ fn uv_triple() -> Option<&'static str> {
         Some("aarch64-unknown-linux-gnu")
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         Some("x86_64-unknown-linux-gnu")
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some("x86_64-pc-windows-msvc")
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        Some("aarch64-pc-windows-msvc")
     } else {
         None
     }

@@ -112,6 +112,8 @@ pub fn seed_for(track: &Track) -> u64 {
 pub struct Render {
     pub planar: Vec<f32>,
     pub limit: crate::limit::LimitReport,
+    /// Which accelerator the sidecar chose: `cuda`, `mps` or `cpu`.
+    pub device: String,
 }
 
 /// Render a whole track. `progress` is called with the number of input frames covered
@@ -124,6 +126,7 @@ pub fn enhance(
     progress: &mut dyn FnMut(usize),
 ) -> Result<Render> {
     let model = PythonWorker::spawn(worker).context("starting the model worker")?;
+    let device = model.hello().device.clone();
     let engine = Engine::new(model, 2, WINDOW, cutoff_hz)?;
     let mut pipeline = Pipeline::new(engine, 2, WINDOW, OVERLAP, seed)?;
 
@@ -159,7 +162,11 @@ pub fn enhance(
     }
     // The model overshoots; nothing downstream can recover a clipped sample.
     let limit = crate::limit::limit_in_place(&mut planar);
-    Ok(Render { planar, limit })
+    Ok(Render {
+        planar,
+        limit,
+        device,
+    })
 }
 
 /// `flacify enhance` in one call: decode, decide, render, write.
@@ -207,6 +214,7 @@ pub fn enhance_file(
         seed_for(&track),
         &mut |done| progress(done, frames),
     )?;
+    eprintln!("model on {}", rendered.device);
     if rendered.limit.limited_samples > 0 {
         eprintln!(
             "peak {:.2} -> {:.2} ({:+.1} dB) across {} samples",

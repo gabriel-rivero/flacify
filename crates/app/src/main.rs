@@ -119,7 +119,7 @@ fn worker_config(paths: &setup::Paths) -> Result<WorkerConfig> {
         worker_script: paths.worker_script(),
         model_dir: paths.models_dir(),
         flashsr_dir: Some(paths.flashsr_dir()),
-        device: "mps".to_string(),
+        device: "auto".to_string(),
     })
 }
 
@@ -256,6 +256,7 @@ fn smoke_play(file: &Path, config: &WorkerConfig) -> Result<()> {
         "played    {position} frames in 1.2 s ({:.2} s of audio)",
         position as f64 / f64::from(engine.device_rate)
     );
+    println!("model     {}", prepared.device);
     println!(
         "switch    {}",
         if prepared.enhanced.is_some() {
@@ -299,6 +300,7 @@ fn prepare(
             audio_secs,
             peak_before: 0.0,
             limited_samples: 0,
+            device: "none (full-band source)".to_string(),
         });
     }
 
@@ -324,6 +326,7 @@ fn prepare(
         enhanced: Some(render::interleave_stereo(&rendered.planar, track.frames)),
         peak_before: rendered.limit.peak_before,
         limited_samples: rendered.limit.limited_samples,
+        device: rendered.device,
         cutoff_hz: analysis.cutoff_hz,
         render_secs,
         audio_secs,

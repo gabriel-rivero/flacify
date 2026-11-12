@@ -179,9 +179,15 @@ release where it should land.
    untested.
 10. **The worker is not supervised.** If it dies mid-render the app errors out; there is no
    restart, and a wedged model with no output blocks the render thread forever.
-11. **Platform coverage is one machine.** CoreAudio only; the uv archive path is
-    macOS/Linux (Windows needs a `.zip`); 44.1 kHz device output is resampled but 96 kHz
-    and mono devices are untested.
+11. **Platform coverage is one machine.** The portable-core work is done: uv's Windows
+    `.zip` is handled, the audio callback covers every integer and float sample format
+    cpal exposes, a refused `BufferSize::Fixed` falls back to the device default, the
+    sidecar picks `cuda > mps > cpu`, and a Windows CI job builds and tests the workspace.
+    What is still missing is a real run on Windows and on Linux (device, PipeWire/WASAPI
+    behaviour, 96 kHz and 5.1 devices) and a decision about the accelerator: PyPI torch is
+    CPU-only on Windows/Linux, so a CUDA build is an opt-in `FLACIFY_TORCH_INDEX`, and
+    without one RTF is ~6–10 and the product is a renderer, not a player. Worth measuring
+    ONNX Runtime with DirectML or the CUDA EP there before settling the sidecar in.
 12. **Metadata is the filename.** No title, artist or duration from tags, no drag and drop.
 
 **Explicitly parked**

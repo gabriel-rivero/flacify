@@ -25,6 +25,7 @@ pub struct Prepared {
     pub audio_secs: f64,
     pub peak_before: f32,
     pub limited_samples: usize,
+    pub device: String,
 }
 
 /// Progress the worker thread publishes while it runs.
@@ -180,8 +181,8 @@ impl PlayerApp {
             }
             ui.label(
                 egui::RichText::new(format!(
-                    "output {} Hz × {} ch",
-                    engine.device_rate, engine.device_channels
+                    "model on {} · output {} Hz × {} ch",
+                    prepared.device, engine.device_rate, engine.device_channels
                 ))
                 .weak()
                 .size(11.0),

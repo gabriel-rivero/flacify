@@ -73,6 +73,45 @@ jobs:
       - name: Byte-compile the tools
         run: python3 -m py_compile tools/*.py tools/fixtures/gen.py
 
+  windows:
+    name: build and test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The fixture-dependent test compares the Rust DSP against scipy goldens, so the
+      # generator has to run here too; numpy/scipy have Windows wheels, which is the
+      # whole reason the fixtures are generated rather than committed.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install fixture generator dependencies
+        run: python -m pip install --quiet numpy scipy
+
+      - name: Generate scipy fixtures
+        run: python tools/fixtures/gen.py
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # No audio device and no window system on a runner, but everything compiles, the
+      # portable modules' tests run, and the Python sidecar is exercised against its
+      # fake worker. This is the Windows half of "the core is portable".
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: |
+          if (-not (Test-Path tools/fixtures/out/manifest.json)) { throw "fixtures missing" }
+          cargo test --workspace --all-targets
+
   deny:
     name: licences and advisories
     runs-on: ubuntu-latest

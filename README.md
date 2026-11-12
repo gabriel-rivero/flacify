@@ -11,6 +11,12 @@ schedule and the mixer; the model runs in a Python process the app installs and 
 Silicon (ADR-002). The working reference implementation is the Python PoC,
 [`gabriel-rivero/flashsr-stream`](https://github.com/gabriel-rivero/flashsr-stream).
 
+Runs end to end on macOS (verified: Metal, 48 kHz out, A/B enabled). The code is
+portable and CI builds and tests it on Windows and Linux as well, but those two have
+not been run on a real device yet, and the accelerator differs: `cuda` if present,
+`mps` on Apple Silicon, otherwise `cpu`, which is a renderer rather than a player
+(RTF 6–10). See the platform gap in [`docs/roadmap.md`](docs/roadmap.md).
+
 ## What works today
 
 ```sh

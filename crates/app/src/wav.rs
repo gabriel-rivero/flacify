@@ -1,50 +1,42 @@
-//! Minimal WAV reading for `flacify probe`.
+//! Writing 32-bit float WAV.
 //!
-//! symphonia replaces this when the decoder lands; until then this is enough to point
-//! `probe` at the fixtures, which are written by scipy as float32 WAVs.
+//! Reading is `decode::decode`, which speaks every format symphonia knows; this module
+//! only exists because the output of a render should be something a person can open.
 
 use anyhow::{Context, Result};
-use hound::{SampleFormat, WavReader};
 
-pub struct Audio {
-    pub sample_rate: u32,
-    /// Planar, normalised to [-1, 1].
-    pub channels: Vec<Vec<f32>>,
-}
-
-pub fn read(path: &std::path::Path) -> Result<Audio> {
-    let mut reader = WavReader::open(path)?;
-    let spec = reader.spec();
-    let channels = spec.channels as usize;
-    if channels == 0 {
-        anyhow::bail!("{} has no channels", path.display());
+/// Write planar float32 audio as a 32-bit float WAV.
+///
+/// Float, not 16-bit: the whole product argument is about content above 16 kHz, and
+/// rounding to 16 bits would put a floor under any A/B comparison.
+pub fn write(
+    path: &std::path::Path,
+    sample_rate: u32,
+    channels: usize,
+    planar: &[f32],
+) -> Result<()> {
+    if channels == 0 || planar.len() % channels != 0 {
+        anyhow::bail!(
+            "planar buffer of {} samples does not divide into {channels} channels",
+            planar.len()
+        );
     }
-
-    let interleaved: Vec<f32> = match spec.sample_format {
-        SampleFormat::Float => reader
-            .samples::<f32>()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("reading float samples")?,
-        SampleFormat::Int => {
-            let scale = 1.0 / (1i64 << (spec.bits_per_sample - 1)) as f32;
-            reader
-                .samples::<i32>()
-                .map(|s| s.map(|v| v as f32 * scale))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context("reading integer samples")?
-        }
+    let spec = hound::WavSpec {
+        channels: channels as u16,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
     };
-
-    let frames = interleaved.len() / channels;
-    let mut planar = vec![Vec::with_capacity(frames); channels];
+    let frames = planar.len() / channels;
+    let mut writer = hound::WavWriter::create(path, spec)
+        .with_context(|| format!("creating {}", path.display()))?;
     for frame in 0..frames {
-        for (channel, buffer) in planar.iter_mut().enumerate() {
-            buffer.push(interleaved[frame * channels + channel]);
+        for channel in 0..channels {
+            writer.write_sample(planar[channel * frames + frame])?;
         }
     }
-
-    Ok(Audio {
-        sample_rate: spec.sample_rate,
-        channels: planar,
-    })
+    writer
+        .finalize()
+        .with_context(|| format!("finalising {}", path.display()))?;
+    Ok(())
 }

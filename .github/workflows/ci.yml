@@ -22,6 +22,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The app links cpal (ALSA on Linux) and eframe (X11/Wayland/GL). The library
+      # crates need none of this, which is why the split matters, but `cargo test
+      # --workspace` builds the binary and so does need it.
+      - name: Install audio and window system headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libgl1-mesa-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libxinerama-dev libxkbcommon-dev libwayland-dev
+
       # The DSP fixtures are generated, not committed (tools/fixtures/out is
       # gitignored), so the comparison test needs the generator to run first. It is
       # numpy/scipy only, which is exactly why the fixtures can be checked in CI with

@@ -3,15 +3,29 @@
 A desktop player that reconstructs the high frequencies an MP3 threw away, and lets
 you hear the difference on a single keystroke.
 
-Status: **prototype.** The Rust workspace builds and its FlashSR preprocessing port
-matches scipy to −132 dB. The ONNX export passes its numeric gate (−74 dB vs PyTorch,
-worst track −48 dB) but ONNX Runtime runs it 30 to 60x slower than PyTorch on the same
-Apple Silicon, so the prototype runs the model in a Python sidecar the app installs on
-first run: RTF 0.543 through the pipe, output bit-identical to in-process Metal
-(ADR-010). There is no audio output and no UI yet. The working reference implementation
-is the Python PoC,
+Status: **prototype, playable on macOS.** `flacify setup` installs the Python sidecar and
+the model, `flacify enhance` renders a file, and `flacify play` opens a window with an
+instant A/B switch. The Rust side owns decode, analysis, the windowing pipeline, the seed
+schedule and the mixer; the model runs in a Python process the app installs and owns
+(ADR-010), because ONNX Runtime measured 30 to 60x slower than PyTorch on the same Apple
+Silicon (ADR-002). The working reference implementation is the Python PoC,
 [`gabriel-rivero/flashsr-stream`](https://github.com/gabriel-rivero/flashsr-stream).
-This repo is the Rust rewrite.
+
+## What works today
+
+```sh
+cargo build --release
+./target/release/flacify setup                 # once, about 6 GB
+./target/release/flacify probe song.mp3        # cutoff, verdict, wait
+./target/release/flacify enhance song.mp3      # -> song.mp3.flacify.wav
+./target/release/flacify play song.mp3         # window: space toggles, p plays
+./target/release/flacify play song.mp3 --smoke # headless audio-path check
+```
+
+Measured on an M5 Max: a 30.7 s clip renders in 34.1 s (including the 8 s worker start)
+and plays back at 48 kHz with the switch enabled. The generated band gains +24.6 dB at
+16–18 kHz and +61.6 dB at 18–22 kHz over the input; the level moves +0.57 dB, which is
+one of the open gaps in [`docs/roadmap.md`](docs/roadmap.md#gaps-found-building-the-prototype-2026-11-12).
 
 ## The one-paragraph pitch
 
@@ -39,17 +53,20 @@ See [`docs/vision.md`](docs/vision.md).
 | [`docs/dependencies.md`](docs/dependencies.md) | crates, model runtime, artifacts, licences |
 | [`docs/risks.md`](docs/risks.md) | risk register, kill criteria |
 | [`docs/backlog.md`](docs/backlog.md) | epics and issue drafts, in build order |
-| [`docs/decisions.md`](docs/decisions.md) | ADR-001 … ADR-008 with status |
+| [`docs/decisions.md`](docs/decisions.md) | ADR-001 … ADR-010 with status and outcomes |
 
 ## Start here
 
 ```sh
-cargo test --workspace                 # 39 tests, no GPU, no audio device, no model
-cargo run -p flacify -- probe song.mp3 # cutoff, what would be inferred, and the wait
+cargo test --workspace   # 87 tests, no GPU, no audio device, no model, no Python
 ```
 
-`docs/decisions.md` records the accepted ADRs. Everything downstream is written
-against them.
+`core` and `infer` are testable without a model, which is what makes the DSP and the
+mixer developable on any laptop. The Python sidecar is the one seam that needs the
+6 GB install, and even it is tested against a fake worker binary in CI.
+
+`docs/decisions.md` records the accepted ADRs and, for ADR-002, the measurement that
+reopened it.
 
 ## Reference material
 

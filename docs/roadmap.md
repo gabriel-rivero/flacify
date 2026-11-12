@@ -136,6 +136,53 @@ AP-BWE); a local HTTP + MCP server so agents and other tools can call the enhanc
 multi-channel and 44.1 kHz-native models; a public RTF-by-GPU compatibility table fed
 by opt-in reports.
 
+## Gaps found building the prototype (2026-11-12)
+
+The first playable prototype works: `flacify setup`, `enhance` and `play` exist, the
+toggle is sample-locked, and a 30.7 s clip renders in 34.1 s and plays through the
+output device. These are the gaps it exposed, in the order they hurt. Each one names the
+release where it should land.
+
+**v0.2, before anyone else uses it**
+
+1. **No FLAC out.** `enhance` writes 32-bit float WAV; `flacenc` is not wired up, so the
+   cache container from ADR-003 does not exist yet. WAV is also 3× larger.
+2. **No loudness match.** Measured +0.57 dB on a steady track, so the A/B switch steps in
+   level as well as in brightness. That makes the comparison slightly dishonest and it is
+   exactly what E2-6 was written for.
+3. **No low-band preservation.** The model regenerates the whole waveform: level-matched,
+   the output differs from the input by −18.7 dB RMS below 12 kHz and gains +2.9 dB in
+   4–12 kHz. Upstream's `mel_replace_ops` splices the input back below the cutoff; try it
+   and measure whether listeners prefer it.
+4. **No seek.** The progress bar is read-only; there is no way back to a moment.
+5. **Whole-track render before play.** `play` waits for the entire file (95 s for a
+   3-minute track) instead of using the render-ahead queue from ADR-001. The mixer and the
+   device path are what make streaming possible; only the scheduler is missing.
+6. **No visual feedback of its own.** No spectrum and no waveform (ADR-005 called for a
+   spectrum). The window is text, a button and a bar.
+
+**v0.3, or when the prototype becomes something to hand over**
+
+7. **No cache.** Every play re-renders. A second play of the same file costs the same as
+    the first, and the seed policy (ADR-006) is only useful once the result is stored.
+8. **Setup is verified in pieces, not end to end.** The uv download, the HF listing, the
+   state machine and the weights script each have evidence; nobody has run the full 6 GB
+   install on a clean machine. The `git+` install of the inference package is untested.
+9. **The worker is not supervised.** If it dies mid-render the app errors out; there is no
+   restart, and a wedged model with no output blocks the render thread forever.
+10. **Platform coverage is one machine.** CoreAudio only; the uv archive path is
+    macOS/Linux (Windows needs a `.zip`); 44.1 kHz device output is resampled but 96 kHz
+    and mono devices are untested.
+11. **Metadata is the filename.** No title, artist or duration from tags, no drag and drop.
+
+**Explicitly parked**
+
+12. Playlists, library view, EQ, export UI, system-wide sink, live capture: unchanged from
+    the MVP cut below, and none of them are blocked by the gaps above.
+13. `flacify probe --rtf` still defaults to 0.3. The app now knows how to measure this for
+    real (the render prints its own RTF); folding that into a saved hardware profile is
+    v0.2 work.
+
 ## The MVP cut, in one table
 
 | in | out |

@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# The fake worker is only a test fixture, but a test binary must exist at build time,
+# and this crate is unpublished, so it ships here rather than in a test-only crate.
+[[bin]]
+name = "fake-flashsr-worker"
+path = "src/bin/fake_worker.rs"
+
 [dependencies]
 flacify-core.workspace = true
 thiserror.workspace = true

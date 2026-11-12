@@ -3,6 +3,20 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
 
+# Everything below arrives with the egui/eframe windowing stack and none of it is on the
+# path of a .wav or .mp3: the two quick-xml vulnerabilities need untrusted XML, which
+# this app never parses, and the unmaintained crates are Windows/Linux glue. Revisit
+# when egui moves past 0.30 (roadmap: gaps, item 11).
+ignore = [
+    "RUSTSEC-2024-0436", # paste, unmaintained (pulled in by the font stack)
+    "RUSTSEC-2026-0192", # quick-xml: quadratic duplicate-attribute check
+    "RUSTSEC-2026-0194", # quick-xml: unbounded namespace allocation
+    "RUSTSEC-2026-0195", # ttf-parser, unmaintained
+    "RUSTSEC-2026-0370", # zbus_names, unmaintained (Linux only)
+    "RUSTSEC-2026-0371", # zvariant, unmaintained (Linux only)
+    "RUSTSEC-2026-0372", # zvariant_derive, unmaintained (Linux only)
+]
+
 [licenses]
 allow = [
     "MIT",
@@ -15,8 +29,22 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
+    # Pulled in by the egui stack: Boost (clipboard-win, Windows only) and the two
+    # font licences eframe embeds. All permissive; the fonts are unmodified.
+    "BSL-1.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 confidence-threshold = 0.9
+
+# `epaint_default_fonts` declares the Ubuntu font as a non-SPDX `LicenseRef`, so the
+# allowance has to be spelled per crate.
+# The crate writes the Ubuntu font licence as a non-SPDX `LicenseRef`, which no
+# allowance list can match; map it to the SPDX id it means.
+[[licenses.clarify]]
+name = "epaint_default_fonts"
+expression = "(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0"
+license-files = []
 
 [bans]
 multiple-versions = "warn"

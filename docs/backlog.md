@@ -149,6 +149,10 @@ committed and pushed to `gabriel-rivero/flacify`; CI is green on all three jobs.
 | E1-5 | **done for ONNX and eager PyTorch** | CPU 21.5, CoreML 31.1 / 21.7 / 15.2, PyTorch CPU 6.1, PyTorch MPS **0.51** |
 | E1-4, E1-6, E1-7, E1-8 | **open, and now blocking** | no runtime measured so far reaches the RTF ≤ 1.5 gate except PyTorch/Metal, which is not the planned backend |
 | E10-1, E10-2 | **done** | `tools/worker.py`, `worker_bench.py`, `worker_check.py`; RTF 0.543 through the pipe, 2 ms IPC, bit-identical to in-process Metal |
+| E10-3 | **done** | `crates/infer/src/python.rs` + `fake-flashsr-worker`; 9 integration tests, no torch in CI |
+| E10-4 | **done** | `flacify enhance` writes a 32-bit float WAV through the real pipeline; 30.7 s in 34.1 s |
+| E10-5 | **written, not run end to end** | `crates/app/src/setup.rs` with a resumable state machine; 12 tests, no network; the 6 GB install has never run on a clean machine |
+| E10-6 | **done** | `flacify play`: egui window, space to toggle, 8 ms sample-locked ramp, `--smoke` proves the device pulls audio |
 
 The three pipeline bugs the tests caught, recorded so they are not reintroduced: the
 windower drained a whole window per render instead of `step`; `finish` lost samples when

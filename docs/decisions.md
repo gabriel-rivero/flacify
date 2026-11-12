@@ -192,6 +192,29 @@ the sidecar carries the prototype and no claim in `vision.md` depends on it.
 
 ---
 
+## ADR-011 — The prototype plays from pre-rendered buffers
+
+**Status:** accepted for the prototype.
+**Context:** ADR-001 chose render-ahead with a bounded queue, which is still the right
+shape for v0.4. But at RTF 0.54 a whole track renders faster than it plays, and a
+streaming queue means shared mutable buffers handed to an audio callback under a lock
+we are not allowed to take. The first playable build needs the toggle to be right, not
+the scheduler.
+
+**Decision:** `play` decodes, analyses and renders the whole track, then plays from two
+immutable buffers of the same length. The A/B switch mixes between them at one shared
+position with an 8 ms ramp. Controls are atomics; the callback only reads, never blocks,
+never allocates.
+
+**Consequences:** sample-locked A/B is a property of the data structure, not of a
+synchronisation protocol, and it is testable without a device (six mixer tests). Memory
+is 2 × 4 bytes × frames per channel (about 140 MB for a 3-minute track) and the user
+waits for the render before pressing play — 95 s for 3 minutes. Both are acceptable for
+a prototype and neither is acceptable at v0.2: the queue in ADR-001 replaces this, and
+the mixer, the controls and the ramp survive the change unchanged.
+
+---
+
 ## Open questions
 
 1. **Runtime endgame.** Backlog E1-4 to E1-8: split the graph so the CoreML EP can take

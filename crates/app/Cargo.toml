@@ -13,8 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 flacify-core.workspace = true
+flacify-infer.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 hound.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+symphonia.workspace = true
+cpal = "0.17.3"
+eframe = "0.30.0"
+blake3 = "1.8.7"

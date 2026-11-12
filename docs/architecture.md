@@ -219,6 +219,17 @@ pipe (`tools/worker.py`): one window in, one window out, 2 ms of IPC, RTF 0.543,
 bit-identical to in-process Metal. `Model` is the seam, so this is one implementation
 rather than a fork of the design, and it never ships in a signed build.
 
+The app crate is small on purpose, one module per job:
+
+| module | job |
+|---|---|
+| `decode.rs` | symphonia → planar f32, channel map, polyphase resample to 48 kHz |
+| `render.rs` | decode + analyse + the pipeline + the sidecar, one track at a time |
+| `player.rs` | the mixer: two buffers, one position, an 8 ms ramp, atomics only |
+| `device.rs` | `cpal` output: config, one-time resample, channel map, callback |
+| `setup.rs` | first-run provisioning: uv, CPython, wheels, weights, resumable state |
+| `ui.rs` | the egui window: one toggle, one transport, progress |
+
 **The window-size cost.** Supporting 0.64 / 1.28 / 2.56 / 5.12 s at full quality
 means either dynamic axes (CoreML EP handles these poorly) or four copies of a
 3.3 GB model. So v1 ships one window size, chosen by measurement, and the latency

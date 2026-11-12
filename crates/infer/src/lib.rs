@@ -8,6 +8,7 @@
 pub mod engine;
 pub mod model;
 pub mod noise;
+pub mod python;
 
 pub use engine::Engine;
 pub use model::{FixedModel, IdentityModel, Model};

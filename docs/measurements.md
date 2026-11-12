@@ -128,6 +128,24 @@ The last row is the acceptance test for the sidecar and it is the one that matte
 the model runs, never *what* it computes. RTF 0.543 is 2.8x inside the gate, and the
 process boundary costs 2 ms.
 
+## End to end, through the app (2026-11-12)
+
+A 30.72 s stereo 48 kHz clip (the `music_cut16k` fixture tiled six times), rendered with
+`flacify enhance` and played with `flacify play --smoke`:
+
+| metric | value |
+|---|---|
+| render | 34.1 s wall for 30.7 s of audio, including ~8 s of worker start (steady RTF ≈ 0.85 with decode and preprocessing included) |
+| output length | 1,474,560 frames, identical to the input |
+| generated band vs input | +24.6 dB at 16–18 kHz, +61.6 dB at 18–22 kHz, +54.4 dB at 22–24 kHz |
+| level | +0.57 dB (no loudness match yet: roadmap gap 2) |
+| low band, level matched | −0.8 dB at 0.1–1 kHz, −0.3 dB at 1–4 kHz, +2.9 dB at 4–12 kHz, but −18.7 dB RMS waveform difference below 12 kHz (the model regenerates, it does not splice: gap 3) |
+| playback | device 48 kHz × 2 ch, 57,344 frames (1.19 s) pulled in 1.2 s, switch enabled, no underrun |
+
+`play --smoke` is the headless proof that the callback runs and the playhead moves; the
+window itself is not verified visually here (the agent has no screen-recording
+permission), only that the process runs clean.
+
 Borrowed from P1, and **not** transferable to M1:
 
 | number | value | source |

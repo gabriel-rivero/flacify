@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: build, lint, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The DSP fixtures are generated, not committed (tools/fixtures/out is
+      # gitignored), so the comparison test needs the generator to run first. It is
+      # numpy/scipy only, which is exactly why the fixtures can be checked in CI with
+      # no torch and no GPU.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install fixture generator dependencies
+        run: python3 -m pip install --quiet numpy scipy
+
+      - name: Generate scipy fixtures
+        run: python3 tools/fixtures/gen.py
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The tests are the evidence that the port matches scipy; run them after lint so
+      # a style failure does not hide a numeric one, and with the fixtures present so
+      # the comparison cannot silently skip.
+      - name: Test
+        run: |
+          test -f tools/fixtures/out/manifest.json
+          cargo test --workspace --all-targets
+
+  python-tools:
+    name: spike tooling parses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The export needs torch and weights, which CI has neither of. This only proves
+      # the tools are importable and their arguments parse, so `--help` cannot rot.
+      - name: Byte-compile the tools
+        run: python3 -m py_compile tools/*.py tools/fixtures/gen.py
+
+  deny:
+    name: licences and advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources advisories

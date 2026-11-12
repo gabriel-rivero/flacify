@@ -1,0 +1,12 @@
+[package]
+name = "flacify-infer"
+description = "Model inference for flacify: deterministic noise, window engine, ONNX seam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+flacify-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

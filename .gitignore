@@ -1,0 +1,11 @@
+/target
+/tools/fixtures/out
+/tools/out
+/tools/flashsr
+/.venv
+__pycache__/
+*.pyc
+*.wav
+*.flac
+/poc/
+.DS_Store

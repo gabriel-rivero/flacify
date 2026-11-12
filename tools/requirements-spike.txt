@@ -1,0 +1,24 @@
+# Dependencies for the ONNX export spike only. Nothing here ships: the app's runtime
+# has no Python, and the exported .onnx file is the artifact these produce.
+#
+#   python3 -m venv .venv && . .venv/bin/activate
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu   # or cu124/mps
+#   pip install -r tools/requirements-spike.txt
+#   git clone https://github.com/jakeoneijk/FlashSR_Inference ./flashsr
+#
+# The FlashSR inference package itself is not on PyPI:
+#   pip install git+https://github.com/jakeoneijk/FlashSR_Inference
+# or clone it and pass --flashsr-dir ./flashsr.
+
+torch>=2.0
+onnx>=1.16
+onnxruntime>=1.18
+
+numpy
+scipy>=1.10
+librosa>=0.9.2
+matplotlib
+einops
+pyyaml
+tqdm
+huggingface_hub>=0.20

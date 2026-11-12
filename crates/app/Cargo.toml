@@ -1,0 +1,19 @@
+[package]
+name = "flacify"
+description = "Play lossy audio through a model that infers the missing high band"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flacify"
+path = "src/main.rs"
+
+[dependencies]
+flacify-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+hound.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

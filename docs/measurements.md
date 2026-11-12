@@ -171,6 +171,32 @@ it, so playback would have clipped. `limit.rs` now applies a soft knee above 0.9
 after it, peak **0.999**, zero samples at or past full scale, 53,294 samples shaped
 (0.6 % of the file) and RMS 0.2712 instead of 0.2714 — the level did not move.
 
+### A clean install, end to end (2026-11-12)
+
+`flacify setup` on a machine with no Python, no torch and no weights, from a release
+build, then `play --smoke` on a 5.12 s clip:
+
+| stage | result |
+|---|---|
+| `setup`, first run | all seven steps, about 5.9 GB downloaded |
+| `setup`, second run | nothing to do, 0.7 s |
+| `play --smoke`, cold (first run after install) | 38.1 s wall, 13.5 s CPU |
+| `play --smoke`, warm | 16.5 s wall for 5.12 s of audio (load ~8 s, render ~4 s, playback 1.2 s) |
+| output | 48 kHz × 2 ch, 57,344 frames pulled in 1.2 s, switch enabled |
+
+Two bugs only a clean install could find:
+
+1. **The inference package cannot be pip-installed.** Its `setup.py` uses
+   `find_packages`, which skips directories without an `__init__.py`, and
+   `TorchJaekwon/Model` is one of them, so the worker died on
+   `No module named 'TorchJaekwon.Model'`. The setup step now downloads the source archive
+   and puts the tree on `sys.path`, which is what the dev checkout always used.
+2. **The wheels list was missing `matplotlib` and `einops`.** Upstream imports matplotlib
+   at module load (`UtilTorch.py`) and einops inside the UNet, so the worker died on the
+   first import either way. Both are in the list now, and the wheels step records the list
+   as a manifest so changing it re-runs the step on an existing install instead of being
+   silently skipped.
+
 | | before the limiter | after |
 |---|---|---|
 | peak | 1.3622 | 0.999 |

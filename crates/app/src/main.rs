@@ -118,7 +118,7 @@ fn worker_config(paths: &setup::Paths) -> Result<WorkerConfig> {
         program: paths.venv_python(),
         worker_script: paths.worker_script(),
         model_dir: paths.models_dir(),
-        flashsr_dir: None,
+        flashsr_dir: Some(paths.flashsr_dir()),
         device: "mps".to_string(),
     })
 }

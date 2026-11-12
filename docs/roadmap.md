@@ -171,9 +171,12 @@ release where it should land.
 
 8. **No cache.** Every play re-renders. A second play of the same file costs the same as
     the first, and the seed policy (ADR-006) is only useful once the result is stored.
-9. **Setup is verified in pieces, not end to end.** The uv download, the HF listing, the
-   state machine and the weights script each have evidence; nobody has run the full 6 GB
-   install on a clean machine. The `git+` install of the inference package is untested.
+9. **Setup is verified, but its progress is coarse.** A clean install now runs end to end
+   (~5.9 GB, and it caught two real bugs: a non-installable upstream package and two missing
+   wheels). What is still missing: per-step progress rather than `step: ... / step: done`,
+   resume *inside* a step (a dropped connection restarts that step's download), and a
+   check that the installed sidecar actually imports before declaring success. Windows is
+   untested.
 10. **The worker is not supervised.** If it dies mid-render the app errors out; there is no
    restart, and a wedged model with no output blocks the render thread forever.
 11. **Platform coverage is one machine.** CoreAudio only; the uv archive path is

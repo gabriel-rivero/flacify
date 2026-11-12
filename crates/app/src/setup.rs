@@ -46,7 +46,35 @@ const WEIGHT_FILES: [(&str, u64); 3] = [
 ];
 const WEIGHTS_BYTES: u64 = WEIGHT_FILES[0].1 + WEIGHT_FILES[1].1 + WEIGHT_FILES[2].1;
 const WEIGHTS_REPO: &str = "jakeoneijk/FlashSR_weights";
-const FLASHSR_PACKAGE: &str = "git+https://github.com/jakeoneijk/FlashSR_Inference";
+const FLASHSR_ARCHIVE: &str =
+    "https://codeload.github.com/jakeoneijk/FlashSR_Inference/tar.gz/refs/heads/main";
+
+/// Downloads the inference source tree and unpacks it without its top-level directory.
+///
+/// The package is not installable from pip: its `setup.py` uses `find_packages`, which
+/// skips every directory without an `__init__.py`, and `TorchJaekwon/Model` is one of
+/// them. A pip install therefore produces an interpreter that fails on
+/// `from TorchJaekwon.Model... import ...` — found on a clean install, 2026-11-12. The
+/// source tree on `sys.path` has no such problem, and it is what the dev checkout uses.
+const FLASHSR_SCRIPT: &str = r#"
+import io, sys, tarfile, urllib.request
+from pathlib import Path
+
+url, dest, marker = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
+with urllib.request.urlopen(url, timeout=120) as response:
+    payload = response.read()
+dest.mkdir(parents=True, exist_ok=True)
+with tarfile.open(fileobj=io.BytesIO(payload)) as archive:
+    for member in archive.getmembers():
+        parts = member.name.split("/", 1)
+        if len(parts) != 2 or not parts[1]:
+            continue
+        member.name = parts[1]
+        archive.extract(member, dest, filter="data")
+if not (dest / marker).is_file():
+    raise SystemExit(f"the archive did not contain {marker}")
+print("extracted", dest / marker, flush=True)
+"#;
 
 /// The pip command, in one place so the exact versions are reviewable.
 const PYTHON_WHEELS: &[&str] = &[
@@ -62,7 +90,24 @@ const PYTHON_WHEELS: &[&str] = &[
     "torchaudio",
     "pydub",
     "psutil",
+    // Upstream imports matplotlib at module load (TorchJaekwon/Util/UtilTorch.py) and
+    // einops inside the UNet. Neither is obviously "inference", both are load-bearing;
+    // found the hard way on a clean install, 2026-11-12.
+    "matplotlib",
+    "einops",
 ];
+
+/// What the wheels receipt records. Comparing this string is how a change to
+/// `PYTHON_WHEELS` re-runs the step on an install that already exists — without it, a
+/// missing wheel is invisible because the receipt file is still there.
+pub fn wheels_manifest() -> String {
+    PYTHON_WHEELS.join("\n") + "\n"
+}
+
+/// Same idea for the embedded sidecar sources.
+pub fn worker_manifest() -> String {
+    format!("{WORKER_PY}\n{FLASHSR_ONNX_PY}")
+}
 
 /// Downloads the missing weights; each file argument is `name=bytes` and the script
 /// fails when the file it got is a different size.
@@ -159,8 +204,18 @@ impl Paths {
         self.venv_dir().join(STEP_RECEIPT)
     }
 
-    pub(crate) fn flashsr_receipt(&self) -> PathBuf {
-        self.venv_dir().join("flashsr.ready")
+    pub(crate) fn worker_receipt(&self) -> PathBuf {
+        self.runtime_dir().join("worker.manifest")
+    }
+
+    /// The extracted FlashSR source tree, which the worker puts on `sys.path`.
+    pub fn flashsr_dir(&self) -> PathBuf {
+        self.runtime_dir().join("flashsr")
+    }
+
+    /// The file whose presence means the tree really unpacked.
+    pub(crate) fn flashsr_sources(&self) -> PathBuf {
+        self.flashsr_dir().join("FlashSR").join("FlashSR.py")
     }
 
     fn uv_binary(&self) -> PathBuf {
@@ -209,8 +264,8 @@ pub fn plan() -> Vec<Step> {
         },
         Step {
             id: STEP_FLASHSR,
-            label: "FlashSR inference package",
-            bytes: 0,
+            label: "FlashSR inference sources",
+            bytes: 40_000_000,
         },
         Step {
             id: STEP_WORKER,
@@ -255,6 +310,8 @@ pub trait Runner {
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<()>;
     /// The size of a regular file, or `None` when it is absent.
     fn size(&self, path: &Path) -> Option<u64>;
+    /// The contents of a regular file, or `None` when it is unreadable.
+    fn read(&self, path: &Path) -> Option<Vec<u8>>;
 }
 
 /// The real runner: child processes, and files written through a temp file.
@@ -295,6 +352,10 @@ impl Runner for SystemRunner {
 
     fn size(&self, path: &Path) -> Option<u64> {
         file_size(path)
+    }
+
+    fn read(&self, path: &Path) -> Option<Vec<u8>> {
+        std::fs::read(path).ok()
     }
 }
 
@@ -417,32 +478,29 @@ fn install_wheels(paths: &Paths, runner: &dyn Runner, uv: &Option<PathBuf>) -> R
     let mut args: Vec<&str> = vec!["pip", "install", "--python", python.as_str()];
     args.extend(PYTHON_WHEELS);
     runner.run(uv, &args)?;
-    runner.write(&paths.wheels_receipt(), b"wheels\n")
+    runner.write(&paths.wheels_receipt(), wheels_manifest().as_bytes())
 }
 
-/// The inference package is not on PyPI, so it comes from its git repo. `--no-deps`
-/// because its `setup.py` asks for training tools (wandb, tensorboardX) that inference
-/// never imports, and every wheel it actually needs is installed by the previous step.
-fn install_flashsr(paths: &Paths, runner: &dyn Runner, uv: &Option<PathBuf>) -> Result<()> {
-    let uv = require_uv(uv)?;
-    let python = paths.venv_python().to_string_lossy().into_owned();
+/// Unpack the inference source tree. See `FLASHSR_SCRIPT` for why this is a download
+/// and not a pip install.
+fn install_flashsr(paths: &Paths, runner: &dyn Runner, _uv: &Option<PathBuf>) -> Result<()> {
+    let destinations = paths.flashsr_dir();
     runner.run(
-        uv,
+        &paths.venv_python(),
         &[
-            "pip",
-            "install",
-            "--python",
-            python.as_str(),
-            "--no-deps",
-            FLASHSR_PACKAGE,
+            "-c",
+            FLASHSR_SCRIPT,
+            FLASHSR_ARCHIVE,
+            destinations.to_string_lossy().as_ref(),
+            "FlashSR/FlashSR.py",
         ],
-    )?;
-    runner.write(&paths.flashsr_receipt(), b"flashsr\n")
+    )
 }
 
 fn write_worker(paths: &Paths, runner: &dyn Runner) -> Result<()> {
     runner.write(&paths.worker_script(), WORKER_PY.as_bytes())?;
-    runner.write(&paths.flashsr_script(), FLASHSR_ONNX_PY.as_bytes())
+    runner.write(&paths.flashsr_script(), FLASHSR_ONNX_PY.as_bytes())?;
+    runner.write(&paths.worker_receipt(), worker_manifest().as_bytes())
 }
 
 fn download_weights(paths: &Paths, runner: &dyn Runner) -> Result<()> {
@@ -579,11 +637,15 @@ fn step_outputs_exist(id: &str, paths: &Paths, runner: &dyn Runner, uv: Option<&
         STEP_UV => uv.is_some(),
         STEP_PYTHON => runner.size(&paths.python_receipt()).is_some(),
         STEP_VENV => runner.size(&paths.venv_python()).is_some(),
-        STEP_WHEELS => runner.size(&paths.wheels_receipt()).is_some(),
-        STEP_FLASHSR => runner.size(&paths.flashsr_receipt()).is_some(),
+        STEP_WHEELS => {
+            runner.read(&paths.wheels_receipt()).as_deref() == Some(wheels_manifest().as_bytes())
+        }
+        STEP_FLASHSR => runner.size(&paths.flashsr_sources()).is_some(),
         STEP_WORKER => {
             runner.size(&paths.worker_script()).is_some()
                 && runner.size(&paths.flashsr_script()).is_some()
+                && runner.read(&paths.worker_receipt()).as_deref()
+                    == Some(worker_manifest().as_bytes())
         }
         STEP_WEIGHTS => WEIGHT_FILES
             .iter()

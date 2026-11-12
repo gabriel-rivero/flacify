@@ -140,11 +140,26 @@ impl Runner for FakeRunner {
         if args.first() == Some(&"venv") && self.is_venv_created {
             SystemRunner.write(&self.venv_python, b"#!/bin/sh\n")?;
         }
+        // The flashsr step runs the extractor script; its contract is that the marker
+        // file exists afterwards, so that is what the double produces.
+        if let Some(marker) = args.iter().find(|arg| arg.ends_with("FlashSR/FlashSR.py")) {
+            if let Some(dest) = args
+                .iter()
+                .position(|arg| *arg == *marker)
+                .and_then(|i| args.get(i - 1))
+            {
+                SystemRunner.write(&Path::new(dest).join(marker), b"class FlashSR: ...\n")?;
+            }
+        }
         Ok(())
     }
 
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         SystemRunner.write(path, bytes)
+    }
+
+    fn read(&self, path: &Path) -> Option<Vec<u8>> {
+        std::fs::read(path).ok()
     }
 
     fn size(&self, path: &Path) -> Option<u64> {
@@ -184,10 +199,11 @@ fn write_state(paths: &Paths, done: &[&str]) {
 fn create_complete_install(paths: &Paths) {
     write_file(&paths.python_receipt(), b"python 3.12\n");
     write_file(&paths.venv_python(), b"#!/bin/sh\n");
-    write_file(&paths.wheels_receipt(), b"wheels\n");
-    write_file(&paths.flashsr_receipt(), b"flashsr\n");
+    write_file(&paths.wheels_receipt(), setup::wheels_manifest().as_bytes());
+    write_file(&paths.flashsr_sources(), b"class FlashSR: ...\n");
     write_file(&paths.worker_script(), b"print('worker')\n");
     write_file(&paths.flashsr_script(), b"print('flashsr')\n");
+    write_file(&paths.worker_receipt(), setup::worker_manifest().as_bytes());
     for (name, bytes) in WEIGHT_SIZES {
         sparse_file(&paths.models_dir().join(name), bytes);
     }
@@ -481,7 +497,7 @@ fn given_the_plan_when_summed_then_it_reports_the_size_the_screen_shows() {
     let total: u64 = steps.iter().map(|step| step.bytes).sum();
     assert_eq!(
         total,
-        20_000_000 + 30_000_000 + 1_000_000 + 2_500_000_000 + 3_316_519_586,
+        20_000_000 + 30_000_000 + 1_000_000 + 2_500_000_000 + 40_000_000 + 3_316_519_586,
         "the setup screen prints this total"
     );
 }

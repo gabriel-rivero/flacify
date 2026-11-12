@@ -427,9 +427,13 @@ fn given_a_venv_without_an_interpreter_when_ensure_runs_then_the_error_names_the
         message.contains("venv"),
         "the step id is missing: {message}"
     );
+    // The path shape differs by platform (bin/python vs Scripts\python.exe), so assert
+    // on the path the code actually computed, not on a fragment of it.
+    let expected = paths.venv_python();
     assert!(
-        message.contains("bin/python"),
-        "the path is missing: {message}"
+        message.contains(&expected.display().to_string()),
+        "the path {} is missing from: {message}",
+        expected.display()
     );
 }
 

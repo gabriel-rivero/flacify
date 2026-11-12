@@ -6,6 +6,11 @@ Status: draft, 2026-11-12. Versions are deliberately unpinned; pin them in
 The rule: **the shipped binary must not contain Python.** If a dependency needs a
 Python runtime, it belongs in `tools/`, not in `crates/`.
 
+**Prototype exception (ADR-010).** v0.0 installs a Python sidecar on first run: `uv`
+fetches CPython 3.12, pip installs the pinned wheels, and the weights download from
+upstream. About 6 GB, once. This is time-boxed scaffolding for evaluating the product,
+not a shipping design, and the rule above is unchanged for v1.
+
 ## Rust crates
 
 | crate | why | risk |

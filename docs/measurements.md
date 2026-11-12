@@ -108,6 +108,26 @@ Two facts matter here:
 So ADR-002's numeric gate passes and its throughput gate fails. The runtime choice, not
 the model, is what failed.
 
+## The Python sidecar (prototype runtime, ADR-010)
+
+`tools/worker.py` keeps the model resident and serves one window per request over a
+binary pipe; `tools/worker_bench.py` drives it exactly the way the Rust client will.
+
+| metric | value |
+|---|---|
+| steady state, 12 consecutive windows of real fixture audio | 2.78 s per window, **RTF 0.543** |
+| compute portion (the worker's own per-window log) | 2.78 s |
+| IPC for a 2 MB request plus a 2 MB reply | **2 ms**, about 0.07 % of a window |
+| interpreter start, import and weight load | 8.2 s |
+| first audio (load + warmup + first window) | 12.7 s |
+| worker RSS as `ps` reports it | 870 MB (MPS allocations are not fully visible to `ps`; weights are 3.3 GB on disk) |
+| worker output vs in-process Metal reference, same window and noise | **bit-identical**, max abs diff 0.0 |
+
+The last row is the acceptance test for the sidecar and it is the one that matters:
+`tools/worker_check.py` must stay at zero difference, because the worker changes *where*
+the model runs, never *what* it computes. RTF 0.543 is 2.8x inside the gate, and the
+process boundary costs 2 ms.
+
 Borrowed from P1, and **not** transferable to M1:
 
 | number | value | source |

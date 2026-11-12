@@ -116,6 +116,17 @@ doc line that would have been wrong. No issue closes on "works on my machine".
 | E9-2 | `docs/measurements.md` per machine | every claim traceable |
 | E9-3 | "What this does not do" section | reviewed by someone who does not like the idea |
 
+## E10 — Python sidecar prototype (v0.0, ADR-010)
+
+| # | title | acceptance |
+|---|---|---|
+| E10-1 | `tools/worker.py`: resident model, binary stdio protocol, Metal by default | **done**: RTF 0.543 over 12 windows, 2 ms IPC, output bit-identical to in-process Metal |
+| E10-2 | `tools/worker_bench.py`, `tools/worker_check.py` | **done**: RTF, compute/IPC split, startup, RSS in JSON; the bit-exactness gate fails loudly |
+| E10-3 | `PythonWorkerModel` in `crates/infer`: spawn, handshake, restart, timeouts | `cargo test` green against a fake worker script, with nothing installed |
+| E10-4 | `flacify enhance in.wav -o out.flac` end to end through the sidecar | a 3-minute track renders in ~95 s and prints the measured RTF |
+| E10-5 | First-run setup: uv-fetched CPython, pinned wheels, weights, resumable | clean machine reaches E10-4 with one command, and reports the 6 GB before starting |
+| E10-6 | Playback + A/B toggle, file-based first | toggle is sample-locked and gap-free between original and rendered buffers |
+
 ## State of the scaffold (2026-11-12)
 
 What actually exists, with its evidence. The Rust workspace and the export are
@@ -137,6 +148,7 @@ committed and pushed to `gabriel-rivero/flacify`; CI is green on all three jobs.
 | E1-3 | **done on 4 fixtures** | worst track −47.78 dB, gate −40; five real tracks need E8-1 |
 | E1-5 | **done for ONNX and eager PyTorch** | CPU 21.5, CoreML 31.1 / 21.7 / 15.2, PyTorch CPU 6.1, PyTorch MPS **0.51** |
 | E1-4, E1-6, E1-7, E1-8 | **open, and now blocking** | no runtime measured so far reaches the RTF ≤ 1.5 gate except PyTorch/Metal, which is not the planned backend |
+| E10-1, E10-2 | **done** | `tools/worker.py`, `worker_bench.py`, `worker_check.py`; RTF 0.543 through the pipe, 2 ms IPC, bit-identical to in-process Metal |
 
 The three pipeline bugs the tests caught, recorded so they are not reintroduced: the
 windower drained a whole window per render instead of `step`; `finish` lost samples when

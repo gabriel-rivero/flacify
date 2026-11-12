@@ -213,6 +213,12 @@ ONNX Runtime is what is slow, and the CoreML EP mostly fell back to CPU. The num
 the method are in [`measurements.md`](measurements.md); the open decision is backlog
 E1-4 to E1-6.
 
+**Prototype deployment (ADR-010).** Until a Rust-native backend reaches Metal, the app
+runs the model in a Python sidecar it installs on first run and talks to over a binary
+pipe (`tools/worker.py`): one window in, one window out, 2 ms of IPC, RTF 0.543,
+bit-identical to in-process Metal. `Model` is the seam, so this is one implementation
+rather than a fork of the design, and it never ships in a signed build.
+
 **The window-size cost.** Supporting 0.64 / 1.28 / 2.56 / 5.12 s at full quality
 means either dynamic axes (CoreML EP handles these poorly) or four copies of a
 3.3 GB model. So v1 ships one window size, chosen by measurement, and the latency

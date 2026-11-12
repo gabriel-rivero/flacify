@@ -159,14 +159,43 @@ non-commercial, that decision propagates to the whole product.
 
 ---
 
-## Open questions for you
+## ADR-010 — The prototype runs the model in a Python sidecar
 
-1. **Runtime.** Accept ADR-002 (ONNX) as the plan of record, or spike candle-Metal
-   first because a pure-Rust binary matters more than EP breadth?
-2. **MVP shape.** Accept ADR-001 (render-ahead, cache in v0.3), or keep real-time
-   streaming as the v0.2 deliverable because that is the thing you want to see work?
-3. **UI.** `egui` (one binary, hand-painted) or Tauri (better looking, webview
-   dependency, JS toolchain)?
-4. **Name.** Keep `flacify` for the app and accept that "flacify" describes the
-   export, not the player? Or name the player something else and keep `flacify` as the
-   CLI verb (`flacify enhance in.mp3`)?
+**Status:** accepted for the prototype, with an exit criterion. Supersedes the ONNX
+Runtime commitment in ADR-002 *for v0.0 only*.
+**Context:** ADR-002's spike measured the exported graph at RTF 15.2 to 31.1 on every
+ONNX Runtime configuration, against 0.51 for the same weights under PyTorch on Metal
+(`measurements.md`). The model is fast enough; no runtime we can reach from Rust is.
+Waiting for that to be fixed means not having a product to evaluate.
+
+**Decision:** the Rust app stays the app. The model runs in a Python 3.12 process that
+the app installs and owns: `uv` fetches the interpreter into the app data directory,
+pip installs pinned wheels, the weights download from upstream, and the app spawns a
+worker that serves one window per request over a binary pipe (`tools/worker.py`).
+Rust keeps everything else: decode, preprocessing, windowing, the seed schedule, the
+buffer policy and the A/B alignment.
+
+**Consequences:**
+
+- **First run downloads about 6 GB** (interpreter and wheels ~2.5 GB, weights 3.3 GB).
+  That is a product-visible number and the setup screen has to say it before it starts.
+- **"No Python at runtime" becomes a v1 requirement, not a prototype requirement.**
+  The sidecar is never part of a signed build; it is scaffolding with a deadline.
+- The `Model` trait does not change, so the rest of the Rust code cannot tell the
+  difference, and swapping the backend later is a single implementation.
+- Measured on M5 Max: RTF 0.543 through the pipe, 2 ms of IPC per window, output
+  bit-identical to the in-process Metal reference.
+
+**Exit criterion:** a Rust-native backend that reaches Metal at RTF ≤ 1.5 (or an ONNX
+path that closes the 30x gap) replaces this before any user-facing release. Until then
+the sidecar carries the prototype and no claim in `vision.md` depends on it.
+
+---
+
+## Open questions
+
+1. **Runtime endgame.** Backlog E1-4 to E1-8: split the graph so the CoreML EP can take
+   the convolutions, or move to libtorch/candle/MLX from Rust. ADR-010 buys the time.
+2. **Where the toggle lives in the prototype.** With the sidecar at RTF 0.54 a 3-minute
+   track renders in ~95 s, so the toggle can be file-based (render, then A/B between two
+   decoded buffers) before the streaming queue exists (ADR-001's v0.4).

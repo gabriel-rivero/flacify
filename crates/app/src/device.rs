@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use flacify_core::dsp::resample::Resampler;
 
+use crate::frontier::Frontier;
 use crate::player::{Controls, Mixer};
 
 /// Bigger than any buffer a device asked us for in practice; the callback clamps to it
@@ -32,27 +33,82 @@ pub struct AudioEngine {
 impl AudioEngine {
     /// `original` and `enhanced` are interleaved stereo at 48 kHz, same length.
     pub fn start(original: &[f32], enhanced: Option<&[f32]>) -> Result<Self> {
+        let output = Output::open()?;
+        let prepared = prepare(original, output.rate, output.channels)?;
+        let generated = match enhanced {
+            Some(buffer) => Some(prepare(buffer, output.rate, output.channels)?),
+            None => None,
+        };
+        let (mixer, controls) = Mixer::new(prepared, generated, output.channels, output.rate);
+        output.start(mixer, controls)
+    }
+
+    /// Play now, generate behind: the frontier must be 48 kHz stereo, because a
+    /// progressive render cannot be resampled per chunk without seams.
+    pub fn start_progressive(original: &[f32], frontier: Arc<Frontier>) -> Result<Self> {
+        let output = Output::open()?;
+        if output.rate != flacify_core::SAMPLE_RATE || output.channels != 2 {
+            anyhow::bail!(
+                "progressive playback needs a 48 kHz stereo device; this one is {} Hz with {} channels",
+                output.rate,
+                output.channels
+            );
+        }
+        let prepared = prepare(original, output.rate, output.channels)?;
+        let (mixer, controls) =
+            Mixer::progressive(prepared, frontier, output.channels, output.rate);
+        output.start(mixer, controls)
+    }
+}
+
+/// The device we found, before deciding what to feed it.
+struct Output {
+    device: cpal::Device,
+    config: cpal::StreamConfig,
+    format: cpal::SampleFormat,
+    rate: u32,
+    channels: usize,
+}
+
+impl Output {
+    fn open() -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
             .context("no default output device")?;
-        let supported = device
+        let default = device
             .default_output_config()
             .context("asking the output device for its default configuration")?;
 
-        let device_rate = supported.sample_rate();
-        let device_channels = supported.channels() as usize;
-        let sample_format = supported.sample_format();
+        // Prefer a stereo 48 kHz configuration when the device offers one: that is what
+        // lets playback start before the render finishes. A 96 kHz default is common and
+        // would otherwise force the slow path for no product reason.
+        let preferred = device
+            .supported_output_configs()
+            .ok()
+            .and_then(|mut configs| {
+                configs
+                    .find(|range| {
+                        range.channels() == 2
+                            && range.min_sample_rate() <= flacify_core::SAMPLE_RATE
+                            && range.max_sample_rate() >= flacify_core::SAMPLE_RATE
+                    })
+                    .map(|range| range.with_sample_rate(flacify_core::SAMPLE_RATE))
+            });
+        let supported = preferred.unwrap_or(default);
+        let rate = supported.sample_rate();
+        let channels = supported.channels() as usize;
+        let format = supported.sample_format();
+        Ok(Self {
+            device,
+            config: supported.into(),
+            format,
+            rate,
+            channels,
+        })
+    }
 
-        let original = prepare(original, device_rate, device_channels)?;
-        let enhanced = match enhanced {
-            Some(buffer) => Some(prepare(buffer, device_rate, device_channels)?),
-            None => None,
-        };
-
-        let (mixer, controls) = Mixer::new(original, enhanced, device_channels, device_rate);
-        let mut config: cpal::StreamConfig = supported.into();
-
+    fn start(mut self, mixer: Mixer, controls: Arc<Controls>) -> Result<AudioEngine> {
         // A fixed buffer size is a request, not a guarantee: WASAPI in shared mode and
         // some ALSA configurations refuse it. Ask for the small one, fall back to
         // whatever the device wants, and report the second failure with both contexts.
@@ -62,13 +118,13 @@ impl AudioEngine {
             cpal::BufferSize::Fixed(PREFERRED_BUFFER_FRAMES),
             cpal::BufferSize::Default,
         ] {
-            config.buffer_size = buffer_size;
+            self.config.buffer_size = buffer_size;
             match open(
-                &device,
-                &config,
-                sample_format,
+                &self.device,
+                &self.config,
+                self.format,
                 mixer.clone(),
-                device_channels,
+                self.channels,
             ) {
                 Ok(opened) => {
                     stream = Some(opened);
@@ -86,12 +142,21 @@ impl AudioEngine {
         })?;
 
         stream.play().context("starting playback")?;
-        Ok(Self {
+        Ok(AudioEngine {
             _stream: stream,
             controls,
-            device_rate,
-            device_channels,
+            device_rate: self.rate,
+            device_channels: self.channels,
         })
+    }
+}
+
+/// Whether progressive playback can work here: chunks are 48 kHz stereo, and
+/// resampling them one second at a time would put a seam at every boundary.
+pub fn progressive_supported() -> bool {
+    match Output::open() {
+        Ok(output) => output.rate == flacify_core::SAMPLE_RATE && output.channels == 2,
+        Err(_) => false,
     }
 }
 

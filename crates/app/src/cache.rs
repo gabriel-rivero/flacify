@@ -70,27 +70,6 @@ impl Cache {
         self.root.join(key)
     }
 
-    /// The bytes a cached entry occupies, for the "cache is 400 MB" line a real app needs.
-    pub fn size_bytes(&self) -> u64 {
-        let mut total = 0;
-        if let Ok(entries) = std::fs::read_dir(&self.root) {
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() {
-                        total += meta.len();
-                    } else if meta.is_dir() {
-                        if let Ok(files) = std::fs::read_dir(entry.path()) {
-                            for file in files.flatten() {
-                                total += file.metadata().map(|m| m.len()).unwrap_or(0);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        total
-    }
-
     /// `None` when there is no entry; an error when there is one and it cannot be read,
     /// because silence about a corrupt cache entry is how you end up debugging audio.
     pub fn load(&self, key: &str) -> Result<Option<Cached>> {

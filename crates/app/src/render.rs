@@ -18,9 +18,13 @@ use crate::decode;
 pub const WINDOW: usize = 245_760;
 /// One second, the reference implementation's default overlap.
 pub const OVERLAP: usize = 48_000;
-/// Frames handed to the pipeline per push. Small enough to report progress, large
-/// enough that the per-call overhead does not matter (the model dominates by 1000x).
-const CHUNK: usize = 8 * (WINDOW - OVERLAP);
+/// Frames handed to the pipeline per push.
+///
+/// One `step` per push: that is the amount of input that produces exactly one emitted
+/// window, so the frontier gains a second of audio every time the model finishes one.
+/// Pushing the whole track at once (which is what this used to do) means the frontier
+/// stays empty until the render is over, and progressive playback cannot work at all.
+const CHUNK: usize = WINDOW - OVERLAP;
 
 /// A decoded track: planar stereo at 48 kHz.
 pub struct Track {
@@ -135,14 +139,59 @@ pub fn enhance(
     seed: u64,
     progress: &mut dyn FnMut(usize),
 ) -> Result<Render> {
+    let mut planar = Vec::with_capacity(track.frames * 2);
+    let (limit, device) = enhance_streaming(track, cutoff_hz, worker, seed, progress, |chunk| {
+        planar.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    Ok(Render {
+        planar,
+        limit,
+        device,
+    })
+}
+
+/// The pipeline, emitting audio as it arrives instead of at the end.
+///
+/// `on_audio` receives planar stereo (the limiter has already run, so what it gets is
+/// final) and may be called many times. The limiter is a per-sample function, so
+/// limiting each block gives exactly the same samples as limiting the whole track
+/// afterwards — which is what lets the frontier publish before the render finishes.
+pub fn enhance_streaming(
+    track: &Track,
+    cutoff_hz: Option<u32>,
+    worker: &WorkerConfig,
+    seed: u64,
+    progress: &mut dyn FnMut(usize),
+    mut on_audio: impl FnMut(&[f32]) -> Result<()>,
+) -> Result<(crate::limit::LimitReport, String)> {
     let model = PythonWorker::spawn(worker).context("starting the model worker")?;
     let device = model.hello().device.clone();
     let engine = Engine::new(model, 2, WINDOW, cutoff_hz)?;
     let mut pipeline = Pipeline::new(engine, 2, WINDOW, OVERLAP, seed)?;
 
-    let mut left = Vec::with_capacity(track.frames);
-    let mut right = Vec::with_capacity(track.frames);
+    let mut report = crate::limit::LimitReport::default();
     let mut emitted = 0usize;
+    let mut carry_left: Vec<f32> = Vec::new();
+    let mut carry_right: Vec<f32> = Vec::new();
+
+    let mut emit = |out: &Block, report: &mut crate::limit::LimitReport| -> Result<()> {
+        carry_left.clear();
+        carry_right.clear();
+        carry_left.extend_from_slice(out.channel(0));
+        carry_right.extend_from_slice(out.channel(1));
+        let frames = out.frames();
+        let mut planar = Vec::with_capacity(frames * 2);
+        planar.extend_from_slice(&carry_left);
+        planar.extend_from_slice(&carry_right);
+        let chunk = crate::limit::limit_in_place(&mut planar);
+        report.peak_before = report.peak_before.max(chunk.peak_before);
+        report.peak_after = report.peak_after.max(chunk.peak_after);
+        report.limited_samples += chunk.limited_samples;
+        on_audio(&planar)?;
+        emitted += frames;
+        Ok(())
+    };
 
     let mut start = 0;
     while start < track.frames {
@@ -152,26 +201,57 @@ pub fn enhance(
         interleaved.extend_from_slice(&track.channel(1)[start..end]);
         let block = Block::from_planar(2, interleaved)?;
         for out in pipeline.push(&block)? {
-            left.extend_from_slice(out.channel(0));
-            right.extend_from_slice(out.channel(1));
-            emitted += out.frames();
+            emit(&out, &mut report)?;
         }
         progress(end);
         start = end;
     }
     for out in pipeline.finish()? {
-        left.extend_from_slice(out.channel(0));
-        right.extend_from_slice(out.channel(1));
-        emitted += out.frames();
+        emit(&out, &mut report)?;
     }
 
-    let mut planar = left;
-    planar.extend_from_slice(&right);
-    if emitted != track.frames || planar.len() != track.planar.len() {
+    if emitted != track.frames {
         anyhow::bail!("pipeline returned {emitted} frames for {} in", track.frames);
     }
-    // The model overshoots; nothing downstream can recover a clipped sample.
-    let limit = crate::limit::limit_in_place(&mut planar);
+    Ok((report, device))
+}
+
+/// Render into the playback frontier, publishing each finished second.
+///
+/// Returns the full render as well, because the cache wants the whole track; the caller
+/// decides when to store it.
+pub fn render_into_frontier(
+    track: &Track,
+    cutoff_hz: Option<u32>,
+    worker: &WorkerConfig,
+    seed: u64,
+    frontier: &crate::frontier::Frontier,
+    progress: &mut dyn FnMut(usize),
+) -> Result<Render> {
+    let mut planar = Vec::with_capacity(track.frames * 2);
+    let mut interleaved = Vec::with_capacity(crate::frontier::CHUNK_FRAMES * 2);
+    let mut published = 0usize;
+
+    let (limit, device) = enhance_streaming(track, cutoff_hz, worker, seed, progress, |chunk| {
+        planar.extend_from_slice(chunk);
+        let frames = chunk.len() / 2;
+        for frame in 0..frames {
+            interleaved.push(chunk[frame]);
+            interleaved.push(chunk[frames + frame]);
+        }
+        while interleaved.len() >= crate::frontier::CHUNK_FRAMES * 2 {
+            let chunk: Vec<f32> = interleaved
+                .drain(..crate::frontier::CHUNK_FRAMES * 2)
+                .collect();
+            frontier.publish(published, chunk);
+            published += 1;
+        }
+        Ok(())
+    })?;
+
+    if !interleaved.is_empty() {
+        frontier.publish(published, interleaved);
+    }
     Ok(Render {
         planar,
         limit,

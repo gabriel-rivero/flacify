@@ -230,11 +230,24 @@ signal once the frontier passes the playhead, and the A/B control reports which 
 live and whether generated audio exists at the current position. A cache hit skips the
 renderer: both signals are complete at once.
 
+**Outcome (measured 2026-11-13).** "Start on the original, promote when it catches up"
+does not survive contact with the numbers. Through the pipeline the renderer runs at
+**1.28x** realtime, not the worker's 1.84x, and the model load costs **8 s**. Starting
+playback at t=0 therefore puts the frontier 8 s behind, and at +0.28 s per second of
+playback it never catches up inside a track. Measured: 28 s of frontier against a 30 s
+playhead after 30 s.
+
+The decision stands, with one change: **playback waits for two seconds of frontier** and
+then starts already enhanced. Measured: 12.6 s to first audio cold (8 s load + the first
+window), 0.17 s on a cache hit, toggle live from the first note. The automatic promotion
+stays for the case where a slow machine reaches the patience budget first and starts on
+the original anyway. The remaining 8 s is the model load; a resident worker (started by
+the app, not by each play) removes it, and that is packaging work, not playback work.
+
 **Consequences:**
 
-- **First sound moves from 95 s to about 0.5 s** (decode + device), with the enhanced side
-  available seconds later. The product is a player from the first frame; the generation is
-  something you watch arrive.
+- **First sound moves from 95 s to 0.17 s (cached) or 12.6 s (cold)**, and the first note
+  is already the generated signal. The product is a player from the first frame.
 - **The toggle becomes position-aware.** It may only claim "generated" where generated
   audio exists. Seeking ahead of the frontier restarts the pipeline at that window and the
   control says so, which is honest and also the natural cache fill.

@@ -409,6 +409,25 @@ and read it back on the next run. Same machine, same tracks, second run only.
 The cache entry for the 5.12 s clip is 1.9 MB, which is exactly 245,760 × 2 × 4 bytes: the
 cache stores the float stream, not a lossy copy.
 
+## Progressive playback (2026-11-13)
+
+The renderer fills a frontier behind playback. Two modes, same 30.7 s clip, same machine:
+
+| path | first audio | toggle live | generated when playback starts |
+|---|---|---|---|
+| cache hit | **0.17 s** | 0.3 s | all 30.7 s, both sides complete |
+| cold (first play of a track) | **12.6 s** | 12.7 s | 8 s ready, then growing |
+
+Where the 12.6 s goes: about 8 s is the worker starting and loading 3.3 GB of weights, and
+about 4 s is the first window (5.12 s of audio at RTF 0.543 plus the Rust preprocessing).
+That is the whole cost of a cold start; nothing waits for the track.
+
+**The renderer runs at 1.28x realtime, not 1.84x.** The worker alone is 0.543 RTF (1.84x),
+but through the pipeline the rate is 30.7 s of audio in about 24 s of render after the
+load. That matters for the design: starting playback at t=0 makes the frontier fall
+behind by the load time and never catch up (it gains 0.28 s per second), so playback
+waits for two seconds of frontier instead. Once it starts, the frontier stays ahead.
+
 ## `flacify probe` arithmetic
 
 The policy is arithmetic on the measured RTF, so these are exact given the input; the

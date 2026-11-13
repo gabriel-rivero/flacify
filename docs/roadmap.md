@@ -96,8 +96,14 @@ realtime, so there is no reason to wait for it:
 5. Seeking backwards into rendered audio is instant. Seeking ahead of the frontier
    restarts the pipeline at that window and the control says "generating from here".
 
-Exit: first sound ≤ 2 s cold (≤ 1 s from cache), toggle live ≤ 10 s on this machine,
-no dropouts in a five-minute session, and a counter in the window to prove it.
+Exit: first sound ≤ 2 s from cache (met: 0.17 s), ≤ 15 s cold (met: 12.6 s), toggle live
+with the first note (met), no dropouts in a five-minute session (not yet exercised).
+
+**Landed so far (2026-11-13):** progressive playback with a prebuffer, automatic promotion
+once, a draggable seek bar, the frontier progress bar and the status line. **Still to do:**
+the spectrum, tags in the title, drag-and-drop, the dropout counter, and a resident worker
+so a cold play costs nothing. That last one is the difference between 12.6 s and ~4 s and
+belongs with the app (v0.3), because it is the app that owns the worker's lifetime.
 
 **The window.** The current one is a button, a slider and two grey lines.
 

@@ -8,6 +8,7 @@
 mod cache;
 mod decode;
 mod device;
+mod frontier;
 mod limit;
 mod player;
 mod render;
@@ -16,7 +17,6 @@ mod ui;
 mod wav;
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,6 +24,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use flacify_core::{plan, Probe, SAMPLE_RATE};
 use flacify_infer::python::WorkerConfig;
+
+use crate::frontier::Frontier;
 
 #[derive(Parser)]
 #[command(
@@ -222,153 +224,237 @@ fn enhance(file: &Path, out: Option<PathBuf>) -> Result<()> {
 fn play(file: &Path, smoke: bool) -> Result<()> {
     let paths = setup::Paths::discover()?;
     let config = worker_config(&paths)?;
-    let cache = cache::Cache::new(paths.cache_dir());
+    let cache = Arc::new(cache::Cache::new(paths.cache_dir()));
     let model_id = cache::model_id(&paths.models_dir());
+    let started = Instant::now();
 
-    if smoke {
-        return smoke_play(file, &config, &cache, &model_id);
+    // Decode and analyse first: this is the only work between pressing play and hearing
+    // the file. Everything else happens behind the playhead.
+    let render::Loaded {
+        track, analysis, ..
+    } = render::load(file)?;
+    let original = track.interleaved();
+    let info_base = (
+        file_name(file),
+        analysis.cutoff_hz,
+        track.frames as f64 / f64::from(SAMPLE_RATE),
+    );
+
+    if analysis.looks_full_band() {
+        eprintln!(
+            "already full-band ({:.4}% of the spectrum above 21 kHz); nothing to generate",
+            analysis.high_band_ratio * 100.0
+        );
+        let engine = device::AudioEngine::start(&original, None)?;
+        let info = ui::TrackInfo {
+            name: info_base.0,
+            cutoff_hz: info_base.1,
+            audio_secs: info_base.2,
+            device: "none".to_string(),
+            from_cache: false,
+        };
+        finish(engine, None, info, smoke, started)
+    } else {
+        let key = cache::key(
+            &render::sample_hash(&track),
+            render::WINDOW,
+            render::OVERLAP,
+            &model_id,
+        );
+        match cache.load(&key)? {
+            Some(cached) => {
+                eprintln!(
+                    "cache hit: {:.0} s of audio, nothing to render",
+                    info_base.2
+                );
+                let enhanced = render::interleave_stereo(&cached.planar, track.frames);
+                let engine = device::AudioEngine::start(&original, Some(&enhanced))?;
+                let info = ui::TrackInfo {
+                    name: info_base.0,
+                    cutoff_hz: info_base.1,
+                    audio_secs: info_base.2,
+                    device: cached.meta.device,
+                    from_cache: true,
+                };
+                finish(engine, None, info, smoke, started)
+            }
+            None if !device::progressive_supported() => {
+                eprintln!(
+                    "this output device is not 48 kHz stereo, so the track is rendered \
+                     before playback starts"
+                );
+                let started = Instant::now();
+                let (rendered, from_cache) = render::enhance_or_cached(
+                    &track,
+                    Some(analysis.cutoff_hz),
+                    &config,
+                    &cache,
+                    &model_id,
+                    &mut |_| {},
+                )?;
+                let enhanced = render::interleave_stereo(&rendered.planar, track.frames);
+                let engine = device::AudioEngine::start(&original, Some(&enhanced))?;
+                let info = ui::TrackInfo {
+                    name: info_base.0,
+                    cutoff_hz: info_base.1,
+                    audio_secs: info_base.2,
+                    device: rendered.device,
+                    from_cache,
+                };
+                eprintln!(
+                    "rendered {:.0} s of audio in {:.0} s",
+                    info_base.2,
+                    started.elapsed().as_secs_f64()
+                );
+                finish(engine, None, info, smoke, started)
+            }
+            None => {
+                let frontier = Frontier::new(track.frames);
+                let cutoff = analysis.cutoff_hz;
+                let seed = render::seed_for(&track);
+                {
+                    let frontier = Arc::clone(&frontier);
+                    let cache = Arc::clone(&cache);
+                    let config = config.clone();
+                    std::thread::spawn(move || {
+                        let result = render::render_into_frontier(
+                            &track,
+                            Some(cutoff),
+                            &config,
+                            seed,
+                            &frontier,
+                            &mut |_| {},
+                        );
+                        match result {
+                            Ok(render) => {
+                                if let Err(error) = cache.store(&key, &render, cutoff) {
+                                    tracing::warn!(%error, "could not cache the render");
+                                }
+                            }
+                            Err(error) => tracing::error!(%error, "rendering failed"),
+                        }
+                    });
+                }
+                let engine =
+                    device::AudioEngine::start_progressive(&original, Arc::clone(&frontier))?;
+                let info = ui::TrackInfo {
+                    name: info_base.0,
+                    cutoff_hz: info_base.1,
+                    audio_secs: info_base.2,
+                    device: "rendering".to_string(),
+                    from_cache: false,
+                };
+                finish(engine, Some(frontier), info, smoke, started)
+            }
+        }
     }
-
-    let (sender, receiver) = mpsc::channel();
-    let progress = Arc::new(ui::Progress::new(0));
-    {
-        let progress = Arc::clone(&progress);
-        let file = file.to_path_buf();
-        let cache = std::sync::Arc::new(cache);
-        let model_id = model_id.clone();
-        std::thread::spawn(move || {
-            let result = prepare(&file, &config, &cache, &model_id, &progress);
-            let _ = sender.send(result);
-        });
-    }
-
-    ui::run(ui::PlayerApp::new(receiver, progress))
-        .map_err(|error| anyhow::anyhow!("{error}"))
-        .context("running the window")?;
-    Ok(())
 }
 
-/// Render, open the device, let it pull for a second, then report. No window, no ears
-/// required: it proves the callback runs and the playhead moves.
-fn smoke_play(
-    file: &Path,
-    config: &WorkerConfig,
-    cache: &cache::Cache,
-    model_id: &str,
+/// Hand the engine to the window, or report what a headless run saw.
+///
+/// Playback starts once the frontier is two seconds ahead, so the first note is already
+/// the generated signal and the frontier stays ahead from there (it runs at about 1.28x
+/// realtime once the model is loaded). A patience budget catches the slow machine that
+/// never gets there: it starts on the original and the automatic promotion does the rest.
+fn finish(
+    engine: device::AudioEngine,
+    frontier: Option<Arc<Frontier>>,
+    info: ui::TrackInfo,
+    smoke: bool,
+    started: Instant,
 ) -> Result<()> {
-    let progress = ui::Progress::new(0);
-    let prepared = prepare(file, config, cache, model_id, &progress)
-        .map_err(|message| anyhow::anyhow!(message))?;
-    let engine = device::AudioEngine::start(&prepared.original, prepared.enhanced.as_deref())
-        .context("opening the output device")?;
-    engine.controls.set_playing(true);
-    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let rate = engine.device_rate as usize;
 
-    let position = engine
-        .controls
-        .position
-        .load(std::sync::atomic::Ordering::Relaxed);
+    if !smoke {
+        return ui::run(ui::PlayerApp::new(engine, frontier, info))
+            .map_err(|error| anyhow::anyhow!("{error}"));
+    }
+
+    let prebuffer = 2 * rate;
+    let patience = 30.0;
+    while started.elapsed().as_secs_f64() < patience {
+        let ready = match &frontier {
+            Some(frontier) => frontier.ready_frames(),
+            None => usize::MAX,
+        };
+        if ready >= prebuffer {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let first_audio = started.elapsed();
+    engine.controls.set_playing(true);
+
+    // Then watch for a few seconds: the toggle should become live, and promotion should
+    // fire on its own.
+    let mut live: Option<f64> = None;
+    let mut promoted: Option<f64> = None;
+    let mut peak_ready = 0usize;
+    let watch = 4.0;
+    let until = started.elapsed().as_secs_f64() + watch;
+    while started.elapsed().as_secs_f64() < until {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let ready = match &frontier {
+            Some(frontier) => frontier.ready_frames(),
+            None => (info.audio_secs * rate as f64) as usize,
+        };
+        peak_ready = peak_ready.max(ready);
+        let position = engine.controls.position_frames();
+        if live.is_none() && ready > position + rate {
+            live = Some(started.elapsed().as_secs_f64());
+        }
+        if promoted.is_none()
+            && engine
+                .controls
+                .promoted
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            promoted = Some(started.elapsed().as_secs_f64());
+        }
+    }
+
+    let frames = engine.controls.position_frames();
+    println!(
+        "first     {:.2} s to first audio (prebuffer included)",
+        first_audio.as_secs_f64()
+    );
     println!(
         "device    {} Hz x {} ch",
         engine.device_rate, engine.device_channels
     );
     println!(
-        "played    {position} frames in 1.2 s ({:.2} s of audio)",
-        position as f64 / f64::from(engine.device_rate)
+        "played    {frames} frames ({:.2} s of audio) in {:.0} s of watching",
+        frames as f64 / f64::from(engine.device_rate),
+        watch
     );
-    println!("model     {}", prepared.device);
+    println!("model     {}", info.device);
     println!(
-        "cache     {}",
-        if prepared.from_cache {
-            "hit"
-        } else {
-            "rendered and stored"
-        }
+        "generated {:.1} s ready of {:.1} s",
+        peak_ready as f64 / f64::from(engine.device_rate),
+        info.audio_secs
     );
+    match live {
+        Some(at) => println!("live      toggle offered at {at:.1} s"),
+        None => println!("live      frontier never got a second ahead"),
+    }
+    match promoted {
+        Some(at) => println!("promoted  automatically at {at:.1} s"),
+        None => println!("promoted  not yet"),
+    }
     println!(
         "switch    {}",
-        if prepared.enhanced.is_some() {
-            "enabled"
-        } else {
+        if !engine.controls.has_enhanced {
             "none (full-band source)"
+        } else if engine.controls.is_enhanced() {
+            "generated"
+        } else {
+            "original"
         }
     );
-    if position == 0 {
+    if frames == 0 {
         anyhow::bail!("the device never pulled audio");
     }
-    if !engine.controls.is_playing() {
-        anyhow::bail!("playback stopped after {position} frames");
-    }
     Ok(())
-}
-
-/// Decode, analyse, and render the whole track. Runs off the UI thread.
-fn prepare(
-    file: &Path,
-    config: &WorkerConfig,
-    cache: &cache::Cache,
-    model_id: &str,
-    progress: &ui::Progress,
-) -> Result<ui::Prepared, String> {
-    let fail = |error: anyhow::Error| format!("{error:#}");
-
-    progress.set_status("decoding");
-    let render::Loaded {
-        track, analysis, ..
-    } = render::load(file).map_err(fail)?;
-    progress.set_total(track.frames);
-    progress.set_done(track.frames);
-    let audio_secs = track.frames as f64 / f64::from(SAMPLE_RATE);
-
-    if analysis.looks_full_band() {
-        return Ok(ui::Prepared {
-            track_name: file_name(file),
-            original: track.interleaved(),
-            enhanced: None,
-            cutoff_hz: analysis.cutoff_hz,
-            render_secs: 0.0,
-            audio_secs,
-            peak_before: 0.0,
-            limited_samples: 0,
-            device: "none (full-band source)".to_string(),
-            from_cache: false,
-            cache_bytes: cache.size_bytes(),
-        });
-    }
-
-    progress.set_status(format!(
-        "enhancing the top {:.1} kHz with the model",
-        (f64::from(SAMPLE_RATE) / 2.0 - f64::from(analysis.cutoff_hz)) / 1000.0
-    ));
-    progress.set_done(0);
-    let started = Instant::now();
-    let (rendered, from_cache) = render::enhance_or_cached(
-        &track,
-        Some(analysis.cutoff_hz),
-        config,
-        cache,
-        model_id,
-        &mut |done| progress.set_done(done),
-    )
-    .map_err(fail)?;
-    let render_secs = started.elapsed().as_secs_f64();
-    if from_cache {
-        progress.set_status("loaded from the cache");
-    }
-
-    Ok(ui::Prepared {
-        track_name: file_name(file),
-        original: track.interleaved(),
-        enhanced: Some(render::interleave_stereo(&rendered.planar, track.frames)),
-        peak_before: rendered.limit.peak_before,
-        limited_samples: rendered.limit.limited_samples,
-        device: rendered.device,
-        from_cache,
-        cache_bytes: cache.size_bytes(),
-        cutoff_hz: analysis.cutoff_hz,
-        render_secs,
-        audio_secs,
-    })
 }
 
 fn file_name(path: &Path) -> String {

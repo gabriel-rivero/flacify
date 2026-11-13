@@ -13,6 +13,7 @@ mod limit;
 mod player;
 mod render;
 mod setup;
+mod spectrum;
 mod ui;
 mod wav;
 
@@ -234,8 +235,10 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
         track, analysis, ..
     } = render::load(file)?;
     let original = track.interleaved();
+    let tags = decode::tags(file);
     let info_base = (
         file_name(file),
+        tags,
         analysis.cutoff_hz,
         track.frames as f64 / f64::from(SAMPLE_RATE),
     );
@@ -248,8 +251,10 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
         let engine = device::AudioEngine::start(&original, None)?;
         let info = ui::TrackInfo {
             name: info_base.0,
-            cutoff_hz: info_base.1,
-            audio_secs: info_base.2,
+            title: info_base.1.title,
+            artist: info_base.1.artist,
+            cutoff_hz: info_base.2,
+            audio_secs: info_base.3,
             device: "none".to_string(),
             from_cache: false,
         };
@@ -265,14 +270,16 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
             Some(cached) => {
                 eprintln!(
                     "cache hit: {:.0} s of audio, nothing to render",
-                    info_base.2
+                    info_base.3
                 );
                 let enhanced = render::interleave_stereo(&cached.planar, track.frames);
                 let engine = device::AudioEngine::start(&original, Some(&enhanced))?;
                 let info = ui::TrackInfo {
                     name: info_base.0,
-                    cutoff_hz: info_base.1,
-                    audio_secs: info_base.2,
+                    title: info_base.1.title,
+                    artist: info_base.1.artist,
+                    cutoff_hz: info_base.2,
+                    audio_secs: info_base.3,
                     device: cached.meta.device,
                     from_cache: true,
                 };
@@ -296,14 +303,16 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
                 let engine = device::AudioEngine::start(&original, Some(&enhanced))?;
                 let info = ui::TrackInfo {
                     name: info_base.0,
-                    cutoff_hz: info_base.1,
-                    audio_secs: info_base.2,
+                    title: info_base.1.title,
+                    artist: info_base.1.artist,
+                    cutoff_hz: info_base.2,
+                    audio_secs: info_base.3,
                     device: rendered.device,
                     from_cache,
                 };
                 eprintln!(
                     "rendered {:.0} s of audio in {:.0} s",
-                    info_base.2,
+                    info_base.3,
                     started.elapsed().as_secs_f64()
                 );
                 finish(engine, None, info, smoke, started)
@@ -339,8 +348,10 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
                     device::AudioEngine::start_progressive(&original, Arc::clone(&frontier))?;
                 let info = ui::TrackInfo {
                     name: info_base.0,
-                    cutoff_hz: info_base.1,
-                    audio_secs: info_base.2,
+                    title: info_base.1.title,
+                    artist: info_base.1.artist,
+                    cutoff_hz: info_base.2,
+                    audio_secs: info_base.3,
                     device: "rendering".to_string(),
                     from_cache: false,
                 };

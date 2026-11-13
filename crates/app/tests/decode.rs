@@ -174,6 +174,16 @@ fn given_a_three_channel_wav_when_mapped_then_the_first_two_channels_are_kept() 
 }
 
 #[test]
+fn given_a_wav_without_tags_when_asked_then_it_reports_none_rather_than_failing() {
+    let file = TempWav::write("untagged", 48_000, 2, 480, |frame, _| {
+        (frame as f32 * 0.01).sin() * 0.1
+    });
+    let tags = decode::tags(file.path());
+    assert!(tags.title.is_none());
+    assert!(tags.artist.is_none());
+}
+
+#[test]
 fn given_a_missing_file_when_decoded_then_the_error_names_it() {
     let path =
         std::env::temp_dir().join(format!("flacify-decode-missing-{}.wav", std::process::id()));

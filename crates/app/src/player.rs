@@ -171,6 +171,18 @@ impl Mixer {
         (mixer, controls)
     }
 
+    /// The buffers themselves, for the window to draw. `Arc` clones: no copy.
+    pub fn original_arc(&self) -> &Arc<[f32]> {
+        &self.original
+    }
+
+    pub fn generated_arc(&self) -> Option<Arc<[f32]>> {
+        match &self.wet {
+            Wet::Full(buffer) => Some(Arc::clone(buffer)),
+            _ => None,
+        }
+    }
+
     /// How many frames of generated audio exist at or beyond the playhead.
     pub fn ready_frames(&self) -> usize {
         match &self.wet {

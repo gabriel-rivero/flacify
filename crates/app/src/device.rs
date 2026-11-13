@@ -8,6 +8,7 @@
 //! If the device does not run at 48 kHz (many do not), both buffers are resampled once
 //! here, before playback, so the callback never has to.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -28,6 +29,11 @@ pub struct AudioEngine {
     pub controls: Arc<Controls>,
     pub device_rate: u32,
     pub device_channels: usize,
+    /// The signals themselves, shared with the mixer (an `Arc` clone, not a copy), so
+    /// the window can draw a spectrum of what is playing.
+    pub display_original: Arc<[f32]>,
+    pub display_generated: Option<Arc<[f32]>>,
+    pub stream_errors: Arc<AtomicUsize>,
 }
 
 impl AudioEngine {
@@ -109,6 +115,9 @@ impl Output {
     }
 
     fn start(mut self, mixer: Mixer, controls: Arc<Controls>) -> Result<AudioEngine> {
+        let display_original = Arc::clone(mixer.original_arc());
+        let display_generated = mixer.generated_arc();
+        let stream_errors = Arc::new(AtomicUsize::new(0));
         // A fixed buffer size is a request, not a guarantee: WASAPI in shared mode and
         // some ALSA configurations refuse it. Ask for the small one, fall back to
         // whatever the device wants, and report the second failure with both contexts.
@@ -125,6 +134,7 @@ impl Output {
                 self.format,
                 mixer.clone(),
                 self.channels,
+                Arc::clone(&stream_errors),
             ) {
                 Ok(opened) => {
                     stream = Some(opened);
@@ -147,6 +157,9 @@ impl Output {
             controls,
             device_rate: self.rate,
             device_channels: self.channels,
+            display_original,
+            display_generated,
+            stream_errors,
         })
     }
 }
@@ -167,18 +180,19 @@ fn open(
     format: cpal::SampleFormat,
     mixer: Mixer,
     channels: usize,
+    errors: Arc<AtomicUsize>,
 ) -> Result<cpal::Stream> {
     match format {
-        cpal::SampleFormat::I8 => build::<i8>(device, config, mixer, channels),
-        cpal::SampleFormat::I16 => build::<i16>(device, config, mixer, channels),
-        cpal::SampleFormat::I32 => build::<i32>(device, config, mixer, channels),
-        cpal::SampleFormat::I64 => build::<i64>(device, config, mixer, channels),
-        cpal::SampleFormat::U8 => build::<u8>(device, config, mixer, channels),
-        cpal::SampleFormat::U16 => build::<u16>(device, config, mixer, channels),
-        cpal::SampleFormat::U32 => build::<u32>(device, config, mixer, channels),
-        cpal::SampleFormat::U64 => build::<u64>(device, config, mixer, channels),
-        cpal::SampleFormat::F32 => build::<f32>(device, config, mixer, channels),
-        cpal::SampleFormat::F64 => build::<f64>(device, config, mixer, channels),
+        cpal::SampleFormat::I8 => build::<i8>(device, config, mixer, channels, errors),
+        cpal::SampleFormat::I16 => build::<i16>(device, config, mixer, channels, errors),
+        cpal::SampleFormat::I32 => build::<i32>(device, config, mixer, channels, errors),
+        cpal::SampleFormat::I64 => build::<i64>(device, config, mixer, channels, errors),
+        cpal::SampleFormat::U8 => build::<u8>(device, config, mixer, channels, errors),
+        cpal::SampleFormat::U16 => build::<u16>(device, config, mixer, channels, errors),
+        cpal::SampleFormat::U32 => build::<u32>(device, config, mixer, channels, errors),
+        cpal::SampleFormat::U64 => build::<u64>(device, config, mixer, channels, errors),
+        cpal::SampleFormat::F32 => build::<f32>(device, config, mixer, channels, errors),
+        cpal::SampleFormat::F64 => build::<f64>(device, config, mixer, channels, errors),
         other => anyhow::bail!("the output device wants {other}, which is not wired up yet"),
     }
 }
@@ -188,6 +202,7 @@ fn build<T>(
     config: &cpal::StreamConfig,
     mut mixer: Mixer,
     channels: usize,
+    errors: Arc<AtomicUsize>,
 ) -> Result<cpal::Stream>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
@@ -206,7 +221,10 @@ where
                 *out = T::from_sample(0.0f32);
             }
         },
-        |error| tracing::error!(%error, "output stream error"),
+        move |error| {
+            errors.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(%error, "output stream error");
+        },
         None,
     )?;
     Ok(stream)

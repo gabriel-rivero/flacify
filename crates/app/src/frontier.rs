@@ -78,8 +78,8 @@ impl Frontier {
         (index, guard, (index + 1) * CHUNK_FRAMES)
     }
 
-    /// One stereo frame, for tests.
-    #[cfg(test)]
+    /// One stereo frame. The window uses this to take a spectrum of generated audio;
+    /// the audio callback does not (it reads whole chunks).
     pub fn frame(&self, frame: usize) -> Option<(f32, f32)> {
         let (_, guard, _) = self.chunk_at(frame);
         let chunk = guard.as_ref()?;

@@ -30,6 +30,33 @@ pub struct Decoded {
     pub planar: Vec<f32>,
 }
 
+/// What the file says about itself, if anything. Cosmetic only: a missing tag is not
+/// an error, and a file with none still plays.
+#[derive(Default, Clone)]
+pub struct Tags {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+}
+
+pub fn tags(path: &Path) -> Tags {
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::Accessor;
+
+    let Ok(file) = lofty::read_from_path(path) else {
+        return Tags::default();
+    };
+    let tag = file.primary_tag().or_else(|| file.first_tag());
+    let clean = |value: Option<std::borrow::Cow<'_, str>>| {
+        value
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+    };
+    Tags {
+        title: tag.and_then(|tag| clean(tag.title())),
+        artist: tag.and_then(|tag| clean(tag.artist())),
+    }
+}
+
 /// Demux and decode every packet of the default track.
 pub fn decode(path: &Path) -> Result<Decoded> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;

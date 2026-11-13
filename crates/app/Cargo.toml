@@ -26,3 +26,5 @@ blake3 = "1.8.7"
 serde.workspace = true
 serde_json.workspace = true
 arc-swap = "1.9.5"
+lofty = "0.22.2"
+realfft.workspace = true

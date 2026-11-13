@@ -62,9 +62,22 @@ def main(argv: list[str]) -> int:
         expected = module(cond, noise).float().cpu().numpy()
 
     # The same window through the pipe.
-    client = Client(args)
-    hello = client.hello()
     body = cond.cpu().numpy().tobytes() + noise_np.tobytes()
+    # Free the reference model before the worker starts. Two fp32 copies do not fit in
+    # 8 GB of VRAM, and an OOM there looks like the worker "closing the pipe" rather
+    # than the out-of-memory error it is.
+    del model, module, cond, noise
+    if args.device == "cuda":
+        import gc
+
+        gc.collect()  # the model and its module form a cycle; refcount alone is not enough
+        torch.cuda.empty_cache()
+    client = Client(args)
+    try:
+        hello = client.hello()
+    except SystemExit:
+        print("worker log:\n" + "\n".join(client.log[-40:]), file=sys.stderr)
+        raise
     _, status, _, _, _, payload = client.request(
         CMD_WINDOW, 1, 2, hello["window"], hello["noise_len_stereo"], body
     )
@@ -88,8 +101,10 @@ def main(argv: list[str]) -> int:
 
     Path(args.report).parent.mkdir(parents=True, exist_ok=True)
     Path(args.report).write_text(json.dumps(report, indent=2) + "\n")
-    print(f"{path.name}  {report['db']:+.2f} dB  max {report['max_abs_diff']:.3e}  "
-          f"device {report['device']}  {'ok' if report['passed'] else 'FAILED'}")
+    print(
+        f"{path.name}  {report['db']:+.2f} dB  max {report['max_abs_diff']:.3e}  "
+        f"device {report['device']}  {'ok' if report['passed'] else 'FAILED'}"
+    )
     return 0 if report["passed"] else 1
 
 

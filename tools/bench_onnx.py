@@ -6,7 +6,8 @@ earlier numbers come from an RTX 4060 Ti, which says nothing about a laptop. Thi
 script needs no torch and no FlashSR package: it loads the .onnx file, reads the
 shapes it declares, and runs it.
 
-    python3 tools/bench_onnx.py                              # coreml, if available
+    python3 tools/bench_onnx.py                              # best available EP
+    python3 tools/bench_onnx.py --provider cuda --iterations 10
     python3 tools/bench_onnx.py --provider cpu --iterations 10
 
 RTF here is seconds of wall clock per second of audio, so lower is better and
@@ -34,8 +35,15 @@ WINDOW_SECS = WINDOW / SAMPLE_RATE
 def parse_args(argv: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--onnx", default=str(TOOLS / "out" / "flashsr.onnx"))
-    ap.add_argument("--provider", default="coreml", choices=["coreml", "cpu", "auto"])
-    ap.add_argument("--iterations", type=int, default=5, help="timed runs, after one warmup")
+    ap.add_argument(
+        "--provider",
+        default="auto",
+        choices=["auto", "tensorrt", "cuda", "directml", "coreml", "cpu"],
+        help="auto picks the first available of tensorrt, cuda, directml, coreml, cpu",
+    )
+    ap.add_argument(
+        "--iterations", type=int, default=5, help="timed runs, after one warmup"
+    )
     ap.add_argument(
         "--coreml-mlprogram",
         action="store_true",
@@ -50,21 +58,56 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--report", default=str(TOOLS / "out" / "bench_report.json"))
-    ap.add_argument("--gate-rtf", type=float, default=1.5, help="ADR-002 kill criterion")
+    ap.add_argument(
+        "--gate-rtf", type=float, default=1.5, help="ADR-002 kill criterion"
+    )
     return ap.parse_args(argv)
+
+
+# The order `auto` tries, best first. TensorRT needs a plan build per shape; CUDA is
+# the steady one on an NVIDIA card; DirectML is the Windows path; CoreML is the macOS
+# one. The CPU EP is always last so a provider that refuses an op can fall back.
+AUTO_ORDER = [
+    ("TensorrtExecutionProvider", "tensorrt"),
+    ("CUDAExecutionProvider", "cuda"),
+    ("DmlExecutionProvider", "directml"),
+    ("CoreMLExecutionProvider", "coreml"),
+]
 
 
 def providers_for(args: argparse.Namespace) -> list[str] | list[tuple[str, dict]]:
     import onnxruntime as ort
 
     available = ort.get_available_providers()
-    if args.provider == "cpu":
-        return ["CPUExecutionProvider"]
-    if args.provider == "coreml" and "CoreMLExecutionProvider" not in available:
+    provider = args.provider
+    if provider == "auto":
+        provider = next((name for ep, name in AUTO_ORDER if ep in available), "cpu")
+        print(f"auto picked {provider} from {available}", file=sys.stderr)
+
+    expected = {
+        "tensorrt": "TensorrtExecutionProvider",
+        "cuda": "CUDAExecutionProvider",
+        "directml": "DmlExecutionProvider",
+        "coreml": "CoreMLExecutionProvider",
+    }
+    if provider in expected and expected[provider] not in available:
         raise SystemExit(
-            f"CoreMLExecutionProvider is not available here: {available}\n"
-            "  onnxruntime on macOS ships it; check the wheel"
+            f"{expected[provider]} is not available here: {available}\n"
+            "  Linux/Windows need onnxruntime-gpu (CUDA/TensorRT) or onnxruntime-directml"
         )
+
+    if provider == "cpu":
+        return ["CPUExecutionProvider"]
+    if provider == "cuda":
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    if provider == "tensorrt":
+        return [
+            "TensorrtExecutionProvider",
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+    if provider == "directml":
+        return ["DmlExecutionProvider", "CPUExecutionProvider"]
 
     options: dict[str, str] = {"MLComputeUnits": args.coreml_units}
     if args.coreml_mlprogram:
@@ -148,7 +191,10 @@ def main(argv: list[str]) -> int:
     )
     print(f"sustained RTF {report['sustained_rtf']:.3f}   report {args.report}")
     if not report["passed"]:
-        print(f"FAILED the sustained gate: RTF {report['sustained_rtf']} > {args.gate_rtf}", file=sys.stderr)
+        print(
+            f"FAILED the sustained gate: RTF {report['sustained_rtf']} > {args.gate_rtf}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

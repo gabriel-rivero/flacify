@@ -22,15 +22,22 @@ can guarantee no dropouts on hardware you have not tested.
 
 ## Releases
 
+Revised 2026-11-13 after it played on real music for a week. Two things moved:
+**the UI is the product now**, and **waiting for a whole render before the first note is
+not acceptable**. Packaging stays, one release later.
+
 | release | theme | exit criteria | weeks |
 |---|---|---|---|
-| **v0.0** | kill the risk | ONNX model runs in Rust on the M5 Max, RTF measured, audio out through `cpal` | 1 |
-| **v0.1** | walking skeleton | `flacify play file.mp3` decodes, enhances, plays; `A` toggles; no UI | 1–2 |
-| **v0.2** | **MVP** | window, spectrum, waveform, instant sample-locked A/B, hardware probe | 2 |
-| **v0.3** | render cache | 60-minute track, zero dropouts, seek anywhere, second play costs no GPU | 2 |
-| **v0.4** | real-time mode | bounded-buffer streaming from file, underrun → passthrough, latency presets | 2 |
-| **v0.5** | first-run | installer, model download with resume + checksum, GPU gate, crash-safe | 2 |
-| **v1.0** | utility | system-wide sink, batch folder, docs, signed builds | 3 |
+| **v0.0** | kill the risk | model runs, RTF measured, audio out | done |
+| **v0.1** | walking skeleton | `play` decodes, enhances, plays; A/B is sample-locked | done |
+| **v0.2** | **the player** | first sound in ≤ 2 s, enhanced within ~10 s, a window worth looking at | 2 |
+| **v0.3** | **a real app** | `.app` bundle, first-run setup inside the window, signing | 2 |
+| **v0.4** | streaming and cache polish | any-length track, seek anywhere, eviction, no full-track buffers | 2 |
+| **v1.0** | utility | system-wide sink, batch folder, Windows/Linux builds | 3 |
+
+The old plan put the cache at v0.3 and real-time at v0.4. Both are partly here already
+(the cache shipped, seek shipped), and both were the wrong priority next: a player that
+takes 95 s to make a sound is not a player, however good its cache is.
 
 ## v0.0 — kill the risk
 
@@ -71,20 +78,45 @@ Goal: audio comes out, and the seam-free windowing survives the port.
 Exit: a whole track plays without a seam or dropout, on a machine with a GPU and on
 one without (`--mock`).
 
-## v0.2 — MVP
+## v0.2 — the player
 
-This is the release the user asked for. One window, one toggle.
+Goal: it feels like a player, not a renderer with a window on it.
 
-- `egui` window: transport, spectrum analyser, waveform with the rendered frontier,
-  A/B button, RTF and dropout readouts.
-- Sample-locked A/B: equal-power 20 ms crossfade, loudness-matched, verified by a
-  null test in CI.
-- Hardware probe on first run, persisted to `profile.toml`; second run skips it.
-- Drag and drop a file onto the window.
-- Errors become a visible state, never a silent stop.
+**Playback starts before the render finishes.** Today `play` decodes, renders the whole
+track (95 s for three minutes) and only then opens the device. The renderer is 1.84x
+realtime, so there is no reason to wait for it:
 
-Deliberately absent: playlists (your call, and correct), library view, EQ, skins,
-export UI, system sink, streaming input.
+1. Decode and start the device immediately. Sound in ~0.5 s, original signal.
+2. Render in the background into a growing frontier, and let the mixer ramp to the
+   enhanced signal once the frontier passes the playhead. At RTF 0.54 the frontier gains
+   about 1.8 s per second, so the toggle is honest within a few seconds.
+3. The A/B control shows the frontier: it says "generating" until enhanced audio exists
+   at the playhead, then it is live. It never claims a region it does not have.
+4. A cache hit skips steps 2 and 3 entirely: both signals are ready at once.
+5. Seeking backwards into rendered audio is instant. Seeking ahead of the frontier
+   restarts the pipeline at that window and the control says "generating from here".
+
+Exit: first sound ≤ 2 s cold (≤ 1 s from cache), toggle live ≤ 10 s on this machine,
+no dropouts in a five-minute session, and a counter in the window to prove it.
+
+**The window.** The current one is a button, a slider and two grey lines.
+
+- Track title/artist from tags, with the file name as the fallback.
+- A real transport: play/pause, seek bar with elapsed/total, and a visible playhead.
+- The A/B control is the centrepiece: a large, obvious switch that names both sides
+  honestly ("generated top band" / "original") and shows which is live.
+- A spectrum of both sides overlaid, with the cutoff and the generated band marked. This
+  is the one picture that explains the product in a second.
+- A status line that says what is happening: rendering (with the frontier), cached, the
+  measured RTF, and the peak limiting it applied.
+- Drag a file onto the window; errors are states, never silent stops.
+
+**Honesty work that belongs with the toggle.** Loudness-match the two sides (today the
+enhanced side is +0.57 dB) and try upstream's low-band splice, so the A/B differs in
+brightness and not in level or in something the model regenerated badly. Both are
+measured before they ship.
+
+Deliberately absent: playlists, library view, EQ, skins, export UI, system sink.
 
 ## v0.3 — render cache
 
@@ -159,9 +191,10 @@ release where it should land.
 4. ~~No seek.~~ **Done (2026-11-13):** the position bar is draggable and the arrow keys
    jump five seconds. Seek is instant because the track is decoded into memory; seeking a
    *streaming* track arrives with the queue in v0.4.
-5. **Whole-track render before play.** `play` waits for the entire file (95 s for a
-   3-minute track) instead of using the render-ahead queue from ADR-001. The mixer and the
-   device path are what make streaming possible; only the scheduler is missing.
+5. ~~Whole-track render before play.~~ **Scheduled for v0.2 (2026-11-13):** the player
+   starts on the original and promotes to enhanced as the frontier passes the playhead
+   (ADR-012). The mixer, the device path and the cache already carry it; what is missing is
+   the producer side.
 6. **No visual feedback of its own.** No spectrum and no waveform (ADR-005 called for a
    spectrum). The window is text, a button and a bar.
 7. **No full-scale policy beyond the limiter.** The original is played as decoded, so a

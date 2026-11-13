@@ -194,7 +194,8 @@ the sidecar carries the prototype and no claim in `vision.md` depends on it.
 
 ## ADR-011 — The prototype plays from pre-rendered buffers
 
-**Status:** accepted for the prototype.
+**Status:** **superseded by ADR-012** (2026-11-13). Kept for the reasoning: it was the
+right trade to get a player working in a day, and the wrong one to keep.
 **Context:** ADR-001 chose render-ahead with a bounded queue, which is still the right
 shape for v0.4. But at RTF 0.54 a whole track renders faster than it plays, and a
 streaming queue means shared mutable buffers handed to an audio callback under a lock
@@ -215,10 +216,47 @@ the mixer, the controls and the ramp survive the change unchanged.
 
 ---
 
+## ADR-012 — Start on the original, promote to enhanced as the frontier arrives
+
+**Status:** accepted, v0.2.
+**Context:** ADR-011 plays from two completed buffers, which means the device opens only
+after a whole render: 95 s for a three-minute track at RTF 0.54, measured at 19.5 s for a
+5 s clip and 32 s for 30 s. The renderer is 1.84x realtime, so the wait buys nothing that
+time would not have bought anyway. The cache hides it only from the second play onward.
+
+**Decision:** playback starts as soon as the file is decoded and the device is open, on the
+original signal. The renderer runs ahead into a frontier; the mixer ramps to the enhanced
+signal once the frontier passes the playhead, and the A/B control reports which side is
+live and whether generated audio exists at the current position. A cache hit skips the
+renderer: both signals are complete at once.
+
+**Consequences:**
+
+- **First sound moves from 95 s to about 0.5 s** (decode + device), with the enhanced side
+  available seconds later. The product is a player from the first frame; the generation is
+  something you watch arrive.
+- **The toggle becomes position-aware.** It may only claim "generated" where generated
+  audio exists. Seeking ahead of the frontier restarts the pipeline at that window and the
+  control says so, which is honest and also the natural cache fill.
+- **The producer needs a safe handoff.** The renderer writes while the audio callback
+  reads, so the frontier is published as immutable chunks through an SPSC queue rather than
+  a shared `Vec` — no unsafe, no lock in the callback.
+- **ADR-001 is now actually implemented**, in its top-left cell: file source, producer
+  unthrottled. The bounded-queue cell stays for live capture.
+- **The alternative was rejected on measurement:** buffering one window and starting
+  enhanced outright costs a full window of render (2.8 s) plus a prebuffer before any
+  sound, and needs the queue before the first note. Starting on the original costs a decode
+  and lets the frontier do the catching up.
+
+---
+
 ## Open questions
 
 1. **Runtime endgame.** Backlog E1-4 to E1-8: split the graph so the CoreML EP can take
-   the convolutions, or move to libtorch/candle/MLX from Rust. ADR-010 buys the time.
+   the convolutions, or move to libtorch/candle/MLX from Rust. ADR-010 buys the time. The
+   Linux measurement (ORT CUDA EP at 0.545 vs torch's 0.453, and half the download) makes a
+   split, platform-specific backend the likely end state: torch where Metal is the
+   accelerator, ONNX Runtime where CUDA is.
 2. **Where the toggle lives in the prototype.** With the sidecar at RTF 0.54 a 3-minute
    track renders in ~95 s, so the toggle can be file-based (render, then A/B between two
    decoded buffers) before the streaming queue exists (ADR-001's v0.4).

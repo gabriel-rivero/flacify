@@ -11,6 +11,10 @@ schedule and the mixer; the model runs in a Python process the app installs and 
 Silicon (ADR-002). The working reference implementation is the Python PoC,
 [`gabriel-rivero/flashsr-stream`](https://github.com/gabriel-rivero/flashsr-stream).
 
+Next up (v0.2) is the player itself: sound in under two seconds instead of after a full
+render, and a window worth looking at. Today `play` renders the whole track first, which is
+the one thing about this prototype that does not feel like a player.
+
 Runs end to end on macOS (verified: Metal, 48 kHz out, A/B enabled), on Linux
 (verified: CUDA on an RTX 4060 Ti, a 44.1 kHz device resampled to 48 kHz, A/B
 enabled) and on Windows (verified: 48 kHz out, A/B enabled, CPU inference). Windows

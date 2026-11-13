@@ -409,6 +409,29 @@ and read it back on the next run. Same machine, same tracks, second run only.
 The cache entry for the 5.12 s clip is 1.9 MB, which is exactly 245,760 × 2 × 4 bytes: the
 cache stores the float stream, not a lossy copy.
 
+## Loudness matching (2026-11-13)
+
+The generated side used to be **1.49 LU louder** than the original on a steady track, so
+the switch changed level as well as brightness. The renderer now measures both sides
+(BS.1770, 400 ms blocks, absolute and relative gating), applies one gain derived from the
+first window, then limits the peaks.
+
+| measurement | before | after |
+|---|---|---|
+| integrated loudness step | +1.49 LU | **−0.10 LU** |
+| gain applied to the generated side | 0 dB | −1.49 dB |
+| RMS step | +0.57 dB | −0.92 dB |
+
+The RMS figure moving the other way is the point, not a fault: at equal loudness, content
+that adds energy above 15 kHz is RMS-quieter, because RMS weights that energy far more
+than hearing does. Verified twice — once by the app's own meter, once by an independent
+scipy implementation of the same specification.
+
+The gain comes from the first 5.12 s and is held for the whole track: a per-window gain
+would pump, and a track whose opening is unrepresentative gets a slightly wrong gain
+rather than audible modulation. Clamped to ±6 dB, because beyond that the measurement is
+lying.
+
 ## Progressive playback (2026-11-13)
 
 The renderer fills a frontier behind playback. Two modes, same 30.7 s clip, same machine:

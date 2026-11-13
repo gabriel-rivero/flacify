@@ -128,6 +128,11 @@ pub struct Render {
     pub limit: crate::limit::LimitReport,
     /// Which accelerator the sidecar chose: `cuda`, `mps` or `cpu`.
     pub device: String,
+    /// Loudness gain applied to the generated side, in dB, and the two measurements it
+    /// came from. Zero when they were already equal (or could not be measured).
+    pub gain_db: f64,
+    pub lufs_input: f64,
+    pub lufs_output: f64,
 }
 
 /// Render a whole track. `progress` is called with the number of input frames covered
@@ -140,14 +145,17 @@ pub fn enhance(
     progress: &mut dyn FnMut(usize),
 ) -> Result<Render> {
     let mut planar = Vec::with_capacity(track.frames * 2);
-    let (limit, device) = enhance_streaming(track, cutoff_hz, worker, seed, progress, |chunk| {
+    let streamed = enhance_streaming(track, cutoff_hz, worker, seed, progress, |chunk| {
         planar.extend_from_slice(chunk);
         Ok(())
     })?;
     Ok(Render {
         planar,
-        limit,
-        device,
+        limit: streamed.limit,
+        device: streamed.device,
+        gain_db: streamed.gain_db,
+        lufs_input: streamed.lufs_input,
+        lufs_output: streamed.lufs_output,
     })
 }
 
@@ -157,6 +165,19 @@ pub fn enhance(
 /// final) and may be called many times. The limiter is a per-sample function, so
 /// limiting each block gives exactly the same samples as limiting the whole track
 /// afterwards — which is what lets the frontier publish before the render finishes.
+/// What `enhance_streaming` produced besides the audio.
+pub struct Streamed {
+    pub limit: crate::limit::LimitReport,
+    pub device: String,
+    pub gain_db: f64,
+    pub lufs_input: f64,
+    pub lufs_output: f64,
+}
+
+/// The most a loudness match may move the generated side. Beyond this something is wrong
+/// with the measurement and a big gain would sound worse than the step it fixes.
+const MAX_GAIN_DB: f64 = 6.0;
+
 pub fn enhance_streaming(
     track: &Track,
     cutoff_hz: Option<u32>,
@@ -164,7 +185,7 @@ pub fn enhance_streaming(
     seed: u64,
     progress: &mut dyn FnMut(usize),
     mut on_audio: impl FnMut(&[f32]) -> Result<()>,
-) -> Result<(crate::limit::LimitReport, String)> {
+) -> Result<Streamed> {
     let model = PythonWorker::spawn(worker).context("starting the model worker")?;
     let device = model.hello().device.clone();
     let engine = Engine::new(model, 2, WINDOW, cutoff_hz)?;
@@ -175,6 +196,16 @@ pub fn enhance_streaming(
     let mut carry_left: Vec<f32> = Vec::new();
     let mut carry_right: Vec<f32> = Vec::new();
 
+    // Loudness is matched from the first window, then held for the whole track: a
+    // per-window gain would pump, and the whole point is that the switch does not move
+    // the level. The first window is the only stretch where input and output are the
+    // same length and both available before anything is published.
+    let head = track.frames.min(WINDOW);
+    let lufs_input =
+        crate::loudness::integrated(&[&track.channel(0)[..head], &track.channel(1)[..head]]);
+    let mut gain: Option<f64> = None;
+    let mut lufs_output = f64::NEG_INFINITY;
+
     let mut emit = |out: &Block, report: &mut crate::limit::LimitReport| -> Result<()> {
         carry_left.clear();
         carry_right.clear();
@@ -184,6 +215,28 @@ pub fn enhance_streaming(
         let mut planar = Vec::with_capacity(frames * 2);
         planar.extend_from_slice(&carry_left);
         planar.extend_from_slice(&carry_right);
+
+        // First block: measure it against the input it came from, then fix the gain for
+        // the rest of the track.
+        let applied = match gain {
+            Some(value) => value,
+            None => {
+                let (left, right) = planar.split_at(frames);
+                lufs_output = crate::loudness::integrated(&[left, right]);
+                let db = crate::loudness::gain_db(lufs_input, lufs_output)
+                    .clamp(-MAX_GAIN_DB, MAX_GAIN_DB);
+                let factor = 10f64.powf(db / 20.0);
+                gain = Some(factor);
+                factor
+            }
+        };
+        if applied != 1.0 {
+            let factor = applied as f32;
+            for sample in planar.iter_mut() {
+                *sample *= factor;
+            }
+        }
+
         let chunk = crate::limit::limit_in_place(&mut planar);
         report.peak_before = report.peak_before.max(chunk.peak_before);
         report.peak_after = report.peak_after.max(chunk.peak_after);
@@ -213,7 +266,14 @@ pub fn enhance_streaming(
     if emitted != track.frames {
         anyhow::bail!("pipeline returned {emitted} frames for {} in", track.frames);
     }
-    Ok((report, device))
+    let gain_db = gain.map_or(0.0, |factor| 20.0 * f64::from(factor as f32).log10());
+    Ok(Streamed {
+        limit: report,
+        device,
+        gain_db,
+        lufs_input,
+        lufs_output,
+    })
 }
 
 /// Render into the playback frontier, publishing each finished second.
@@ -232,7 +292,7 @@ pub fn render_into_frontier(
     let mut interleaved = Vec::with_capacity(crate::frontier::CHUNK_FRAMES * 2);
     let mut published = 0usize;
 
-    let (limit, device) = enhance_streaming(track, cutoff_hz, worker, seed, progress, |chunk| {
+    let streamed = enhance_streaming(track, cutoff_hz, worker, seed, progress, |chunk| {
         planar.extend_from_slice(chunk);
         let frames = chunk.len() / 2;
         for frame in 0..frames {
@@ -254,8 +314,11 @@ pub fn render_into_frontier(
     }
     Ok(Render {
         planar,
-        limit,
-        device,
+        limit: streamed.limit,
+        device: streamed.device,
+        gain_db: streamed.gain_db,
+        lufs_input: streamed.lufs_input,
+        lufs_output: streamed.lufs_output,
     })
 }
 
@@ -282,6 +345,9 @@ pub fn enhance_or_cached(
                 limited_samples: cached.meta.limited_samples,
             },
             device: cached.meta.device,
+            gain_db: cached.meta.gain_db,
+            lufs_input: 0.0,
+            lufs_output: 0.0,
         };
         return Ok((render, true));
     }
@@ -345,6 +411,12 @@ pub fn enhance_file(
         eprintln!("cache hit: {frames} frames, nothing to render");
     }
     eprintln!("model on {}", rendered.device);
+    if rendered.gain_db.abs() > 0.05 {
+        eprintln!(
+            "loudness  {:+.2} dB applied (input {:.1} LUFS, generated {:.1} LUFS before matching)",
+            rendered.gain_db, rendered.lufs_input, rendered.lufs_output
+        );
+    }
     if rendered.limit.limited_samples > 0 {
         eprintln!(
             "peak {:.2} -> {:.2} ({:+.1} dB) across {} samples",

@@ -185,15 +185,18 @@ release where it should land.
 
 1. **No FLAC out.** `enhance` writes 32-bit float WAV; `flacenc` is not wired up, so the
    cache container from ADR-003 does not exist yet. WAV is also 3× larger.
-2. **No loudness match.** Measured +0.57 dB on a steady track, so the A/B switch steps in
-   level as well as in brightness. That makes the comparison slightly dishonest and it is
-   exactly what E2-6 was written for. (Peak protection is now in place: a soft knee above
-   0.9, because the model overshot full scale by 2.7 dB on real music. That fixes
-   distortion, not the level step.)
+2. ~~No loudness match.~~ **Done (2026-11-13):** the generated side was 1.49 LU louder;
+   BS.1770 matching brings the step to −0.10 LU, measured twice (the app's meter and an
+   independent scipy implementation). One gain per track, taken from the first window, so
+   nothing pumps; a track whose opening is unrepresentative gets a slightly wrong gain
+   instead. Peak protection (soft knee above 0.9) landed earlier.
 3. **No low-band preservation.** The model regenerates the whole waveform: level-matched,
    the output differs from the input by −18.7 dB RMS below 12 kHz and gains +2.9 dB in
-   4–12 kHz. Upstream's `mel_replace_ops` splices the input back below the cutoff; try it
-   and measure whether listeners prefer it.
+   4–12 kHz. Upstream's `mel_replace_ops` splices the input back below the cutoff. The
+   experiment: a zero-phase low-pass on both signals (same filter, so no phase error),
+   replace the output's low band with the input's, and A/B the result on the same tracks
+   that were already judged better. Measure both the null against the input below the
+   cutoff *and* listener preference, because this one changes the sound by design.
 4. ~~No seek.~~ **Done (2026-11-13):** the position bar is draggable and the arrow keys
    jump five seconds. Seek is instant because the track is decoded into memory; seeking a
    *streaming* track arrives with the queue in v0.4.

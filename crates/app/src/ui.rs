@@ -24,6 +24,8 @@ pub struct TrackInfo {
     pub audio_secs: f64,
     pub device: String,
     pub from_cache: bool,
+    /// Loudness gain applied to the generated side, for the status line.
+    pub gain_db: f64,
 }
 
 pub struct PlayerApp {
@@ -185,10 +187,20 @@ impl PlayerApp {
         } else {
             "rendering now"
         };
+        let matched = if self.info.gain_db.abs() > 0.05 {
+            format!(" · loudness {:+.1} dB", self.info.gain_db)
+        } else {
+            String::new()
+        };
         ui.label(
             egui::RichText::new(format!(
-                "{} · cutoff {} Hz · {} · out {} Hz × {} ch",
-                self.info.device, self.info.cutoff_hz, source, rate, self.engine.device_channels
+                "{} · cutoff {} Hz · {} · out {} Hz × {} ch{}",
+                self.info.device,
+                self.info.cutoff_hz,
+                source,
+                rate,
+                self.engine.device_channels,
+                matched
             ))
             .weak()
             .size(11.0),

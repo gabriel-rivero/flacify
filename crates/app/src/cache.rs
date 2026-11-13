@@ -32,7 +32,7 @@ use crate::render::Render;
 
 /// Bump this when anything about the pipeline changes the samples: window, overlap,
 /// preprocessing, the seed schedule, the limiter.
-pub const CACHE_VERSION: &str = "flacify-cache-1";
+pub const CACHE_VERSION: &str = "flacify-cache-2";
 
 /// 24-bit has about 144 dB of headroom, well under the float noise floor of the model.
 
@@ -46,6 +46,10 @@ pub struct Meta {
     pub peak_before: f32,
     pub peak_after: f32,
     pub limited_samples: usize,
+    /// Loudness gain applied to the generated side, in dB. Recorded so a cache hit can
+    /// still report it.
+    #[serde(default)]
+    pub gain_db: f64,
     /// The device the render ran on. Informational: a cache hit on another device is
     /// accepted, which is a deliberate prototype compromise (fp32 devices agree to
     /// within the gate, but they are not bit-identical).
@@ -136,6 +140,7 @@ impl Cache {
             peak_before: render.limit.peak_before,
             peak_after: render.limit.peak_after,
             limited_samples: render.limit.limited_samples,
+            gain_db: render.gain_db,
             device: render.device.clone(),
         };
         std::fs::write(
@@ -257,6 +262,9 @@ mod tests {
                 limited_samples: 0,
             },
             device: "cpu".to_string(),
+            gain_db: 0.0,
+            lufs_input: -14.0,
+            lufs_output: -15.0,
         }
     }
 

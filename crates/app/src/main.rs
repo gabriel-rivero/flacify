@@ -10,6 +10,7 @@ mod decode;
 mod device;
 mod frontier;
 mod limit;
+mod loudness;
 mod player;
 mod render;
 mod setup;
@@ -257,6 +258,7 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
             audio_secs: info_base.3,
             device: "none".to_string(),
             from_cache: false,
+            gain_db: 0.0,
         };
         finish(engine, None, info, smoke, started)
     } else {
@@ -282,6 +284,7 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
                     audio_secs: info_base.3,
                     device: cached.meta.device,
                     from_cache: true,
+                    gain_db: cached.meta.gain_db,
                 };
                 finish(engine, None, info, smoke, started)
             }
@@ -309,6 +312,7 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
                     audio_secs: info_base.3,
                     device: rendered.device,
                     from_cache,
+                    gain_db: rendered.gain_db,
                 };
                 eprintln!(
                     "rendered {:.0} s of audio in {:.0} s",
@@ -354,6 +358,7 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
                     audio_secs: info_base.3,
                     device: "rendering".to_string(),
                     from_cache: false,
+                    gain_db: 0.0,
                 };
                 finish(engine, Some(frontier), info, smoke, started)
             }

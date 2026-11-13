@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use flacify_core::{Block, Pipeline, SAMPLE_RATE};
+use flacify_core::{Block, Pipeline, Preprocessor, SAMPLE_RATE};
 use flacify_infer::python::{PythonWorker, WorkerConfig};
 use flacify_infer::Engine;
 
@@ -142,13 +142,22 @@ pub fn enhance(
     cutoff_hz: Option<u32>,
     worker: &WorkerConfig,
     seed: u64,
+    splice_low_band: bool,
     progress: &mut dyn FnMut(usize),
 ) -> Result<Render> {
     let mut planar = Vec::with_capacity(track.frames * 2);
-    let streamed = enhance_streaming(track, cutoff_hz, worker, seed, progress, |chunk| {
-        planar.extend_from_slice(chunk);
-        Ok(())
-    })?;
+    let streamed = enhance_streaming(
+        track,
+        cutoff_hz,
+        worker,
+        seed,
+        splice_low_band,
+        progress,
+        |chunk| {
+            planar.extend_from_slice(chunk);
+            Ok(())
+        },
+    )?;
     Ok(Render {
         planar,
         limit: streamed.limit,
@@ -183,6 +192,7 @@ pub fn enhance_streaming(
     cutoff_hz: Option<u32>,
     worker: &WorkerConfig,
     seed: u64,
+    splice_low_band: bool,
     progress: &mut dyn FnMut(usize),
     mut on_audio: impl FnMut(&[f32]) -> Result<()>,
 ) -> Result<Streamed> {
@@ -206,15 +216,36 @@ pub fn enhance_streaming(
     let mut gain: Option<f64> = None;
     let mut lufs_output = f64::NEG_INFINITY;
 
+    // The splice needs the input that produced this window, which is the same frame range
+    // of the track: the pipeline keeps output aligned with input, sample for sample.
+    let splicer = match (splice_low_band, cutoff_hz) {
+        (true, Some(cutoff)) => Some(Preprocessor::new(cutoff)?),
+        _ => None,
+    };
+
     let mut emit = |out: &Block, report: &mut crate::limit::LimitReport| -> Result<()> {
         carry_left.clear();
         carry_right.clear();
         carry_left.extend_from_slice(out.channel(0));
         carry_right.extend_from_slice(out.channel(1));
         let frames = out.frames();
+
         let mut planar = Vec::with_capacity(frames * 2);
-        planar.extend_from_slice(&carry_left);
-        planar.extend_from_slice(&carry_right);
+        if let Some(preprocessor) = &splicer {
+            let offset = emitted;
+            for channel in 0..2 {
+                let generated = if channel == 0 {
+                    &carry_left
+                } else {
+                    &carry_right
+                };
+                let input = &track.channel(channel)[offset..offset + frames];
+                planar.extend(crate::splice::channel(generated, input, preprocessor)?);
+            }
+        } else {
+            planar.extend_from_slice(&carry_left);
+            planar.extend_from_slice(&carry_right);
+        }
 
         // First block: measure it against the input it came from, then fix the gain for
         // the rest of the track.
@@ -285,6 +316,7 @@ pub fn render_into_frontier(
     cutoff_hz: Option<u32>,
     worker: &WorkerConfig,
     seed: u64,
+    splice_low_band: bool,
     frontier: &crate::frontier::Frontier,
     progress: &mut dyn FnMut(usize),
 ) -> Result<Render> {
@@ -292,22 +324,30 @@ pub fn render_into_frontier(
     let mut interleaved = Vec::with_capacity(crate::frontier::CHUNK_FRAMES * 2);
     let mut published = 0usize;
 
-    let streamed = enhance_streaming(track, cutoff_hz, worker, seed, progress, |chunk| {
-        planar.extend_from_slice(chunk);
-        let frames = chunk.len() / 2;
-        for frame in 0..frames {
-            interleaved.push(chunk[frame]);
-            interleaved.push(chunk[frames + frame]);
-        }
-        while interleaved.len() >= crate::frontier::CHUNK_FRAMES * 2 {
-            let chunk: Vec<f32> = interleaved
-                .drain(..crate::frontier::CHUNK_FRAMES * 2)
-                .collect();
-            frontier.publish(published, chunk);
-            published += 1;
-        }
-        Ok(())
-    })?;
+    let streamed = enhance_streaming(
+        track,
+        cutoff_hz,
+        worker,
+        seed,
+        splice_low_band,
+        progress,
+        |chunk| {
+            planar.extend_from_slice(chunk);
+            let frames = chunk.len() / 2;
+            for frame in 0..frames {
+                interleaved.push(chunk[frame]);
+                interleaved.push(chunk[frames + frame]);
+            }
+            while interleaved.len() >= crate::frontier::CHUNK_FRAMES * 2 {
+                let chunk: Vec<f32> = interleaved
+                    .drain(..crate::frontier::CHUNK_FRAMES * 2)
+                    .collect();
+                frontier.publish(published, chunk);
+                published += 1;
+            }
+            Ok(())
+        },
+    )?;
 
     if !interleaved.is_empty() {
         frontier.publish(published, interleaved);
@@ -332,9 +372,16 @@ pub fn enhance_or_cached(
     worker: &WorkerConfig,
     cache: &crate::cache::Cache,
     model_id: &str,
+    splice_low_band: bool,
     progress: &mut dyn FnMut(usize),
 ) -> Result<(Render, bool)> {
-    let key = crate::cache::key(&sample_hash(track), WINDOW, OVERLAP, model_id);
+    let key = crate::cache::key(
+        &sample_hash(track),
+        WINDOW,
+        OVERLAP,
+        model_id,
+        splice_low_band,
+    );
     if let Some(cached) = cache.load(&key)? {
         progress(track.frames);
         let render = Render {
@@ -352,7 +399,14 @@ pub fn enhance_or_cached(
         return Ok((render, true));
     }
 
-    let render = enhance(track, cutoff_hz, worker, seed_for(track), progress)?;
+    let render = enhance(
+        track,
+        cutoff_hz,
+        worker,
+        seed_for(track),
+        splice_low_band,
+        progress,
+    )?;
     if let Some(cutoff) = cutoff_hz {
         cache.store(&key, &render, cutoff)?;
     }
@@ -366,6 +420,7 @@ pub fn enhance_file(
     worker: &WorkerConfig,
     cache: &crate::cache::Cache,
     model_id: &str,
+    splice_low_band: bool,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<()> {
     let Loaded {
@@ -405,6 +460,7 @@ pub fn enhance_file(
         worker,
         cache,
         model_id,
+        splice_low_band,
         &mut |done| progress(done, frames),
     )?;
     if from_cache {
@@ -416,6 +472,9 @@ pub fn enhance_file(
             "loudness  {:+.2} dB applied (input {:.1} LUFS, generated {:.1} LUFS before matching)",
             rendered.gain_db, rendered.lufs_input, rendered.lufs_output
         );
+    }
+    if splice_low_band {
+        eprintln!("low band  from the input (experimental splice)");
     }
     if rendered.limit.limited_samples > 0 {
         eprintln!(

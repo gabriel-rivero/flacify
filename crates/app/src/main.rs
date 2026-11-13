@@ -15,6 +15,7 @@ mod player;
 mod render;
 mod setup;
 mod spectrum;
+mod splice;
 mod ui;
 mod wav;
 
@@ -59,10 +60,16 @@ enum Command {
         /// Defaults to <name>.flacify.wav next to the input.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Keep the input's low band instead of the model's (experimental).
+        #[arg(long)]
+        splice: bool,
     },
     /// Play a file with an instant A/B switch between original and generated.
     Play {
         file: PathBuf,
+        /// Keep the input's low band instead of the model's (experimental).
+        #[arg(long)]
+        splice: bool,
         /// Render, open the output device, play for a second, report and exit.
         /// This is how a headless machine (and CI) checks the audio path.
         #[arg(long)]
@@ -79,8 +86,12 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Setup => run_setup(),
         Command::Probe { file, rtf } => probe(&file, rtf),
-        Command::Enhance { file, out } => enhance(&file, out),
-        Command::Play { file, smoke } => play(&file, smoke),
+        Command::Enhance { file, out, splice } => enhance(&file, out, splice),
+        Command::Play {
+            file,
+            smoke,
+            splice,
+        } => play(&file, smoke, splice),
     }
 }
 
@@ -180,7 +191,7 @@ fn mode_label(plan: &flacify_core::Plan) -> String {
     }
 }
 
-fn enhance(file: &Path, out: Option<PathBuf>) -> Result<()> {
+fn enhance(file: &Path, out: Option<PathBuf>, splice: bool) -> Result<()> {
     let paths = setup::Paths::discover()?;
     let config = worker_config(&paths)?;
     let cache = cache::Cache::new(paths.cache_dir());
@@ -199,6 +210,7 @@ fn enhance(file: &Path, out: Option<PathBuf>) -> Result<()> {
         &config,
         &cache,
         &model_id,
+        splice,
         &mut |done, total| {
             if total == 0 {
                 return;
@@ -223,7 +235,7 @@ fn enhance(file: &Path, out: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn play(file: &Path, smoke: bool) -> Result<()> {
+fn play(file: &Path, smoke: bool, splice: bool) -> Result<()> {
     let paths = setup::Paths::discover()?;
     let config = worker_config(&paths)?;
     let cache = Arc::new(cache::Cache::new(paths.cache_dir()));
@@ -267,6 +279,7 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
             render::WINDOW,
             render::OVERLAP,
             &model_id,
+            splice,
         );
         match cache.load(&key)? {
             Some(cached) => {
@@ -300,6 +313,7 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
                     &config,
                     &cache,
                     &model_id,
+                    splice,
                     &mut |_| {},
                 )?;
                 let enhanced = render::interleave_stereo(&rendered.planar, track.frames);
@@ -335,6 +349,7 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
                             Some(cutoff),
                             &config,
                             seed,
+                            splice,
                             &frontier,
                             &mut |_| {},
                         );

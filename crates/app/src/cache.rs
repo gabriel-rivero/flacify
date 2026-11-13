@@ -32,7 +32,7 @@ use crate::render::Render;
 
 /// Bump this when anything about the pipeline changes the samples: window, overlap,
 /// preprocessing, the seed schedule, the limiter.
-pub const CACHE_VERSION: &str = "flacify-cache-2";
+pub const CACHE_VERSION: &str = "flacify-cache-3";
 
 /// 24-bit has about 144 dB of headroom, well under the float noise floor of the model.
 
@@ -189,7 +189,13 @@ fn write_audio(path: &Path, planar: &[f32]) -> Result<()> {
 /// The sample hash comes from the decoded track, not the file, so the same audio in a
 /// different container or bitrate shares nothing and the same file repackaged is still a
 /// miss. That is deliberate: the cache is cheap to rebuild and a wrong hit is not.
-pub fn key(sample_hash: &str, window: usize, overlap: usize, model_id: &str) -> String {
+pub fn key(
+    sample_hash: &str,
+    window: usize,
+    overlap: usize,
+    model_id: &str,
+    splice_low_band: bool,
+) -> String {
     let mut hasher = blake3::Hasher::new();
     for part in [
         CACHE_VERSION,
@@ -197,6 +203,7 @@ pub fn key(sample_hash: &str, window: usize, overlap: usize, model_id: &str) -> 
         model_id,
         &window.to_string(),
         &overlap.to_string(),
+        if splice_low_band { "splice" } else { "whole" },
     ] {
         hasher.update(part.as_bytes());
         hasher.update(b"\0");
@@ -351,10 +358,11 @@ mod tests {
 
     #[test]
     fn given_the_same_inputs_when_keyed_twice_then_the_key_matches_and_a_window_change_moves_it() {
-        let a = key("samples", 245_760, 48_000, "model");
-        assert_eq!(a, key("samples", 245_760, 48_000, "model"));
-        assert_ne!(a, key("samples", 122_880, 48_000, "model"));
-        assert_ne!(a, key("samples", 245_760, 48_000, "other-model"));
+        let a = key("samples", 245_760, 48_000, "model", false);
+        assert_eq!(a, key("samples", 245_760, 48_000, "model", false));
+        assert_ne!(a, key("samples", 122_880, 48_000, "model", false));
+        assert_ne!(a, key("samples", 245_760, 48_000, "other-model", false));
+        assert_ne!(a, key("samples", 245_760, 48_000, "model", true));
         assert_eq!(a.len(), 32);
     }
 

@@ -190,13 +190,20 @@ release where it should land.
    independent scipy implementation). One gain per track, taken from the first window, so
    nothing pumps; a track whose opening is unrepresentative gets a slightly wrong gain
    instead. Peak protection (soft knee above 0.9) landed earlier.
-3. **No low-band preservation.** The model regenerates the whole waveform: level-matched,
-   the output differs from the input by −18.7 dB RMS below 12 kHz and gains +2.9 dB in
-   4–12 kHz. Upstream's `mel_replace_ops` splices the input back below the cutoff. The
-   experiment: a zero-phase low-pass on both signals (same filter, so no phase error),
-   replace the output's low band with the input's, and A/B the result on the same tracks
-   that were already judged better. Measure both the null against the input below the
-   cutoff *and* listener preference, because this one changes the sound by design.
+3. **Low-band preservation: attempted, blocked on a measurement.** The splice exists
+   (`--splice`, zero-phase filter on both sides, unit-tested on synthetic signals), but on a
+   rendered track it does not do what it claims: the spliced output correlates with the
+   input's low band exactly as much as the unspliced one (0.297 in 100–6,000 Hz, both
+   freshly rendered), while differing from it by −14.8 dB. The premise may be wrong rather
+   than the code: the generated signal's best alignment against the original wanders
+   (3, −53 and +429 samples at 0.5 s, 2 s and 5 s), so "output frame k is input frame k" is
+   not obviously true at this stage.
+
+   **This is now the top investigation**, ahead of the splice itself: if the generated and
+   original signals are not sample-aligned, then (a) the A/B switch is comparing different
+   moments, (b) every low-band metric is meaningless, and (c) the splice cannot work. The
+   test is cheap: an impulse track through the pipeline, and through the real model, with
+   the output's impulse position measured against the input's.
 4. ~~No seek.~~ **Done (2026-11-13):** the position bar is draggable and the arrow keys
    jump five seconds. Seek is instant because the track is decoded into memory; seeking a
    *streaming* track arrives with the queue in v0.4.

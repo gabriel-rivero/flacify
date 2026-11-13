@@ -1293,6 +1293,8 @@ dependencies = [
  "flacify-core",
  "flacify-infer",
  "hound",
+ "serde",
+ "serde_json",
  "symphonia",
  "tracing",
  "tracing-subscriber",

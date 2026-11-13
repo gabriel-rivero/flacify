@@ -5,6 +5,7 @@
 //! sidecar the app installs and owns (ADR-010), which is why `setup` and
 //! `worker_config` exist at all.
 
+mod cache;
 mod decode;
 mod device;
 mod limit;
@@ -178,6 +179,8 @@ fn mode_label(plan: &flacify_core::Plan) -> String {
 fn enhance(file: &Path, out: Option<PathBuf>) -> Result<()> {
     let paths = setup::Paths::discover()?;
     let config = worker_config(&paths)?;
+    let cache = cache::Cache::new(paths.cache_dir());
+    let model_id = cache::model_id(&paths.models_dir());
     let out = out.unwrap_or_else(|| {
         let mut name = file.file_name().unwrap_or_default().to_os_string();
         name.push(".flacify.wav");
@@ -186,19 +189,26 @@ fn enhance(file: &Path, out: Option<PathBuf>) -> Result<()> {
 
     let started = Instant::now();
     let mut last_printed = 0u32;
-    render::enhance_file(file, &out, &config, &mut |done, total| {
-        if total == 0 {
-            return;
-        }
-        let percent = (done * 100 / total) as u32;
-        if percent >= last_printed + 5 {
-            last_printed = percent;
-            eprint!(
-                "\r  {percent:3}%  {:.0} s of audio",
-                done as f64 / f64::from(SAMPLE_RATE)
-            );
-        }
-    })
+    render::enhance_file(
+        file,
+        &out,
+        &config,
+        &cache,
+        &model_id,
+        &mut |done, total| {
+            if total == 0 {
+                return;
+            }
+            let percent = (done * 100 / total) as u32;
+            if percent >= last_printed + 5 {
+                last_printed = percent;
+                eprint!(
+                    "\r  {percent:3}%  {:.0} s of audio",
+                    done as f64 / f64::from(SAMPLE_RATE)
+                );
+            }
+        },
+    )
     .context("enhancing")?;
     eprintln!();
     println!(
@@ -212,9 +222,11 @@ fn enhance(file: &Path, out: Option<PathBuf>) -> Result<()> {
 fn play(file: &Path, smoke: bool) -> Result<()> {
     let paths = setup::Paths::discover()?;
     let config = worker_config(&paths)?;
+    let cache = cache::Cache::new(paths.cache_dir());
+    let model_id = cache::model_id(&paths.models_dir());
 
     if smoke {
-        return smoke_play(file, &config);
+        return smoke_play(file, &config, &cache, &model_id);
     }
 
     let (sender, receiver) = mpsc::channel();
@@ -222,8 +234,10 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
     {
         let progress = Arc::clone(&progress);
         let file = file.to_path_buf();
+        let cache = std::sync::Arc::new(cache);
+        let model_id = model_id.clone();
         std::thread::spawn(move || {
-            let result = prepare(&file, &config, &progress);
+            let result = prepare(&file, &config, &cache, &model_id, &progress);
             let _ = sender.send(result);
         });
     }
@@ -236,9 +250,15 @@ fn play(file: &Path, smoke: bool) -> Result<()> {
 
 /// Render, open the device, let it pull for a second, then report. No window, no ears
 /// required: it proves the callback runs and the playhead moves.
-fn smoke_play(file: &Path, config: &WorkerConfig) -> Result<()> {
+fn smoke_play(
+    file: &Path,
+    config: &WorkerConfig,
+    cache: &cache::Cache,
+    model_id: &str,
+) -> Result<()> {
     let progress = ui::Progress::new(0);
-    let prepared = prepare(file, config, &progress).map_err(|message| anyhow::anyhow!(message))?;
+    let prepared = prepare(file, config, cache, model_id, &progress)
+        .map_err(|message| anyhow::anyhow!(message))?;
     let engine = device::AudioEngine::start(&prepared.original, prepared.enhanced.as_deref())
         .context("opening the output device")?;
     engine.controls.set_playing(true);
@@ -257,6 +277,14 @@ fn smoke_play(file: &Path, config: &WorkerConfig) -> Result<()> {
         position as f64 / f64::from(engine.device_rate)
     );
     println!("model     {}", prepared.device);
+    println!(
+        "cache     {}",
+        if prepared.from_cache {
+            "hit"
+        } else {
+            "rendered and stored"
+        }
+    );
     println!(
         "switch    {}",
         if prepared.enhanced.is_some() {
@@ -278,6 +306,8 @@ fn smoke_play(file: &Path, config: &WorkerConfig) -> Result<()> {
 fn prepare(
     file: &Path,
     config: &WorkerConfig,
+    cache: &cache::Cache,
+    model_id: &str,
     progress: &ui::Progress,
 ) -> Result<ui::Prepared, String> {
     let fail = |error: anyhow::Error| format!("{error:#}");
@@ -301,6 +331,8 @@ fn prepare(
             peak_before: 0.0,
             limited_samples: 0,
             device: "none (full-band source)".to_string(),
+            from_cache: false,
+            cache_bytes: cache.size_bytes(),
         });
     }
 
@@ -310,15 +342,19 @@ fn prepare(
     ));
     progress.set_done(0);
     let started = Instant::now();
-    let rendered = render::enhance(
+    let (rendered, from_cache) = render::enhance_or_cached(
         &track,
         Some(analysis.cutoff_hz),
         config,
-        render::seed_for(&track),
+        cache,
+        model_id,
         &mut |done| progress.set_done(done),
     )
     .map_err(fail)?;
     let render_secs = started.elapsed().as_secs_f64();
+    if from_cache {
+        progress.set_status("loaded from the cache");
+    }
 
     Ok(ui::Prepared {
         track_name: file_name(file),
@@ -327,6 +363,8 @@ fn prepare(
         peak_before: rendered.limit.peak_before,
         limited_samples: rendered.limit.limited_samples,
         device: rendered.device,
+        from_cache,
+        cache_bytes: cache.size_bytes(),
         cutoff_hz: analysis.cutoff_hz,
         render_secs,
         audio_secs,

@@ -193,6 +193,11 @@ impl Paths {
     }
 
     /// Where the three `.pth` files land.
+    /// Where rendered tracks are kept between runs.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root().join("cache")
+    }
+
     pub fn models_dir(&self) -> PathBuf {
         self.root.join("models")
     }

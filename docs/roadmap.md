@@ -156,7 +156,9 @@ release where it should land.
    the output differs from the input by −18.7 dB RMS below 12 kHz and gains +2.9 dB in
    4–12 kHz. Upstream's `mel_replace_ops` splices the input back below the cutoff; try it
    and measure whether listeners prefer it.
-4. **No seek.** The progress bar is read-only; there is no way back to a moment.
+4. ~~No seek.~~ **Done (2026-11-13):** the position bar is draggable and the arrow keys
+   jump five seconds. Seek is instant because the track is decoded into memory; seeking a
+   *streaming* track arrives with the queue in v0.4.
 5. **Whole-track render before play.** `play` waits for the entire file (95 s for a
    3-minute track) instead of using the render-ahead queue from ADR-001. The mixer and the
    device path are what make streaming possible; only the scheduler is missing.

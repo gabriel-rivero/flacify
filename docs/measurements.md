@@ -394,6 +394,21 @@ result. It is not a configuration switch either: `tools/worker.py` imports torch
 shipping the ONNX path means a second worker or the Rust `ort` work, which is why the
 Linux section lists it as future work.
 
+## The render cache (2026-11-13)
+
+`flacify play` and `flacify enhance` write the finished stream to `<data>/cache/<key>/`
+and read it back on the next run. Same machine, same tracks, second run only.
+
+| run | wall clock | output |
+|---|---|---|
+| 30.72 s clip, first (render + store) | 32.0 s | `clip_cache_a.wav` |
+| 30.72 s clip, second (cache hit) | **0.1 s** | `clip_cache_b.wav`, **byte-identical** (same SHA-256) |
+| 5.12 s clip, `play --smoke`, first | 19.5 s | plays, stores |
+| 5.12 s clip, `play --smoke`, second | **1.48 s** | plays from cache, no model, no worker |
+
+The cache entry for the 5.12 s clip is 1.9 MB, which is exactly 245,760 × 2 × 4 bytes: the
+cache stores the float stream, not a lossy copy.
+
 ## `flacify probe` arithmetic
 
 The policy is arithmetic on the measured RTF, so these are exact given the input; the

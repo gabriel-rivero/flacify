@@ -94,6 +94,16 @@ pub fn load(path: &Path) -> Result<Loaded> {
     })
 }
 
+/// A hash of the decoded samples, for cache keys. The pipeline version, window, overlap
+/// and model go into the key separately, so this is only about the audio.
+pub fn sample_hash(track: &Track) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for sample in &track.planar {
+        hasher.update(&sample.to_bits().to_le_bytes());
+    }
+    hasher.finalize().to_hex()[..32].to_string()
+}
+
 /// A seed that survives re-renders, cache keys and bug reports (ADR-006).
 pub fn seed_for(track: &Track) -> u64 {
     let mut hasher = blake3::Hasher::new();
@@ -169,11 +179,47 @@ pub fn enhance(
     })
 }
 
+/// Render the track, or take it from the cache when this exact render already exists.
+///
+/// Returns the audio and whether it came from disk, so the UI can say "cached" instead
+/// of pretending it did 95 s of work.
+pub fn enhance_or_cached(
+    track: &Track,
+    cutoff_hz: Option<u32>,
+    worker: &WorkerConfig,
+    cache: &crate::cache::Cache,
+    model_id: &str,
+    progress: &mut dyn FnMut(usize),
+) -> Result<(Render, bool)> {
+    let key = crate::cache::key(&sample_hash(track), WINDOW, OVERLAP, model_id);
+    if let Some(cached) = cache.load(&key)? {
+        progress(track.frames);
+        let render = Render {
+            planar: cached.planar,
+            limit: crate::limit::LimitReport {
+                peak_before: cached.meta.peak_before,
+                peak_after: cached.meta.peak_after,
+                limited_samples: cached.meta.limited_samples,
+            },
+            device: cached.meta.device,
+        };
+        return Ok((render, true));
+    }
+
+    let render = enhance(track, cutoff_hz, worker, seed_for(track), progress)?;
+    if let Some(cutoff) = cutoff_hz {
+        cache.store(&key, &render, cutoff)?;
+    }
+    Ok((render, false))
+}
+
 /// `flacify enhance` in one call: decode, decide, render, write.
 pub fn enhance_file(
     input: &Path,
     output: &Path,
     worker: &WorkerConfig,
+    cache: &crate::cache::Cache,
+    model_id: &str,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<()> {
     let Loaded {
@@ -207,13 +253,17 @@ pub fn enhance_file(
         (f64::from(SAMPLE_RATE) / 2.0 - f64::from(analysis.cutoff_hz)) / 1000.0
     );
     let frames = track.frames;
-    let rendered = enhance(
+    let (rendered, from_cache) = enhance_or_cached(
         &track,
         Some(analysis.cutoff_hz),
         worker,
-        seed_for(&track),
+        cache,
+        model_id,
         &mut |done| progress(done, frames),
     )?;
+    if from_cache {
+        eprintln!("cache hit: {frames} frames, nothing to render");
+    }
     eprintln!("model on {}", rendered.device);
     if rendered.limit.limited_samples > 0 {
         eprintln!(

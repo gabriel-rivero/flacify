@@ -41,6 +41,22 @@ impl Controls {
         self.position.load(Ordering::Relaxed) as f64 / f64::from(sample_rate)
     }
 
+    /// Move the playhead. Clamped so a seek past the end lands on the last frame
+    /// instead of stopping playback, which is what a scrubber at 100% should do.
+    pub fn seek_frames(&self, frame: usize) {
+        let last = self.frames.saturating_sub(1);
+        self.position.store(frame.min(last), Ordering::Relaxed);
+    }
+
+    pub fn seek_secs(&self, seconds: f64, sample_rate: u32) {
+        let frame = (seconds.max(0.0) * f64::from(sample_rate)) as usize;
+        self.seek_frames(frame);
+    }
+
+    pub fn position_frames(&self) -> usize {
+        self.position.load(Ordering::Relaxed)
+    }
+
     pub fn toggle(&self) {
         if self.has_enhanced {
             let next = !self.use_enhanced.load(Ordering::Relaxed);
@@ -197,6 +213,25 @@ mod tests {
         assert!((second[0] - 2000.0).abs() < 50.0);
         // ...and by frame 1999 the ramp is done and the value is the dry buffer's.
         assert!((second[999 * 2] - 1999.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn given_playback_when_seeking_then_the_next_fill_reads_from_the_new_position() {
+        let (mut mixer, controls) = Mixer::new(ramp_track(64, 0.0), None, 2, 48_000);
+        controls.set_playing(true);
+        controls.seek_frames(40);
+
+        let mut out = vec![0.0f32; 8];
+        assert_eq!(mixer.fill(&mut out), 4);
+        assert_eq!(out[0], 40.0);
+        assert_eq!(controls.position_frames(), 44);
+    }
+
+    #[test]
+    fn given_a_position_past_the_end_when_seeking_then_it_lands_on_the_last_frame() {
+        let (_mixer, controls) = Mixer::new(ramp_track(64, 0.0), None, 2, 48_000);
+        controls.seek_frames(10_000);
+        assert_eq!(controls.position_frames(), 63);
     }
 
     #[test]

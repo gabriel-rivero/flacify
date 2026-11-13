@@ -340,6 +340,14 @@ fn given_a_clean_home_when_the_uv_step_runs_then_curl_has_a_directory_to_write_i
 }
 
 #[test]
+fn given_a_discovered_home_when_asked_for_paths_then_the_cache_sits_beside_the_models() {
+    let home = Home::new("paths");
+    let paths = home.paths();
+    assert_eq!(paths.cache_dir(), paths.root().join("cache"));
+    assert_eq!(paths.models_dir(), paths.root().join("models"));
+}
+
+#[test]
 fn given_a_finished_home_when_ensure_runs_again_then_no_step_executes() {
     let home = Home::new("second-run");
     let paths = home.paths();

@@ -26,6 +26,9 @@ pub struct Prepared {
     pub peak_before: f32,
     pub limited_samples: usize,
     pub device: String,
+    /// True when the audio came from the cache instead of a fresh render.
+    pub from_cache: bool,
+    pub cache_bytes: u64,
 }
 
 /// Progress the worker thread publishes while it runs.
@@ -162,16 +165,28 @@ impl PlayerApp {
             ui.add_space(14.0);
             let position = controls.position_secs(engine.device_rate);
             let duration = prepared.audio_secs.max(0.001);
-            ui.add(
-                egui::ProgressBar::new((position / duration) as f32)
-                    .desired_width(f32::INFINITY)
-                    .text(format!(
-                        "{:02}:{:02} / {:02}:{:02}",
-                        (position as u64) / 60,
-                        (position as u64) % 60,
-                        (duration as u64) / 60,
-                        (duration as u64) % 60
-                    )),
+            // The playhead is this slider's value, so dragging it *is* the seek.
+            let mut scrub = position;
+            if ui
+                .add(
+                    egui::Slider::new(&mut scrub, 0.0..=duration)
+                        .show_value(false)
+                        .trailing_fill(true),
+                )
+                .changed()
+            {
+                controls.seek_secs(scrub, engine.device_rate);
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "{:02}:{:02} / {:02}:{:02}   ·   drag to seek, arrows jump 5 s",
+                    (position as u64) / 60,
+                    (position as u64) % 60,
+                    (duration as u64) / 60,
+                    (duration as u64) % 60
+                ))
+                .weak()
+                .size(11.0),
             );
 
             ui.add_space(8.0);
@@ -211,6 +226,16 @@ impl PlayerApp {
                 egui::RichText::new(format!(
                     "peaks limited: {:.2} -> full scale, {} samples above the knee",
                     prepared.peak_before, prepared.limited_samples
+                ))
+                .weak()
+                .size(11.0),
+            );
+        }
+        if prepared.cache_bytes > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "cache: {:.0} MB on disk",
+                    prepared.cache_bytes as f64 / 1e6
                 ))
                 .weak()
                 .size(11.0),
@@ -258,6 +283,14 @@ impl eframe::App for PlayerApp {
                 }
                 if input.key_pressed(egui::Key::P) {
                     controls.set_playing(!controls.is_playing());
+                }
+                let rate = engine.device_rate;
+                let backwards = controls.position_frames().saturating_sub(5 * rate as usize);
+                if input.key_pressed(egui::Key::ArrowLeft) {
+                    controls.seek_frames(backwards);
+                }
+                if input.key_pressed(egui::Key::ArrowRight) {
+                    controls.seek_frames(controls.position_frames() + 5 * rate as usize);
                 }
                 if input.key_pressed(egui::Key::Escape) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);

@@ -7,8 +7,9 @@ date. If a number is not here, it is either borrowed (and says so) or it does no
 
 | # | what | specs |
 |---|---|---|
-| M1 | development laptop (2026-11-12, every number below except P1's) | Apple M5 Max, 32-core GPU, 36 GB, macOS 27.2.1, Rust 1.99.1, Python 3.12.13, torch 2.15.0, onnxruntime 1.31.1 |
+| M1 | development laptop (2026-11-12, every number below except P1's and M2's) | Apple M5 Max, 32-core GPU, 36 GB, macOS 27.2.1, Rust 1.99.1, Python 3.12.13, torch 2.15.0, onnxruntime 1.31.1 |
 | P1 | the PoC's machine (PoC numbers only) | RTX 4060 Ti 8 GB, Ryzen 9 5900XT, 39 GB, Linux, torch 2.15.0+cu132 |
+| M2 | the same RTX 4060 Ti box, running flacify (Linux numbers) | CachyOS, driver 620.70.06 (CUDA 13.5), Ryzen 9 5900XT, 39 GB, Rust 1.99.1, Python 3.12.16, torch 2.15.0+cu132, onnxruntime-gpu 1.31.1 |
 
 ## Preprocessing port (Rust vs scipy)
 
@@ -210,6 +211,66 @@ Borrowed from P1, and **not** transferable to M1:
 |---|---|---|
 | FlashSR RTF, 5.12 s stereo, bf16 | 0.37 (1.889 s per window) | P1, `flashsr-stream` |
 | peak VRAM | 3.69 GB | P1 |
+
+## Linux: the download, and whether ONNX Runtime can shrink it (2026-11-12)
+
+The macOS probes rejected the ONNX path on throughput, so the full torch install was
+the only viable one there. Linux has a different accelerator, so the same question was
+asked again on M2, the RTX 4060 Ti box.
+
+`flacify setup` on this machine downloads **about 6.6 GB**: 3.20 GB of compressed
+wheels (5.9 GB installed), the 3.32 GB of `.pth` weights, and ~0.15 GB of
+Python/uv/sources. That is more than the 5.9 GB the setup screen prints and more than
+macOS, because PyPI's torch pulls the whole CUDA 13 stack (cublas 405 MB, cuDNN
+519 MB, triton 286 MB, nccl 216 MB, and the rest).
+
+The exported graph (`tools/export_onnx.py`) is unchanged from the macOS one: opset 18,
+4706 nodes, 8.6 MB graph + 2.47 GB external data, export gate **−56.4 dB** on one
+fixture window (gate −40). The runtimes on that graph, same weights, same GPU:
+
+| path | load | s/window | RTF | gate ≤ 1.5 |
+|---|---|---|---|---|
+| PyTorch 2.15 + CUDA, resident worker (`worker_bench.py`) | 9.6 s | 2.32 | **0.453** | pass |
+| ONNX Runtime 1.31.1, CUDA EP, fp32 graph | 1.8 s | 2.79 | **0.545** | pass |
+| ONNX Runtime 1.31.1, CUDA EP, fp16 graph | 1.2 s | 1.78 | **0.348** | pass (numerics fail) |
+
+The sidecar is bit-identical to in-process CUDA here too: `worker_check.py --device
+cuda` reports **−290.6 dB, max abs diff 0.0**. `play --smoke` opens a 44.1 kHz × 2 ch
+device, resamples to 48 kHz and plays with the switch enabled; a 12.0 s clip takes
+21.9 s wall including the ~10 s worker start, and a 345 s track renders and plays in
+221 s (RTF 0.64 including decode and preprocessing).
+
+The numeric gate on the four fixtures, PyTorch TF32 off, fixed seed:
+
+| graph | worst track | worst dB | gate −40 |
+|---|---|---|---|
+| fp32 | `music_cut8k` | **−41.70** | pass, 1.7 dB margin |
+| fp16 | `music_cut8k` | **−10.20** | **fail** |
+
+Whole-graph fp16 conversion is not a download lever: it halves the weights to
+1.24 GB but changes the signal past the gate. A mixed-precision graph (fp16 only where
+safe) might work; it is not a one-line conversion.
+
+**What switching runtimes would save.** ONNX Runtime CUDA removes the 3.2 GB torch
+wheel stack and replaces the 3.32 GB of `.pth` weights with the 2.47 GB exported
+graph:
+
+| deployment | wheels | weights | runtime | first-run total |
+|---|---|---|---|---|
+| torch sidecar (today) | 3.20 GB | 3.32 GB | 0.15 GB | **~6.6 GB** |
+| ONNX Runtime GPU, pip CUDA extras | 1.08 GB | 2.47 GB | 0.05 GB | **~3.6 GB** |
+| ONNX Runtime GPU, system CUDA/cuDNN | 0.26 GB | 2.47 GB | 0.05 GB | **~2.8 GB** |
+| Rust `ort` (no Python) | 0.04 GB | 2.47 GB | — | **~2.5 GB** |
+
+The pip extras are `nvidia-cuda-runtime`, `nvidia-cuda-nvrtc`, `nvidia-cufft`,
+`nvidia-curand` and `nvidia-cudnn-cu13`, 0.82 GB together; a machine with CUDA 13 and
+cuDNN 9 already installed does not need them. The weights are now the floor, which is
+why fp16 was worth testing.
+
+The trade is 20 % slower than torch on the same GPU (0.545 vs 0.453), still 2.75×
+inside the gate. On macOS the same runtime is 15–31 RTF and the trade does not exist.
+That is the platform split: Linux can roughly halve the download, macOS cannot.
+Windows has not been measured; DirectML is the EP to try there.
 
 ## `flacify probe` arithmetic
 

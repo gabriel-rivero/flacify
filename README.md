@@ -3,7 +3,7 @@
 A desktop player that reconstructs the high frequencies an MP3 threw away, and lets
 you hear the difference on a single keystroke.
 
-Status: **prototype, playable on macOS.** `flacify setup` installs the Python sidecar and
+Status: **prototype, playable on macOS and Linux.** `flacify setup` installs the Python sidecar and
 the model, `flacify enhance` renders a file, and `flacify play` opens a window with an
 instant A/B switch. The Rust side owns decode, analysis, the windowing pipeline, the seed
 schedule and the mixer; the model runs in a Python process the app installs and owns
@@ -11,11 +11,15 @@ schedule and the mixer; the model runs in a Python process the app installs and 
 Silicon (ADR-002). The working reference implementation is the Python PoC,
 [`gabriel-rivero/flashsr-stream`](https://github.com/gabriel-rivero/flashsr-stream).
 
-Runs end to end on macOS (verified: Metal, 48 kHz out, A/B enabled). The code is
-portable and CI builds and tests it on Windows and Linux as well, but those two have
-not been run on a real device yet, and the accelerator differs: `cuda` if present,
-`mps` on Apple Silicon, otherwise `cpu`, which is a renderer rather than a player
-(RTF 6–10). See the platform gap in [`docs/roadmap.md`](docs/roadmap.md).
+Runs end to end on macOS (verified: Metal, 48 kHz out, A/B enabled) and on Linux
+(verified: CUDA on an RTX 4060 Ti, a 44.1 kHz device resampled to 48 kHz, A/B
+enabled). Windows is still unrun on a real device; CI builds and tests it. The
+accelerator is `cuda` if present, `mps` on Apple Silicon, otherwise `cpu`, which is a
+renderer rather than a player (RTF 6–10). On Linux the same graph through ONNX
+Runtime's CUDA EP reaches RTF 0.545 and would cut the first-run download roughly in
+half, but the sidecar still runs torch; the numbers are in
+[`docs/measurements.md`](docs/measurements.md#linux-the-download-and-whether-onnx-runtime-can-shrink-it-2026-11-12).
+See the platform gap in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## What works today
 

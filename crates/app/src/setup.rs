@@ -33,6 +33,11 @@ const HOME_ENV: &str = "FLACIFY_HOME";
 const UV_ENV: &str = "FLACIFY_UV";
 
 /// Approximate download sizes for the setup screen. The weights are exact.
+///
+/// `WHEELS_BYTES` is the macOS/PyPI figure. A Linux CUDA install measured 3.20 GB of
+/// compressed wheels on 2026-11-12 (PyPI's torch pulls the whole CUDA 13 stack), so the
+/// screen understates that first run by about 0.7 GB; see the Linux section of
+/// `docs/measurements.md`.
 const UV_BYTES: u64 = 20_000_000;
 const PYTHON_BYTES: u64 = 30_000_000;
 const VENV_BYTES: u64 = 1_000_000;

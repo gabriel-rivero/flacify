@@ -179,15 +179,18 @@ release where it should land.
    untested.
 10. **The worker is not supervised.** If it dies mid-render the app errors out; there is no
    restart, and a wedged model with no output blocks the render thread forever.
-11. **Platform coverage is one machine.** The portable-core work is done: uv's Windows
-    `.zip` is handled, the audio callback covers every integer and float sample format
-    cpal exposes, a refused `BufferSize::Fixed` falls back to the device default, the
-    sidecar picks `cuda > mps > cpu`, and a Windows CI job builds and tests the workspace.
-    What is still missing is a real run on Windows and on Linux (device, PipeWire/WASAPI
-    behaviour, 96 kHz and 5.1 devices) and a decision about the accelerator: PyPI torch is
-    CPU-only on Windows/Linux, so a CUDA build is an opt-in `FLACIFY_TORCH_INDEX`, and
-    without one RTF is ~6–10 and the product is a renderer, not a player. Worth measuring
-    ONNX Runtime with DirectML or the CUDA EP there before settling the sidecar in.
+11. **Platform coverage is one machine plus one Linux run.** The portable-core work is
+    done: uv's Windows `.zip` is handled, the audio callback covers every integer and
+    float sample format cpal exposes, a refused `BufferSize::Fixed` falls back to the
+    device default, the sidecar picks `cuda > mps > cpu`, and a Windows CI job builds and
+    tests the workspace. Linux has now run end to end on a real device (CUDA, a 44.1 kHz
+    device resampled to 48 kHz, `play --smoke`, A/B enabled), and ONNX Runtime's CUDA EP
+    was measured on the same graph: RTF 0.545 fp32, versus 0.453 for torch. Switching to
+    it would cut the Linux first-run download from ~6.6 GB to ~2.5–3.6 GB, but it is 20 %
+    slower and fp16 weights fail the numeric gate. The sidecar therefore stays on torch
+    for the prototype. What is still missing: Windows on a real device (DirectML is the
+    EP to try), the rest of the device matrix (WASAPI/PipeWire, 96 kHz, 5.1), and a
+    decision on the accelerator once Windows is measured.
 12. **Metadata is the filename.** No title, artist or duration from tags, no drag and drop.
 
 **Explicitly parked**

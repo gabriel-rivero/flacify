@@ -13,8 +13,10 @@ Silicon (ADR-002). The working reference implementation is the Python PoC,
 
 Runs end to end on macOS (verified: Metal, 48 kHz out, A/B enabled), on Linux
 (verified: CUDA on an RTX 4060 Ti, a 44.1 kHz device resampled to 48 kHz, A/B
-enabled) and on Windows (verified: 48 kHz out, A/B enabled, CPU inference; 152 s
-for a 5.12 s clip, so a renderer rather than a player there). The
+enabled) and on Windows (verified: 48 kHz out, A/B enabled, CPU inference). Windows
+on that machine is a renderer rather than a player: the render alone measures RTF 7.7,
+and a whole `play --smoke` run for a 5.12 s clip takes 152 s wall clock because the
+model load dominates at that length. The
 accelerator is `cuda` if present, `mps` on Apple Silicon, otherwise `cpu`, which is a
 renderer rather than a player (RTF 6–10). On Linux the same graph through ONNX
 Runtime's CUDA EP reaches RTF 0.545 and would cut the first-run download roughly in
@@ -26,7 +28,7 @@ See the platform gap in [`docs/roadmap.md`](docs/roadmap.md).
 
 ```sh
 cargo build --release
-./target/release/flacify setup                 # once, about 6 GB
+./target/release/flacify setup                 # once, 4-7 GB by platform
 ./target/release/flacify probe song.mp3        # cutoff, verdict, wait
 ./target/release/flacify enhance song.mp3      # -> song.mp3.flacify.wav
 ./target/release/flacify play song.mp3         # window: space toggles, p plays
@@ -69,7 +71,7 @@ See [`docs/vision.md`](docs/vision.md).
 ## Start here
 
 ```sh
-cargo test --workspace   # 91 tests, no GPU, no audio device, no model, no Python
+cargo test --workspace   # 92 tests, no GPU, no audio device, no model, no Python
 ```
 
 `core` and `infer` are testable without a model, which is what makes the DSP and the

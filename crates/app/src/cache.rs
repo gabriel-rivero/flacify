@@ -32,7 +32,7 @@ use crate::render::Render;
 
 /// Bump this when anything about the pipeline changes the samples: window, overlap,
 /// preprocessing, the seed schedule, the limiter.
-pub const CACHE_VERSION: &str = "flacify-cache-3";
+pub const CACHE_VERSION: &str = "flacify-cache-5";
 
 /// 24-bit has about 144 dB of headroom, well under the float noise floor of the model.
 

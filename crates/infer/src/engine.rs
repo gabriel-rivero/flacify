@@ -8,6 +8,19 @@
 use flacify_core::{Block, Error, Preprocessor, Result, Upscaler};
 
 use crate::model::Model;
+
+/// Move every channel back by `delay` samples, padding the tail with silence.
+fn shift_back(planar: &mut [f32], channels: usize, frames: usize, delay: usize) {
+    if delay == 0 || delay >= frames || channels == 0 {
+        return;
+    }
+    for channel in 0..channels {
+        let start = channel * frames;
+        let slice = &mut planar[start..start + frames];
+        slice.copy_within(delay.., 0);
+        slice[frames - delay..].fill(0.0);
+    }
+}
 use crate::noise::fill_normal;
 
 pub struct Engine<M: Model> {
@@ -68,9 +81,19 @@ impl<M: Model> Upscaler for Engine<M> {
         let mut noise = vec![0.0f32; self.model.noise_len(self.channels, self.window)];
         fill_normal(&mut noise, seed);
 
-        let output = self
+        let mut output = self
             .model
             .run(&prepared, &noise, self.channels, self.window)?;
+
+        // Two delays, both measured rather than guessed, both removed here so that frame
+        // k of the output is frame k of the input: the model's own latency, which it
+        // reports, and the preprocessing round trip's, from the preprocessor.
+        let mut delay = self.model.latency_samples();
+        if let Some(preprocessor) = &self.preprocessor {
+            delay += preprocessor.delay_samples();
+        }
+        shift_back(&mut output, self.channels, self.window, delay);
+
         Block::from_planar(self.channels, output)
     }
 

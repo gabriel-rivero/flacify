@@ -16,6 +16,15 @@ pub trait Model: Send {
         frames: usize,
     ) -> Result<Vec<f32>>;
 
+    /// How many samples late the model's output is, relative to its input.
+    ///
+    /// FlashSR's VAE and vocoder add a fixed delay (measured at 12 samples on the
+    /// published checkpoint), and the player compensates for it so that frame `k` of the
+    /// generated signal is frame `k` of the original. Mocks have no latency.
+    fn latency_samples(&self) -> usize {
+        0
+    }
+
     /// Number of noise samples for a window of this shape.
     ///
     /// FlashSR draws its starting noise on the VAE's latent grid, so the count is not

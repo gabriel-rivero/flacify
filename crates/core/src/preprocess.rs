@@ -27,6 +27,12 @@ pub struct Preprocessor {
     sos: Vec<Sos>,
     down: Resampler,
     up: Resampler,
+    /// What the resample round trip delays the signal by, in samples. The polyphase FIR
+    /// is linear-phase, so it arrives late by half its length, twice; upstream inherits
+    /// the same delay and never compensates for it. A player that switches between the
+    /// original and the model's output cannot afford that, so the delay is measured once
+    /// here and removed where the model's output is emitted.
+    delay: usize,
 }
 
 impl Preprocessor {
@@ -56,6 +62,7 @@ impl Preprocessor {
         }
         let down = Resampler::new(fs_down, sample_rate as usize)?;
         let up = Resampler::new(sample_rate as usize, fs_down)?;
+        let delay = measure_delay(&down, &up);
 
         Ok(Self {
             cutoff_hz,
@@ -63,7 +70,14 @@ impl Preprocessor {
             sos,
             down,
             up,
+            delay,
         })
+    }
+
+    /// Samples of delay the resample round trip adds. Zero when the cutoff needs no
+    /// resampling at all.
+    pub fn delay_samples(&self) -> usize {
+        self.delay
     }
 
     pub fn cutoff_hz(&self) -> u32 {
@@ -94,6 +108,43 @@ impl Preprocessor {
     pub fn process(&self, channel: &[f32]) -> Result<Vec<f64>> {
         Ok(self.band_limited(&self.filtered(channel)?))
     }
+
+    /// Undo the round trip's delay, in place, across a planar buffer.
+    ///
+    /// Call this on audio that came back from the model: it was conditioned on delayed
+    /// input, so it is late by the same amount. The tail is padded, because the samples
+    /// shifted off the end do not exist.
+    pub fn compensate(&self, planar: &mut [f32], channels: usize, frames: usize) {
+        if self.delay == 0 || self.delay >= frames || channels == 0 {
+            return;
+        }
+        for channel in 0..channels {
+            let start = channel * frames;
+            let slice = &mut planar[start..start + frames];
+            slice.copy_within(self.delay.., 0);
+            slice[frames - self.delay..].fill(0.0);
+        }
+    }
+}
+
+/// Round-trip an impulse through both stages and see where it lands.
+///
+/// Cheaper and less error-prone than deriving the group delay of a two-stage polyphase
+/// resampler, and it cannot drift from the implementation because it measures it.
+fn measure_delay(down: &Resampler, up: &Resampler) -> usize {
+    if down.is_passthrough() && up.is_passthrough() {
+        return 0;
+    }
+    let centre = 4096;
+    let mut probe = vec![0.0f64; centre * 2];
+    probe[centre] = 1.0;
+    let out = up.process(&down.process(&probe));
+    let peak = out
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap())
+        .map_or(centre, |(index, _)| index);
+    peak.saturating_sub(centre)
 }
 
 impl std::fmt::Debug for Preprocessor {

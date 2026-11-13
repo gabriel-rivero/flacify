@@ -190,20 +190,26 @@ release where it should land.
    independent scipy implementation). One gain per track, taken from the first window, so
    nothing pumps; a track whose opening is unrepresentative gets a slightly wrong gain
    instead. Peak protection (soft knee above 0.9) landed earlier.
-3. **Low-band preservation: attempted, blocked on a measurement.** The splice exists
-   (`--splice`, zero-phase filter on both sides, unit-tested on synthetic signals), but on a
-   rendered track it does not do what it claims: the spliced output correlates with the
-   input's low band exactly as much as the unspliced one (0.297 in 100–6,000 Hz, both
-   freshly rendered), while differing from it by −14.8 dB. The premise may be wrong rather
-   than the code: the generated signal's best alignment against the original wanders
-   (3, −53 and +429 samples at 0.5 s, 2 s and 5 s), so "output frame k is input frame k" is
-   not obviously true at this stage.
+3. **Low-band preservation: attempted, does not work, parked.** The splice exists
+   (`--splice`, zero-phase filter on both sides, unit-tested on synthetic signals) and it
+   still does not restore the input's low band on real music: spliced and unspliced outputs
+   correlate with the input's low band at 0.32 and 0.39 (100–6,000 Hz, freshly rendered,
+   after latency compensation). The measurements that motivated it, and the ones that
+   retired it, are in `measurements.md`.
 
-   **This is now the top investigation**, ahead of the splice itself: if the generated and
-   original signals are not sample-aligned, then (a) the A/B switch is comparing different
-   moments, (b) every low-band metric is meaningless, and (c) the splice cannot work. The
-   test is cheap: an impulse track through the pipeline, and through the real model, with
-   the output's impulse position measured against the input's.
+   The alignment question it raised is answered, and the earlier "wandering lag" was noise:
+   - the pipeline is exact (an impulse comes out at its own index, tested);
+   - the preprocessing round trip is exact too (the 62-sample shift I first measured was an
+     artefact of a rectangular burst; a single-sample impulse lands on itself);
+   - the model is late by a fixed **12 samples** (0.25 ms), measured twice, which the player
+     now compensates because the model declares its own latency.
+
+   So the sides are sample-aligned to a quarter of a millisecond. The remaining reason the
+   splice fails is that the model's low band is not a delayed copy of the input's — it is a
+   regenerated signal with its own phase (correlation ~0.4), and subtracting one and adding
+   the other leaves a mix of both. A working version means doing it where upstream does, in
+   the mel domain, or a linear-phase crossover much steeper than the current Chebyshev. Not
+   worth either until the product needs it.
 4. ~~No seek.~~ **Done (2026-11-13):** the position bar is draggable and the arrow keys
    jump five seconds. Seek is instant because the track is decoded into memory; seeking a
    *streaming* track arrives with the queue in v0.4.

@@ -409,6 +409,32 @@ and read it back on the next run. Same machine, same tracks, second run only.
 The cache entry for the 5.12 s clip is 1.9 MB, which is exactly 245,760 × 2 × 4 bytes: the
 cache stores the float stream, not a lossy copy.
 
+## Alignment and the low-band splice (2026-11-13)
+
+Whether frame `k` of the generated signal is frame `k` of the original, measured in three
+places:
+
+| stage | test | result |
+|---|---|---|
+| pipeline (windowing, crossfade) | impulse at 0, 1 000, 197 760, 400 000, 500 000 frames, identity upscaler | comes out at its own index, length exact |
+| preprocessing round trip | single-sample impulse through `Preprocessor::process` at three positions | lands on itself; the 62-sample shift first seen was an artefact of using a 64-sample rectangular burst, whose ringing moves the apparent peak |
+| the model | band-limited burst at frames 60 000 and 120 000 in one window | **12 samples late both times** (peak); the energy centroid says 24, the expected disagreement for an asymmetric kernel |
+
+The player compensates the model's 12 samples (`Model::latency_samples`), so the two sides
+are aligned to 0.25 ms.
+
+**The splice, measured.** `out − low(out) + low(input)`, same zero-phase Chebyshev on both
+sides, cutoff 15,351 Hz, on a 30.7 s track:
+
+| variant | correlation with the input's low band (100–6 000 Hz) |
+|---|---|
+| unspliced | 0.39 |
+| spliced | 0.32 |
+
+It does not work. The model's low band is not a delayed copy of the input's: it is
+regenerated with its own phase, so subtracting it and adding the input's leaves a mixture of
+both rather than the input. The `--splice` flag stays off.
+
 ## Loudness matching (2026-11-13)
 
 The generated side used to be **1.49 LU louder** than the original on a steady track, so

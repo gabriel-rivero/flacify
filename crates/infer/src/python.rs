@@ -209,6 +209,17 @@ impl Model for PythonWorker {
         }
     }
 
+    /// Measured on the published checkpoint with a band-limited burst at two positions
+    /// inside one window: the peak lands 12 samples late both times. The energy centroid
+    /// says 24, which is the expected disagreement for an asymmetric response kernel; the
+    /// peak is the moment the transient actually arrives, so that is the value used.
+    ///
+    /// This is a 0.25 ms offset, well under anything audible in a switch, and it is not
+    /// what made the low-band splice fail. Re-measure if the weights move.
+    fn latency_samples(&self) -> usize {
+        12
+    }
+
     fn name(&self) -> &str {
         "flashsr-sidecar"
     }

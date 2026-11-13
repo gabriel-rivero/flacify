@@ -26,8 +26,16 @@ const WEIGHT_SIZES: [(&str, u64); 3] = [
     ("vae.pth", 1_655_458_345),
 ];
 
-/// `FLACIFY_HOME` and `FLACIFY_UV` are process-wide, so the tests take turns.
+/// `FLACIFY_HOME`, `FLACIFY_UV` and `PATH` are process-wide, so the tests take turns.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Takes the turn. `Home` holds this for its lifetime; a test that must not have the
+/// environment changed under it takes it directly.
+fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// A unique data directory for one test, with uv redirected away from `PATH`.
 struct Home {
@@ -40,9 +48,7 @@ struct Home {
 
 impl Home {
     fn new(name: &str) -> Home {
-        let guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = env_lock();
         let root = env::temp_dir().join(format!("flacify-setup-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("creating the temp home");
@@ -564,6 +570,9 @@ fn given_the_plan_when_summed_then_it_reports_the_size_the_screen_shows() {
 #[cfg(unix)]
 #[test]
 fn given_a_command_that_fails_when_run_then_the_error_carries_its_output_or_exit() {
+    // `sh` is looked up in `PATH`, and a concurrent `Home::without_uv` empties it.
+    let _env = env_lock();
+
     let with_output = SystemRunner
         .run(Path::new("sh"), &["-c", "echo boom >&2; exit 3"])
         .expect_err("a command that exits 3");

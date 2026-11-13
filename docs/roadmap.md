@@ -176,10 +176,11 @@ release where it should land.
    wheels). What is still missing: per-step progress rather than `step: ... / step: done`,
    resume *inside* a step (a dropped connection restarts that step's download), and a
    check that the installed sidecar actually imports before declaring success. Windows is
-   untested.
+   now installed end to end (4.2 GiB on a CPU-only machine) and setup is idempotent; that
+   run found the `uv` pre-download bug in gap 11.
 10. **The worker is not supervised.** If it dies mid-render the app errors out; there is no
    restart, and a wedged model with no output blocks the render thread forever.
-11. **Platform coverage is one machine plus one Linux run.** The portable-core work is
+11. **Platform coverage is one machine plus Linux and Windows runs.** The portable-core work is
     done: uv's Windows `.zip` is handled, the audio callback covers every integer and
     float sample format cpal exposes, a refused `BufferSize::Fixed` falls back to the
     device default, the sidecar picks `cuda > mps > cpu`, and a Windows CI job builds and
@@ -188,9 +189,13 @@ release where it should land.
     was measured on the same graph: RTF 0.545 fp32, versus 0.453 for torch. Switching to
     it would cut the Linux first-run download from ~6.6 GB to ~2.5–3.6 GB, but it is 20 %
     slower and fp16 weights fail the numeric gate. The sidecar therefore stays on torch
-    for the prototype. What is still missing: Windows on a real device (DirectML is the
-    EP to try), the rest of the device matrix (WASAPI/PipeWire, 96 kHz, 5.1), and a
-    decision on the accelerator once Windows is measured.
+    for the prototype. Windows has now run end to end on a real device as well (CPU
+    inference, 48 kHz device, A/B enabled, `play --smoke`), which makes it a renderer
+    there: 152 s of wall clock for a 5.12 s clip, and ONNX Runtime's CPU EP is 4.3x
+    slower again. DirectML is not the answer there: its newest release (ORT 1.24.4)
+    refuses to initialise a graph containing a 1D `ConvTranspose`, which is what the
+    vocoder is built from. What is still missing: a Windows accelerator, the rest of the
+    device matrix (WASAPI/PipeWire, 96 kHz, 5.1), and a decision on the accelerator.
 12. **Metadata is the filename.** No title, artist or duration from tags, no drag and drop.
 
 **Explicitly parked**

@@ -10,6 +10,7 @@ date. If a number is not here, it is either borrowed (and says so) or it does no
 | M1 | development laptop (2026-11-12, every number below except P1's and M2's) | Apple M5 Max, 32-core GPU, 36 GB, macOS 27.2.1, Rust 1.99.1, Python 3.12.13, torch 2.15.0, onnxruntime 1.31.1 |
 | P1 | the PoC's machine (PoC numbers only) | RTX 4060 Ti 8 GB, Ryzen 9 5900XT, 39 GB, Linux, torch 2.15.0+cu132 |
 | M2 | the same RTX 4060 Ti box, running flacify (Linux numbers) | CachyOS, driver 620.70.06 (CUDA 13.5), Ryzen 9 5900XT, 39 GB, Rust 1.99.1, Python 3.12.16, torch 2.15.0+cu132, onnxruntime-gpu 1.31.1 |
+| W1 | this Windows handheld (Windows numbers) | Ryzen Z1 Extreme, 8 cores / 16 threads, Radeon integrated graphics, 23.2 GB, Windows 11 Pro 26200, Rust 1.100.0 (MSVC), no CUDA |
 
 ## Preprocessing port (Rust vs scipy)
 
@@ -270,7 +271,128 @@ why fp16 was worth testing.
 The trade is 20 % slower than torch on the same GPU (0.545 vs 0.453), still 2.75×
 inside the gate. On macOS the same runtime is 15–31 RTF and the trade does not exist.
 That is the platform split: Linux can roughly halve the download, macOS cannot.
-Windows has not been measured; DirectML is the EP to try there.
+Windows is measured below: its CPU EP is 33 RTF and DirectML cannot load the graph.
+
+## Windows: build and test suite (2026-11-12)
+
+Windows had only ever been compiled by CI. This is the first native run on a real
+device, and the machine has no CUDA (Radeon integrated graphics), so `auto` resolves
+to `cpu`. The build and test rows are model-free; the `play --smoke` row is the
+end-to-end path.
+
+| metric | value | source |
+|---|---|---|
+| cold `cargo build --release` (every dependency, MSVC) | 75 s | W1, 2026-11-12 |
+| warm `cargo build --release` (one file changed) | 17.7 s | W1, 2026-11-12 |
+| `cargo test --workspace`, warm | **91 passed, 0 failed**, 1.5 s | W1, 2026-11-12 |
+| breakdown | 19 core lib, 1 fixture, 11 pipeline, 13 app lib, 9 decode, 12 setup, 14 infer lib, 3 fake worker, 9 worker IPC | W1, 2026-11-12 |
+| `flacify setup`, first run | all seven steps, **4.2 GiB on disk** (weights 3.09, venv 0.93, runtime 0.16) | W1, 2026-11-12 |
+| `flacify setup`, second run | 0.1 s, no step executes | W1, 2026-11-12 |
+| `flacify play --smoke`, 5.12 s clip | 152.1 s wall (load + render + 1.2 s of playback), **48 kHz × 2 ch**, 58,656 frames pulled in 1.2 s, switch enabled, `model cpu` | W1, 2026-11-12 |
+| toolchain | rustc 1.100.0, stable-x86_64-pc-windows-msvc | W1, 2026-11-12 |
+
+The suite is 91 tests at this commit; the README's 87 predates the Windows-port
+fixes and the one added below.
+
+Windows is a renderer on this machine, not a player: 152 s of wall clock for one
+5.12 s window, load included, is far outside the 1.5 RTF gate and that is the CPU
+path the README already describes. DirectML through ONNX Runtime was the candidate for a
+Windows accelerator; it cannot load this graph, and the reason is below. Setup is
+smaller than on the other platforms
+(4.2 GiB vs the 5.9 GB the screen prints) because PyPI's Windows torch is CPU-only,
+so the wheels are ~0.9 GiB instead of the 2.5 GB the plan reserves for CUDA.
+
+**Smart App Control blocks every local build.** This Windows 11 install had Smart App
+Control enforced (`VerifiedAndReputablePolicyState = 1`), and the first build died in
+`khronos_api`'s build script with `An Application Control policy has blocked this file.
+(os error 4551)`; CodeIntegrity logged policy `{0283ac0f-…}`. SAC has no exclusion
+list, and it would also block the `uv.exe`, managed CPython and wheels that
+`flacify setup` installs, so the build and test numbers above were taken after
+Settings → App & browser control → Smart App Control → Off and a reboot. That toggle
+is one-way: re-enabling it needs a Windows reset.
+
+A clean first run also found a provisioning bug that macOS never hit, because macOS
+had `uv` on `PATH` and skipped the download. `install_uv` hands `curl -o` a path under
+`runtime/`, and `tar -C runtime/bin`, before either directory exists, so on a machine
+with no `uv` the `uv` step fails with `curl: (23) client returned ERROR on write`.
+The step now creates those directories first, and a test covers the download branch
+with no `uv` on `PATH`.
+
+## Windows: the download, and whether ONNX Runtime can shrink it (2026-11-12)
+
+Windows starts from a different number than macOS and Linux: PyPI's Windows torch is
+CPU-only, so the wheel stack is already small and the `.pth` weights are most of the
+download.
+
+| component (first run, W1) | download | on disk |
+|---|---|---|
+| three `.pth` weights | 3.32 GB | 3.09 GiB |
+| 66 distributions in the venv | **294 MB** | 0.93 GiB |
+| CPython 3.12 (installed by uv) | 63 MB | 63 MB |
+| FlashSR source archive | 53 MB | 53 MB |
+| uv.exe and the kept uv.zip | 46 MB | 46 MB |
+| **total** | **~3.8 GB** | **4.17 GiB** |
+
+The wheels, largest first: torch 127 MB, llvmlite 42, scipy 37, onnxruntime 15, numpy
+13, matplotlib 9, scikit-learn 8, onnx 8, pillow 7, sympy 6; the other 56 distributions
+are 21 MB together. So Windows is already ~1.9 GB below the 5.9 GB the setup screen
+prints, because that figure reserves 2.5 GB for the CUDA wheels a CPU-only Windows
+install never fetches. Dropping the keep of `uv.zip` and trimming the FlashSR tree are
+noise next to the weights; the librosa chain (llvmlite, numba, scikit-learn,
+matplotlib, ~63 MB) cannot go without patching upstream, which imports matplotlib and
+scikit-learn at module load.
+
+The exported graph is the same one macOS and Linux produced — dynamo, opset 18, 4706
+nodes — at **8.6 MB graph + 2.46 GB external data**, 2,472,256,261 bytes in total.
+Exported on W1 against the `music_cut16k` fixture, the gate is **−66.7 dB** against
+eager torch (gate −40); the four-track comparison was not re-run on Windows because
+each track costs a torch window plus an ONNX window on CPU, and the conversion is
+architecture-independent (−41.70 dB worst on M2, fp32).
+
+| deployment | wheels | weights | python + uv | first-run total |
+|---|---|---|---|---|
+| torch sidecar (today) | 294 MB | 3.32 GB | 162 MB | **~3.8 GB** |
+| ONNX Runtime, Python sidecar | ~35 MB | 2.46 GB | 109 MB | **~2.6 GB** |
+| Rust `ort` (no Python) | — | 2.46 GB | — | **~2.5 GB** |
+
+That is **~1.2 GB less (31 %)** for the Python path and **~1.3 GB less (34 %)** for the
+Rust one. Whole-graph fp16 halves the weights again to 1.24 GB, but it fails the
+numeric gate on Linux (−10.20 dB on the worst track), and that conversion does not
+depend on the OS, so it was not retried here.
+
+The catch is throughput, and on Windows it is the same catch as on macOS:
+
+| path, 5.12 s stereo window | load | s/window | RTF |
+|---|---|---|---|
+| PyTorch 2.15, CPU, resident worker | 12.5 s | 39.40 | **7.70** |
+| ONNX Runtime 1.31.1, CPU EP | 5.0 s | 169.14 | **33.0** |
+
+ONNX Runtime's CPU EP is 4.3x slower than torch's CPU path on this machine, against
+3.5x on the M5 Max, so on a CPU-only Windows box the smaller download buys a much worse
+renderer. The trade is only worth it alongside a GPU execution provider, and on Windows
+that is DirectML — tried here, and it cannot load this graph.
+`onnxruntime-directml` installs cleanly at 25.1 MB (137 MB on disk), but its newest
+release is ORT 1.24.4, seven minor versions behind the 1.31.1 the CPU package ships, and
+`DmlExecutionProvider` dies in session init on the exported graph:
+
+    RUNTIME_EXCEPTION: Exception during initialization:
+    .../DmlExecutionProvider/src/MLOperatorAuthorImpl.cpp(2818) ... 80070057
+    The parameter is incorrect.
+
+That is `onnxruntime-directml==1.24.4` in a scratch venv plus
+`python tools/bench_onnx.py --provider directml`; `tools/bench_onnx.py` needs no change
+to reach it, because the failure is before any timing starts.
+
+The blocker is 1D transposed convolution. The vocoder is 94 `ConvTranspose` nodes and the
+EP claims them: a one-node model whose only op is a 1D `ConvTranspose` fails identically,
+while its 2D twin, a plain 1D `Conv`, a grouped 1D `Conv` and a 4706-node `Conv` chain all
+load and run on the DML EP on this machine. Disabling graph optimisation, and disabling
+the memory pattern together with switching to sequential execution, change nothing. So
+DirectML needs those 94 nodes rewritten as `Resize` plus `Conv` — which the graph already
+does six times — or a newer EP that does not exist yet, and no DirectML number exists as a
+result. It is not a configuration switch either: `tools/worker.py` imports torch, so
+shipping the ONNX path means a second worker or the Rust `ort` work, which is why the
+Linux section lists it as future work.
 
 ## `flacify probe` arithmetic
 

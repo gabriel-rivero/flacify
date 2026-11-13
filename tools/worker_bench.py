@@ -60,6 +60,21 @@ def read_exact(stream, size: int) -> bytes:
     return bytes(chunks)
 
 
+def windows_rss_mb(pid: int) -> float:
+    """RSS of `pid` and its children, because Windows has no `ps` and the venv's
+    `python.exe` is a launcher that hands the work to a child interpreter."""
+    try:
+        import psutil
+    except ImportError:
+        return 0.0
+    try:
+        process = psutil.Process(pid)
+        tree = [process, *process.children(recursive=True)]
+        return round(sum(p.memory_info().rss for p in tree) / 2**20, 1)
+    except (psutil.Error, OSError):
+        return 0.0
+
+
 class Client:
     def __init__(self, args: argparse.Namespace) -> None:
         command = [
@@ -110,6 +125,8 @@ class Client:
         return json.loads(payload)
 
     def rss_mb(self) -> float:
+        if sys.platform == "win32":
+            return windows_rss_mb(self.proc.pid)
         out = subprocess.run(
             ["ps", "-o", "rss=", "-p", str(self.proc.pid)], capture_output=True, text=True
         ).stdout.strip()

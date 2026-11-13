@@ -332,6 +332,9 @@ pub trait Runner {
     fn run(&self, program: &Path, args: &[&str]) -> Result<()>;
     /// Replaces `path` atomically, creating parent directories.
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<()>;
+    /// Creates `path` and any missing parents, for steps that shell out to a program
+    /// which will not create the directory it writes into (curl, tar).
+    fn create_dir_all(&self, path: &Path) -> Result<()>;
     /// The size of a regular file, or `None` when it is absent.
     fn size(&self, path: &Path) -> Option<u64>;
     /// The contents of a regular file, or `None` when it is unreadable.
@@ -372,6 +375,10 @@ impl Runner for SystemRunner {
                 .with_context(|| format!("syncing {}", temp.display()))?;
         }
         fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()))
+    }
+
+    fn create_dir_all(&self, path: &Path) -> Result<()> {
+        fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))
     }
 
     fn size(&self, path: &Path) -> Option<u64> {
@@ -436,6 +443,10 @@ fn install_uv(paths: &Paths, runner: &dyn Runner, uv: &mut Option<PathBuf>) -> R
     let bin_dir = paths.runtime_dir().join("bin");
     let archive_arg = archive.to_string_lossy().into_owned();
     let bin_arg = bin_dir.to_string_lossy().into_owned();
+
+    // curl -o does not create the directory it writes into, and tar -C fails if its
+    // destination is missing; on a clean machine neither exists yet.
+    runner.create_dir_all(&bin_dir)?;
 
     runner.run(
         Path::new("curl"),

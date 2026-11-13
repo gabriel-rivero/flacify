@@ -11,9 +11,10 @@ schedule and the mixer; the model runs in a Python process the app installs and 
 Silicon (ADR-002). The working reference implementation is the Python PoC,
 [`gabriel-rivero/flashsr-stream`](https://github.com/gabriel-rivero/flashsr-stream).
 
-Runs end to end on macOS (verified: Metal, 48 kHz out, A/B enabled) and on Linux
+Runs end to end on macOS (verified: Metal, 48 kHz out, A/B enabled), on Linux
 (verified: CUDA on an RTX 4060 Ti, a 44.1 kHz device resampled to 48 kHz, A/B
-enabled). Windows is still unrun on a real device; CI builds and tests it. The
+enabled) and on Windows (verified: 48 kHz out, A/B enabled, CPU inference; 152 s
+for a 5.12 s clip, so a renderer rather than a player there). The
 accelerator is `cuda` if present, `mps` on Apple Silicon, otherwise `cpu`, which is a
 renderer rather than a player (RTF 6–10). On Linux the same graph through ONNX
 Runtime's CUDA EP reaches RTF 0.545 and would cut the first-run download roughly in
@@ -68,7 +69,7 @@ See [`docs/vision.md`](docs/vision.md).
 ## Start here
 
 ```sh
-cargo test --workspace   # 87 tests, no GPU, no audio device, no model, no Python
+cargo test --workspace   # 91 tests, no GPU, no audio device, no model, no Python
 ```
 
 `core` and `infer` are testable without a model, which is what makes the DSP and the

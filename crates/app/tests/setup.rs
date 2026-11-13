@@ -34,6 +34,7 @@ struct Home {
     root: PathBuf,
     previous_home: Option<OsString>,
     previous_uv: Option<OsString>,
+    previous_path: Option<Option<OsString>>,
     _guard: MutexGuard<'static, ()>,
 }
 
@@ -55,8 +56,18 @@ impl Home {
             root,
             previous_home,
             previous_uv,
+            previous_path: None,
             _guard: guard,
         }
+    }
+
+    /// A home with no uv anywhere, so the step that installs it has to download it.
+    fn without_uv(name: &str) -> Home {
+        let mut home = Home::new(name);
+        env::remove_var("FLACIFY_UV");
+        home.previous_path = Some(env::var_os("PATH"));
+        env::set_var("PATH", "");
+        home
     }
 
     fn paths(&self) -> Paths {
@@ -73,6 +84,12 @@ impl Drop for Home {
         match &self.previous_uv {
             Some(value) => env::set_var("FLACIFY_UV", value),
             None => env::remove_var("FLACIFY_UV"),
+        }
+        if let Some(value) = &self.previous_path {
+            match value {
+                Some(path) => env::set_var("PATH", path),
+                None => env::remove_var("PATH"),
+            }
         }
         let _ = fs::remove_dir_all(&self.root);
         // `_guard` drops last, after the variables are restored.
@@ -140,6 +157,22 @@ impl Runner for FakeRunner {
         if args.first() == Some(&"venv") && self.is_venv_created {
             SystemRunner.write(&self.venv_python, b"#!/bin/sh\n")?;
         }
+        // A real `tar -C` fails when its destination is missing; model that, then leave
+        // the binary behind so the step's size check sees an install.
+        if args.first() == Some(&"-xf") {
+            if let Some(dir) = args
+                .iter()
+                .position(|arg| *arg == "-C")
+                .and_then(|i| args.get(i + 1))
+            {
+                let dir = Path::new(dir);
+                if !dir.is_dir() {
+                    anyhow::bail!("tar -C {}: No such file or directory", dir.display());
+                }
+                let name = if cfg!(windows) { "uv.exe" } else { "uv" };
+                SystemRunner.write(&dir.join(name), b"uv (fake)\n")?;
+            }
+        }
         // The flashsr step runs the extractor script; its contract is that the marker
         // file exists afterwards, so that is what the double produces.
         if let Some(marker) = args.iter().find(|arg| arg.ends_with("FlashSR/FlashSR.py")) {
@@ -156,6 +189,10 @@ impl Runner for FakeRunner {
 
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         SystemRunner.write(path, bytes)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> Result<()> {
+        SystemRunner.create_dir_all(path)
     }
 
     fn read(&self, path: &Path) -> Option<Vec<u8>> {
@@ -278,6 +315,22 @@ fn given_an_empty_home_when_ensure_runs_then_every_step_executes_in_order() {
             .collect();
         assert_eq!(reported, vec![0.0, 1.0], "{id} reported {reported:?}");
     }
+}
+
+#[test]
+fn given_a_clean_home_when_the_uv_step_runs_then_curl_has_a_directory_to_write_into() {
+    let home = Home::without_uv("uv-dirs");
+    let paths = home.paths();
+    let runner = FakeRunner::new(&paths);
+
+    ensure_with(&paths, &runner, Progress::default()).expect("a clean provisioning run");
+
+    // tar extracts into runtime/bin, and curl writes runtime/uv.zip; neither parent
+    // exists on a fresh machine, and neither program creates it.
+    assert!(
+        paths.runtime_dir().join("bin").is_dir(),
+        "bin/ was not created"
+    );
 }
 
 #[test]

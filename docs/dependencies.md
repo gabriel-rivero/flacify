@@ -8,17 +8,23 @@ Python runtime, it belongs in `tools/`, not in `crates/`.
 
 **Prototype exception (ADR-010).** v0.0 installs a Python sidecar on first run: `uv`
 fetches CPython 3.12, pip installs the pinned wheels, and the weights download from
-upstream. About 6 GB, once. This is time-boxed scaffolding for evaluating the product,
+upstream. About 6 GB, once — 6.9 GiB measured with the CUDA wheels, 4.2 GiB with PyPI's
+CPU-only torch. This is time-boxed scaffolding for evaluating the product,
 not a shipping design, and the rule above is unchanged for v1.
 
 PyPI's `torch` is CPU-only on Windows and Linux. A CUDA build comes from PyTorch's own
 index and costs about 2.5 GB more, so it is opt-in per machine rather than assumed:
 
 ```sh
-FLACIFY_TORCH_INDEX=https://download.pytorch.org/whl/cu124 flacify setup
+FLACIFY_TORCH_INDEX=https://download.pytorch.org/whl/cu132 flacify setup
 ```
 
-The chosen index is recorded in the wheels receipt, so changing it re-runs that step.
+The index must carry the same torch version the pins resolve to; `cu132` is the one
+that publishes 2.15.0. Setting it upgrades an existing CPU install on the next
+`setup` (2.0 GiB, about 13 minutes measured), and the chosen index is recorded in the
+wheels receipt, so changing it re-runs that step. On Windows the PowerShell form is
+`$env:FLACIFY_TORCH_INDEX = "https://download.pytorch.org/whl/cu132"`. Leaving it
+unset keeps the CPU wheel and does not re-download anything.
 
 ## Rust crates
 

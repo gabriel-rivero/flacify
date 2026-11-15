@@ -100,12 +100,13 @@ Exit: first sound ≤ 2 s from cache (met: 0.17 s), ≤ 15 s cold (met: 12.6 s),
 with the first note (met), no dropouts in a five-minute session (not yet exercised).
 
 **Landed so far (2026-11-13):** progressive playback with a prebuffer, automatic promotion
-once, a draggable seek bar, the frontier progress bar and the status line. **Still to do:**
-the spectrum, tags in the title, drag-and-drop, the dropout counter, and a resident worker
-so a cold play costs nothing. That last one is the difference between 12.6 s and ~4 s and
-belongs with the app (v0.3), because it is the app that owns the worker's lifetime.
+once, a draggable seek bar, the frontier progress bar and the status line; then the two
+spectra, title and artist from tags, and a device stream-error counter (2026-11-13). **Still
+to do:** drag-and-drop and a resident worker so a cold play costs nothing. That last one is
+the difference between 12.6 s and ~4 s and belongs with the app (v0.3), because it is the
+app that owns the worker's lifetime.
 
-**The window.** The current one is a button, a slider and two grey lines.
+**The window.** The spectrum and the tags have landed; this is the rest of the target.
 
 - Track title/artist from tags, with the file name as the fallback.
 - A real transport: play/pause, seek bar with elapsed/total, and a visible playhead.
@@ -117,10 +118,13 @@ belongs with the app (v0.3), because it is the app that owns the worker's lifeti
   measured RTF, and the peak limiting it applied.
 - Drag a file onto the window; errors are states, never silent stops.
 
-**Honesty work that belongs with the toggle.** Loudness-match the two sides (today the
-enhanced side is +0.57 dB) and try upstream's low-band splice, so the A/B differs in
-brightness and not in level or in something the model regenerated badly. Both are
-measured before they ship.
+**Honesty work that belongs with the toggle.** Both landed and both were measured.
+Loudness matching brought the two sides within 0.1 dB on a steady track, so the switch now
+changes brightness and not level. The low-band splice did not work: with the input's low
+band subtracted from the generated side and its own added back, the result correlates
+*worse* with the input's low band than the unspliced render (0.32 vs 0.39), so `--splice`
+stays off. The numbers are in
+[`docs/measurements.md`](measurements.md#alignment-and-the-low-band-splice-2026-11-13).
 
 Deliberately absent: playlists, library view, EQ, skins, export UI, system sink.
 
@@ -213,12 +217,13 @@ release where it should land.
 4. ~~No seek.~~ **Done (2026-11-13):** the position bar is draggable and the arrow keys
    jump five seconds. Seek is instant because the track is decoded into memory; seeking a
    *streaming* track arrives with the queue in v0.4.
-5. ~~Whole-track render before play.~~ **Scheduled for v0.2 (2026-11-13):** the player
-   starts on the original and promotes to enhanced as the frontier passes the playhead
-   (ADR-012). The mixer, the device path and the cache already carry it; what is missing is
-   the producer side.
-6. **No visual feedback of its own.** No spectrum and no waveform (ADR-005 called for a
-   spectrum). The window is text, a button and a bar.
+5. ~~Whole-track render before play.~~ **Done (2026-11-13):** the player starts on the
+   original and promotes itself once the frontier passes the playhead (ADR-012); 0.17 s
+   from cache and 12.6 s cold on the M5 Max, then the switch is live. What remains is the
+   resident worker, which turns the cold 12.6 s into ~4 s.
+6. **No waveform.** The two spectra are there, at the playhead, with the cutoff and the
+   generated band marked (ADR-005). There is still no waveform, and the transport is text,
+   a button and a bar.
 7. **No full-scale policy beyond the limiter.** The original is played as decoded, so a
    master that already peaks above 1.0 clips at the device exactly as it would in any
    player; the enhanced side is limited to 0.999 while the original is not, which can make
@@ -233,8 +238,8 @@ release where it should land.
    wheels). What is still missing: per-step progress rather than `step: ... / step: done`,
    resume *inside* a step (a dropped connection restarts that step's download), and a
    check that the installed sidecar actually imports before declaring success. Windows is
-   now installed end to end (4.2 GiB on a CPU-only machine) and setup is idempotent; that
-   run found the `uv` pre-download bug in gap 11.
+   now installed end to end (4.2 GiB on a CPU-only machine, 6.9 GiB on W2 with the CUDA
+   wheels) and setup is idempotent; that run found the `uv` pre-download bug in gap 11.
 10. **The worker is not supervised.** If it dies mid-render the app errors out; there is no
    restart, and a wedged model with no output blocks the render thread forever.
 11. **Platform coverage is one machine plus Linux and Windows runs.** The portable-core work is
@@ -246,14 +251,21 @@ release where it should land.
     was measured on the same graph: RTF 0.545 fp32, versus 0.453 for torch. Switching to
     it would cut the Linux first-run download from ~6.6 GB to ~2.5–3.6 GB, but it is 20 %
     slower and fp16 weights fail the numeric gate. The sidecar therefore stays on torch
-    for the prototype. Windows has now run end to end on a real device as well (CPU
-    inference, 48 kHz device, A/B enabled, `play --smoke`), which makes it a renderer
-    there: 152 s of wall clock for a 5.12 s clip, and ONNX Runtime's CPU EP is 4.3x
-    slower again. DirectML is not the answer there: its newest release (ORT 1.24.4)
-    refuses to initialise a graph containing a 1D `ConvTranspose`, which is what the
-    vocoder is built from. What is still missing: a Windows accelerator, the rest of the
-    device matrix (WASAPI/PipeWire, 96 kHz, 5.1), and a decision on the accelerator.
-12. **Metadata is the filename.** No title, artist or duration from tags, no drag and drop.
+    for the prototype. Windows has now run end to end twice: on W1 with CPU inference
+    (48 kHz device, A/B enabled, RTF 7.7, ONNX Runtime's CPU EP 4.3x slower again), and on
+    W2 — the 4060 Ti box — with torch from PyTorch's `cu132` index, where it is no longer
+    a renderer but a player: RTF 0.66, and an uncached 45 s `play --smoke` reported the
+    switch offered and promoted at 25.4 s, 22 s of which is the model load. That is opt-in
+    through `FLACIFY_TORCH_INDEX`, not a default, and the run found two setup bugs that are
+    now fixed (the index did not upgrade an existing CPU install, and setting it made a
+    good install look missing). DirectML is still not the answer: its newest release (ORT
+    1.24.4) refuses to initialise a graph containing a 1D `ConvTranspose`, which is what
+    the vocoder is built from. What is still missing: choosing the CUDA wheel without an
+    environment variable (a per-platform default, or a documented `setup` flag), the rest
+    of the device matrix (WASAPI/PipeWire, 96 kHz, 5.1), and a decision on the accelerator.
+12. **Metadata is partial.** Title and artist come from tags, with the filename as the
+    fallback; duration comes from the decode. There is no artwork, no album or year, and no
+    drag and drop.
 
 **Explicitly parked**
 

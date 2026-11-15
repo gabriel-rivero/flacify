@@ -151,7 +151,7 @@ committed and pushed to `gabriel-rivero/flacify`; CI is green on all three jobs.
 | E10-1, E10-2 | **done** | `tools/worker.py`, `worker_bench.py`, `worker_check.py`; RTF 0.543 through the pipe, 2 ms IPC, bit-identical to in-process Metal |
 | E10-3 | **done** | `crates/infer/src/python.rs` + `fake-flashsr-worker`; 9 integration tests, no torch in CI |
 | E10-4 | **done** | `flacify enhance` writes a 32-bit float WAV through the real pipeline; 30.7 s in 34.1 s |
-| E10-5 | **written, not run end to end** | `crates/app/src/setup.rs` with a resumable state machine; 12 tests, no network; the 6 GB install has never run on a clean machine |
+| E10-5 | **done on three machines** | `crates/app/src/setup.rs`, resumable state machine; clean installs on M1 (macOS, ~5.9 GB), W1 (Windows, 4.2 GiB, CPU) and W2 (Windows, 6.9 GiB with CUDA wheels); a second run executes no step |
 | E10-6 | **done** | `flacify play`: egui window, space to toggle, 8 ms sample-locked ramp, `--smoke` proves the device pulls audio |
 
 The three pipeline bugs the tests caught, recorded so they are not reintroduced: the

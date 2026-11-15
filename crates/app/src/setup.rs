@@ -130,8 +130,12 @@ fn receipt_wheels(text: &str) -> Vec<&str> {
 /// index and is about 2.5 GB larger. Opting in is per machine:
 ///
 /// ```text
-/// FLACIFY_TORCH_INDEX=https://download.pytorch.org/whl/cu124
+/// FLACIFY_TORCH_INDEX=https://download.pytorch.org/whl/cu132
 /// ```
+///
+/// The tag has to publish the torch version the pins resolve to: `cu132` is the one that
+/// carries 2.15.0 (measured on Windows, 2026-11-15). The variable doubles as the signal to
+/// upgrade an existing install, so setting it re-downloads torch.
 ///
 /// macOS needs none of this: its PyPI wheel already has Metal.
 fn torch_index() -> Option<String> {

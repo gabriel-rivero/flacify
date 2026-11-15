@@ -7,10 +7,11 @@ date. If a number is not here, it is either borrowed (and says so) or it does no
 
 | # | what | specs |
 |---|---|---|
-| M1 | development laptop (2026-11-12, every number below except P1's and M2's) | Apple M5 Max, 32-core GPU, 36 GB, macOS 27.2.1, Rust 1.99.1, Python 3.12.13, torch 2.15.0, onnxruntime 1.31.1 |
+| M1 | development laptop (2026-11-12, every number below except P1's, M2's, W1's and W2's) | Apple M5 Max, 32-core GPU, 36 GB, macOS 27.2.1, Rust 1.99.1, Python 3.12.13, torch 2.15.0, onnxruntime 1.31.1 |
 | P1 | the PoC's machine (PoC numbers only) | RTX 4060 Ti 8 GB, Ryzen 9 5900XT, 39 GB, Linux, torch 2.15.0+cu132 |
 | M2 | the same RTX 4060 Ti box, running flacify (Linux numbers) | CachyOS, driver 620.70.06 (CUDA 13.5), Ryzen 9 5900XT, 39 GB, Rust 1.99.1, Python 3.12.16, torch 2.15.0+cu132, onnxruntime-gpu 1.31.1 |
 | W1 | this Windows handheld (Windows numbers) | Ryzen Z1 Extreme, 8 cores / 16 threads, Radeon integrated graphics, 23.2 GB, Windows 11 Pro 26200, Rust 1.100.0 (MSVC), no CUDA |
+| W2 | the RTX 4060 Ti box's Windows install (the 2026-11-15 numbers) | Windows 11 Home 10.0.26300, driver 621.01, Ryzen 9 5900XT, 16 cores / 32 threads, 39.9 GB, RTX 4060 Ti 8 GB, Rust 1.99.1 (MSVC), Python 3.12.14, torch 2.15.0+cu132 (CUDA 13.2), onnxruntime 1.32.0 |
 
 ## Preprocessing port (Rust vs scipy)
 
@@ -296,7 +297,9 @@ fixes and the one added below.
 
 Windows is a renderer on this machine, not a player: 152 s of wall clock for one
 5.12 s window, load included, is far outside the 1.5 RTF gate and that is the CPU
-path the README already describes. DirectML through ONNX Runtime was the candidate for a
+path the README already describes. It became a player on W2 once torch came from the
+CUDA index; the [2026-11-15 section](#windows-cuda-and-the-4060-ti-as-a-player-2026-11-15)
+has that run. DirectML through ONNX Runtime was the candidate for a
 Windows accelerator; it cannot load this graph, and the reason is below. Setup is
 smaller than on the other platforms
 (4.2 GiB vs the 5.9 GB the screen prints) because PyPI's Windows torch is CPU-only,
@@ -366,6 +369,11 @@ The catch is throughput, and on Windows it is the same catch as on macOS:
 |---|---|---|---|
 | PyTorch 2.15, CPU, resident worker | 12.5 s | 39.40 | **7.70** |
 | ONNX Runtime 1.31.1, CPU EP | 5.0 s | 169.14 | **33.0** |
+
+The first row is W1's CPU-only Windows result. On W2, once torch came from PyTorch's
+CUDA index, the same model ran on the 4060 Ti at RTF 0.66; see
+[Windows: CUDA](#windows-cuda-and-the-4060-ti-as-a-player-2026-11-15) below. Everything
+in this ONNX section was measured on W1 and is unchanged.
 
 ONNX Runtime's CPU EP is 4.3x slower than torch's CPU path on this machine, against
 3.5x on the M5 Max, so on a CPU-only Windows box the smaller download buys a much worse
@@ -489,3 +497,62 @@ RTF used below is the CLI's placeholder, not a measurement.
 | 5.12 s track | 0.3 (CLI default until the probe exists) | 5.1 s of audio | 1.5 s |
 
 `--rtf` defaults to 0.3 and says so in `flacify probe --help`.
+
+## Windows: CUDA, and the 4060 Ti as a player (2026-11-15)
+
+W1 is CPU-only, so Windows had only ever been a renderer there. W2 is the same 4060 Ti
+box M2 runs Linux on, booted into Windows, and the first Windows run that uses the GPU.
+The change is one environment variable: `FLACIFY_TORCH_INDEX` pointed at PyTorch's
+`cu132` index, one of the two that publish the installed torch (2.15.0, the other being
+`cu134`; checked 2026-11-15) and the one that matches M2's Linux install. Nothing in the
+code is platform-conditional; the flag is the same one the docs already documented.
+
+| metric | value | source |
+|---|---|---|
+| CUDA torch, download and install | 2.0 GiB download, 13 min 24 s to download and prepare, 6.3 s to install, `torch 2.15.0+cpu` → `2.15.0+cu132` | W2, 2026-11-15, `uv pip install --upgrade torch --index-url .../cu132` |
+| device after the reinstall | `cuda` available, `NVIDIA GeForce RTX 4060 Ti`, capability `(8, 9)`, CUDA runtime 13.2 | W2, 2026-11-15, `torch.cuda.get_device_capability` |
+| model load | **21.88 s** (`device=cuda torch=2.15.0+cu132 load_secs=21.88`) | W2, 2026-11-15, `RUST_LOG=info flacify enhance` |
+| whole install on disk | **6.90 GiB**: models 3.09, venv 3.45, runtime 0.11, cache 0.25 | W2, 2026-11-15, `Get-ChildItem -Recurse \| Measure-Object` |
+| `torch/lib` alone | 2.79 GiB of the venv's 3.45 | W2, 2026-11-15, same |
+| 60.06 s clip, cold | **61.3 s wall** for the whole `enhance`, RTF **0.66** once the load is subtracted (≈39.4 s of render) | W2, 2026-11-15, `Measure-Command flacify enhance` |
+| 5.0 s clip, cold (one window) | 31.5 s wall: 21.88 s load plus 9.6 s for the first window, which pays CUDA's kernel setup — the 60 s row is the throughput number | W2, 2026-11-15, `flacify enhance` |
+| same box, CPU-only torch, 5.12 s clip | 124.5 s wall, `model on cpu` | W2, 2026-11-15, before the CUDA reinstall |
+| `play --smoke`, 45 s clip, uncached | first audio **25.27 s**, `generated 8.0 s ready of 45.0 s`, `live` and `promoted` at **25.4 s**, `switch generated`, device 48000 Hz × 2 ch | W2, 2026-11-15 |
+
+RTF 0.66 is the number that matters: below 1.0, so the frontier gains on the playhead and
+the A/B switch unlocks by itself. Arithmetic on the measured rate puts the 619.13 s MP3
+this run started from at ≈6.8 min of render after the load. On the CPU path that file had
+not produced its first generated second before the playhead passed it, which is why the
+window showed no generated curve at all.
+
+### The high band, with the same weights (CPU inference)
+
+A 5.0 s clip cut from the same 12 kHz-cut MP3, both sides normalised to the same RMS so
+the bands compare, one FFT with a Hann window per side. Measured while the box was still
+on CPU torch, before the reinstall; the weights and the pipeline are the same, and the
+point of the row is the spectral shape, not the speed.
+
+| band | source | generated | delta |
+|---|---|---|---|
+| 100–1000 Hz | 61.0 dB | 61.0 dB | −0.0 |
+| 1000–8000 Hz | 43.1 dB | 43.4 dB | +0.3 |
+| 8000–14000 Hz | 21.7 dB | 27.9 dB | +6.2 |
+| 14000–18000 Hz | 7.4 dB | 18.7 dB | **+11.4** |
+| 18000–22000 Hz | −38.2 dB | 14.7 dB | **+52.9** |
+
+### Two setup bugs this run found
+
+Both are fixed in `crates/app/src/setup.rs`; the numbers are here because they are the
+evidence for the fix.
+
+1. **The index was a no-op on an existing install.** `uv pip install torch` with no
+   version spec keeps what is there. Run against the already-installed CPU wheel with
+   the `cu132` index, uv answered **"Would make no changes"** (exit 1) — the venv stayed
+   on `2.15.0+cpu` while `setup` printed `wheels: done`. The index now comes with
+   `--upgrade`; without the index the command is unchanged.
+2. **Setting the index made a good install look missing.** `is_ready` compared the
+   wheels receipt against the *current* environment, so launching `flacify play` without
+   `FLACIFY_TORCH_INDEX` exported again printed *"the model is not installed yet"* on a
+   working venv. Readiness now ignores the receipt's one environment-dependent line
+   (`torch-index …`); `ensure` still compares the whole manifest, so changing the index
+   re-runs the step.

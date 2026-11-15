@@ -3,28 +3,34 @@
 A desktop player that reconstructs the high frequencies an MP3 threw away, and lets
 you hear the difference on a single keystroke.
 
-Status: **prototype, playable on macOS and Linux.** `flacify setup` installs the Python sidecar and
-the model, `flacify enhance` renders a file, and `flacify play` opens a window with an
-instant A/B switch. The Rust side owns decode, analysis, the windowing pipeline, the seed
-schedule and the mixer; the model runs in a Python process the app installs and owns
-(ADR-010), because ONNX Runtime measured 30 to 60x slower than PyTorch on the same Apple
-Silicon (ADR-002). The working reference implementation is the Python PoC,
+Status: **prototype, playable on macOS, Linux and Windows.** `flacify setup` installs the
+Python sidecar and the model, `flacify enhance` renders a file, and `flacify play` opens a
+window with an instant A/B switch. The Rust side owns decode, analysis, the windowing
+pipeline, the seed schedule and the mixer; the model runs in a Python process the app
+installs and owns (ADR-010), because ONNX Runtime measured 30 to 60x slower than PyTorch on
+the same Apple Silicon (ADR-002). The working reference implementation is the Python PoC,
 [`gabriel-rivero/flashsr-stream`](https://github.com/gabriel-rivero/flashsr-stream).
 
-Next up (v0.2) is the player itself: sound in under two seconds instead of after a full
-render, and a window worth looking at. Today `play` renders the whole track first, which is
-the one thing about this prototype that does not feel like a player.
+`play` no longer waits for a whole render: it starts the original as soon as the device
+opens and fills a frontier behind it, 0.17 s from cache and 12.6 s cold on the M5 Max
+(model load plus the first window), then hands the A/B switch over once the frontier is
+ahead. What v0.2 still owes is the wait feeling short — a resident worker — and the rest
+of the window. The numbers are in
+[`docs/measurements.md`](docs/measurements.md#progressive-playback-2026-11-13).
 
 Runs end to end on macOS (verified: Metal, 48 kHz out, A/B enabled), on Linux
-(verified: CUDA on an RTX 4060 Ti, a 44.1 kHz device resampled to 48 kHz, A/B
-enabled) and on Windows (verified: 48 kHz out, A/B enabled, CPU inference). Windows
-on that machine is a renderer rather than a player: the render alone measures RTF 7.7,
-and a whole `play --smoke` run for a 5.12 s clip takes 152 s wall clock because the
-model load dominates at that length. The
-accelerator is `cuda` if present, `mps` on Apple Silicon, otherwise `cpu`, which is a
-renderer rather than a player (RTF 6–10). On Linux the same graph through ONNX
-Runtime's CUDA EP reaches RTF 0.545 and would cut the first-run download roughly in
-half, but the sidecar still runs torch; the numbers are in
+(verified: CUDA on an RTX 4060 Ti, a 44.1 kHz device resampled to 48 kHz, A/B enabled) and
+on Windows (verified: CUDA on the same RTX 4060 Ti under Windows 11, 48 kHz out, A/B
+enabled, RTF 0.66). That makes Windows a player on that box, not just a renderer: a 45 s
+track that had never been rendered reported the switch offered and promoted at 25.4 s, the
+first 22 s of which is the model load. A CPU-only Windows machine is still a renderer — the
+handheld in the measurements ran the render at RTF 7.7 — and the accelerator is `cuda` if
+present, `mps` on Apple Silicon, otherwise `cpu`, which is a renderer rather than a player
+(RTF 6–10). The CUDA wheel is opt-in (`FLACIFY_TORCH_INDEX`, see
+[`docs/dependencies.md`](docs/dependencies.md)); PyPI's torch is CPU-only on Windows and
+Linux. On Linux the same graph through ONNX Runtime's CUDA EP reaches RTF 0.545 and would
+cut the first-run download roughly in half, but the sidecar still runs torch; the numbers
+are in
 [`docs/measurements.md`](docs/measurements.md#linux-the-download-and-whether-onnx-runtime-can-shrink-it-2026-11-12).
 See the platform gap in [`docs/roadmap.md`](docs/roadmap.md).
 
@@ -41,8 +47,10 @@ cargo build --release
 
 Measured on an M5 Max: a 30.7 s clip renders in 34.1 s (including the 8 s worker start)
 and plays back at 48 kHz with the switch enabled. The generated band gains +24.6 dB at
-16–18 kHz and +61.6 dB at 18–22 kHz over the input; the level moves +0.57 dB, which is
-one of the open gaps in [`docs/roadmap.md`](docs/roadmap.md#gaps-found-building-the-prototype-2026-11-12).
+16–18 kHz and +61.6 dB at 18–22 kHz over the input. That measurement predates loudness
+matching, which now holds the two sides within 0.1 dB so the toggle changes brightness,
+not level (see
+[`docs/measurements.md`](docs/measurements.md#loudness-matching-2026-11-13)).
 
 ## The one-paragraph pitch
 
@@ -75,12 +83,13 @@ See [`docs/vision.md`](docs/vision.md).
 ## Start here
 
 ```sh
-cargo test --workspace   # 92 tests, no GPU, no audio device, no model, no Python
+cargo test --workspace   # 134 tests, no GPU, no audio device, no model, no Python
 ```
 
 `core` and `infer` are testable without a model, which is what makes the DSP and the
 mixer developable on any laptop. The Python sidecar is the one seam that needs the
-6 GB install, and even it is tested against a fake worker binary in CI.
+6 GB install (6.9 GiB with the CUDA wheels), and even it is tested against a fake worker
+binary in CI.
 
 `docs/decisions.md` records the accepted ADRs and, for ADR-002, the measurement that
 reopened it.

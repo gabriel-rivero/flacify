@@ -102,6 +102,28 @@ const PYTHON_WHEELS: &[&str] = &[
     "einops",
 ];
 
+/// The receipt line that records which index torch came from: the only line in it that
+/// depends on the environment rather than on the wheels.
+const TORCH_INDEX_LINE: &str = "torch-index ";
+
+/// Whether the receipt lists every wheel, whatever torch's source was.
+fn wheels_installed(runner: &dyn Runner, paths: &Paths) -> bool {
+    let Some(receipt) = runner.read(&paths.wheels_receipt()) else {
+        return false;
+    };
+    receipt_wheels(&String::from_utf8_lossy(&receipt)) == PYTHON_WHEELS
+}
+
+/// The wheel lines of a receipt, without the index line.
+///
+/// Because of that line, a venv installed from PyTorch's CUDA index lists the same wheels
+/// as one installed from PyPI — which is what lets `is_ready` ignore the opt-in.
+fn receipt_wheels(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|line| !line.starts_with(TORCH_INDEX_LINE))
+        .collect()
+}
+
 /// Where the torch wheel comes from.
 ///
 /// PyPI's torch is CPU-only on Windows and Linux; a CUDA build lives on PyTorch's own
@@ -213,7 +235,7 @@ impl Paths {
         let uv = uv_on_disk(self);
         plan().iter().all(|step| {
             state.is_done(step.id)
-                && step_outputs_exist(step.id, self, &SystemRunner, uv.as_deref())
+                && step_outputs_exist(step.id, self, &SystemRunner, uv.as_deref(), false)
         })
     }
 
@@ -407,7 +429,8 @@ pub fn ensure_with(paths: &Paths, runner: &dyn Runner, progress: Progress) -> Re
     let mut uv = uv_program(paths, runner);
 
     for step in plan() {
-        if state.is_done(step.id) && step_outputs_exist(step.id, paths, runner, uv.as_deref()) {
+        if state.is_done(step.id) && step_outputs_exist(step.id, paths, runner, uv.as_deref(), true)
+        {
             continue;
         }
         progress.emit(step.id, 0.0);
@@ -515,14 +538,9 @@ fn install_wheels(paths: &Paths, runner: &dyn Runner, uv: &Option<PathBuf>) -> R
     let python = paths.venv_python().to_string_lossy().into_owned();
     let index = torch_index();
 
-    // torch goes first and alone, because --index-url applies to the whole command and
-    // PyTorch's index does not carry the rest of these wheels.
-    let mut torch_args: Vec<&str> = vec!["pip", "install", "--python", python.as_str(), "torch"];
-    if let Some(url) = index.as_deref() {
-        torch_args.push("--index-url");
-        torch_args.push(url);
-    }
-    runner.run(uv, &torch_args)?;
+    let torch_args = torch_install_args(&python, index.as_deref());
+    let borrowed: Vec<&str> = torch_args.iter().map(String::as_str).collect();
+    runner.run(uv, &borrowed)?;
 
     let mut args: Vec<&str> = vec!["pip", "install", "--python", python.as_str()];
     args.extend(
@@ -534,6 +552,30 @@ fn install_wheels(paths: &Paths, runner: &dyn Runner, uv: &Option<PathBuf>) -> R
     runner.run(uv, &args)?;
 
     runner.write(&paths.wheels_receipt(), wheels_manifest().as_bytes())
+}
+
+/// The torch install command, split out so the upgrade pairing can be tested without a
+/// venv, a network or the environment.
+///
+/// `uv pip install torch` with no version spec keeps whatever torch is already installed,
+/// so on a machine that ran the CPU install first the index alone changes nothing (found
+/// on 2026-11-15: `--index-url` reported "Would make no changes" and the venv stayed on
+/// the CPU wheel). Opting in is a change of wheel, so it has to ask for an upgrade; the
+/// unpinned case stays put, which is what keeps a re-run reproducible.
+fn torch_install_args(python: &str, index: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = ["pip", "install", "--python", python]
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+    if index.is_some() {
+        args.push("--upgrade".to_string());
+    }
+    args.push("torch".to_string());
+    if let Some(url) = index {
+        args.push("--index-url".to_string());
+        args.push(url.to_string());
+    }
+    args
 }
 
 /// Unpack the inference source tree. See `FLASHSR_SCRIPT` for why this is a download
@@ -697,13 +739,31 @@ fn uv_triple() -> Option<&'static str> {
     }
 }
 
-fn step_outputs_exist(id: &str, paths: &Paths, runner: &dyn Runner, uv: Option<&Path>) -> bool {
+/// Whether a step's outputs are still on disk.
+///
+/// `as_installed` says whether the receipt must match today's environment as well as the
+/// files being present. `ensure` wants that, because changing the torch index has to
+/// re-run the step; [`Paths::is_ready`] does not, because the receipt records what was
+/// installed, and otherwise the app would refuse to play a working install just because
+/// `FLACIFY_TORCH_INDEX` was not exported again at launch.
+fn step_outputs_exist(
+    id: &str,
+    paths: &Paths,
+    runner: &dyn Runner,
+    uv: Option<&Path>,
+    as_installed: bool,
+) -> bool {
     match id {
         STEP_UV => uv.is_some(),
         STEP_PYTHON => runner.size(&paths.python_receipt()).is_some(),
         STEP_VENV => runner.size(&paths.venv_python()).is_some(),
         STEP_WHEELS => {
-            runner.read(&paths.wheels_receipt()).as_deref() == Some(wheels_manifest().as_bytes())
+            if as_installed {
+                runner.read(&paths.wheels_receipt()).as_deref()
+                    == Some(wheels_manifest().as_bytes())
+            } else {
+                wheels_installed(runner, paths)
+            }
         }
         STEP_FLASHSR => runner.size(&paths.flashsr_sources()).is_some(),
         STEP_WORKER => {
@@ -857,4 +917,58 @@ fn platform_data_dir() -> Result<PathBuf> {
 fn home_dir() -> Result<PathBuf> {
     let home = env::var_os("HOME").context("HOME is not set; set FLACIFY_HOME")?;
     Ok(PathBuf::from(home))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{receipt_wheels, torch_install_args, wheels_manifest, PYTHON_WHEELS};
+
+    #[test]
+    fn given_a_receipt_from_another_index_when_read_then_the_same_wheels_are_listed() {
+        let receipt = wheels_manifest();
+        assert!(receipt.starts_with("torch-index "), "{receipt}");
+        assert_eq!(receipt_wheels(&receipt), PYTHON_WHEELS);
+    }
+
+    #[test]
+    fn given_a_receipt_without_the_index_line_when_read_then_the_wheels_still_match() {
+        let receipt = format!("{}\n", PYTHON_WHEELS.join("\n"));
+        assert_eq!(receipt_wheels(&receipt), PYTHON_WHEELS);
+    }
+
+    #[test]
+    fn given_a_receipt_missing_a_wheel_when_read_then_the_list_is_short() {
+        let receipt = format!("torch-index \n{}\n", PYTHON_WHEELS[..3].join("\n"));
+        assert_ne!(receipt_wheels(&receipt), PYTHON_WHEELS);
+    }
+
+    #[test]
+    fn given_no_torch_index_when_the_torch_command_is_built_then_it_does_not_upgrade() {
+        let args = torch_install_args("/venv/python", None);
+        assert_eq!(
+            args,
+            vec!["pip", "install", "--python", "/venv/python", "torch"]
+        );
+    }
+
+    #[test]
+    fn given_a_torch_index_when_the_torch_command_is_built_then_it_upgrades_from_that_index() {
+        let args = torch_install_args(
+            "/venv/python",
+            Some("https://download.pytorch.org/whl/cu132"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "pip",
+                "install",
+                "--python",
+                "/venv/python",
+                "--upgrade",
+                "torch",
+                "--index-url",
+                "https://download.pytorch.org/whl/cu132",
+            ]
+        );
+    }
 }

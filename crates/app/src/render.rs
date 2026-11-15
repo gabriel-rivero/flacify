@@ -197,7 +197,17 @@ pub fn enhance_streaming(
     mut on_audio: impl FnMut(&[f32]) -> Result<()>,
 ) -> Result<Streamed> {
     let model = PythonWorker::spawn(worker).context("starting the model worker")?;
-    let device = model.hello().device.clone();
+    let hello = model.hello();
+    // The worker's own "ready on cuda" line goes to its stderr, which is captured and
+    // only surfaced when an inference call fails; say it out loud here instead, where
+    // RUST_LOG can reach it.
+    tracing::info!(
+        device = %hello.device,
+        torch = %hello.torch,
+        load_secs = hello.load_secs,
+        "model ready"
+    );
+    let device = hello.device.clone();
     let engine = Engine::new(model, 2, WINDOW, cutoff_hz)?;
     let mut pipeline = Pipeline::new(engine, 2, WINDOW, OVERLAP, seed)?;
 

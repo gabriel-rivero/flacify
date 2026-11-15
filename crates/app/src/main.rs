@@ -13,6 +13,7 @@ mod limit;
 mod loudness;
 mod player;
 mod render;
+mod render_status;
 mod setup;
 mod spectrum;
 mod splice;
@@ -29,6 +30,7 @@ use flacify_core::{plan, Probe, SAMPLE_RATE};
 use flacify_infer::python::WorkerConfig;
 
 use crate::frontier::Frontier;
+use crate::render_status::RenderStatus;
 
 #[derive(Parser)]
 #[command(
@@ -272,7 +274,7 @@ fn play(file: &Path, smoke: bool, splice: bool) -> Result<()> {
             from_cache: false,
             gain_db: 0.0,
         };
-        finish(engine, None, info, smoke, started)
+        finish(engine, None, None, info, smoke, started)
     } else {
         let key = cache::key(
             &render::sample_hash(&track),
@@ -299,7 +301,7 @@ fn play(file: &Path, smoke: bool, splice: bool) -> Result<()> {
                     from_cache: true,
                     gain_db: cached.meta.gain_db,
                 };
-                finish(engine, None, info, smoke, started)
+                finish(engine, None, None, info, smoke, started)
             }
             None if !device::progressive_supported() => {
                 eprintln!(
@@ -333,16 +335,18 @@ fn play(file: &Path, smoke: bool, splice: bool) -> Result<()> {
                     info_base.3,
                     started.elapsed().as_secs_f64()
                 );
-                finish(engine, None, info, smoke, started)
+                finish(engine, None, None, info, smoke, started)
             }
             None => {
                 let frontier = Frontier::new(track.frames);
+                let status = RenderStatus::new();
                 let cutoff = analysis.cutoff_hz;
                 let seed = render::seed_for(&track);
                 {
                     let frontier = Arc::clone(&frontier);
                     let cache = Arc::clone(&cache);
                     let config = config.clone();
+                    let status = Arc::clone(&status);
                     std::thread::spawn(move || {
                         let result = render::render_into_frontier(
                             &track,
@@ -355,11 +359,16 @@ fn play(file: &Path, smoke: bool, splice: bool) -> Result<()> {
                         );
                         match result {
                             Ok(render) => {
+                                status.finish();
                                 if let Err(error) = cache.store(&key, &render, cutoff) {
                                     tracing::warn!(%error, "could not cache the render");
                                 }
                             }
-                            Err(error) => tracing::error!(%error, "rendering failed"),
+                            Err(error) => {
+                                // The window shows this too; tracing is for the terminal.
+                                tracing::error!(%error, "rendering failed");
+                                status.fail(format!("{error:#}"));
+                            }
                         }
                     });
                 }
@@ -375,7 +384,7 @@ fn play(file: &Path, smoke: bool, splice: bool) -> Result<()> {
                     from_cache: false,
                     gain_db: 0.0,
                 };
-                finish(engine, Some(frontier), info, smoke, started)
+                finish(engine, Some(frontier), Some(status), info, smoke, started)
             }
         }
     }
@@ -390,6 +399,7 @@ fn play(file: &Path, smoke: bool, splice: bool) -> Result<()> {
 fn finish(
     engine: device::AudioEngine,
     frontier: Option<Arc<Frontier>>,
+    status: Option<Arc<RenderStatus>>,
     info: ui::TrackInfo,
     smoke: bool,
     started: Instant,
@@ -397,7 +407,7 @@ fn finish(
     let rate = engine.device_rate as usize;
 
     if !smoke {
-        return ui::run(ui::PlayerApp::new(engine, frontier, info))
+        return ui::run(ui::PlayerApp::new(engine, frontier, status, info))
             .map_err(|error| anyhow::anyhow!("{error}"));
     }
 
@@ -464,6 +474,9 @@ fn finish(
         peak_ready as f64 / f64::from(engine.device_rate),
         info.audio_secs
     );
+    if let Some(failure) = status.as_ref().and_then(|status| status.failure()) {
+        println!("render    failed: {failure}");
+    }
     match live {
         Some(at) => println!("live      toggle offered at {at:.1} s"),
         None => println!("live      frontier never got a second ahead"),

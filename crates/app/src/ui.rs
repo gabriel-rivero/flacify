@@ -12,6 +12,7 @@ use eframe::egui;
 
 use crate::device::AudioEngine;
 use crate::frontier::Frontier;
+use crate::render_status::RenderStatus;
 use crate::spectrum;
 
 /// What the window needs to know about the track, none of it expensive.
@@ -31,6 +32,8 @@ pub struct TrackInfo {
 pub struct PlayerApp {
     engine: AudioEngine,
     frontier: Option<Arc<Frontier>>,
+    /// Present only when this window is watching a background render.
+    status: Option<Arc<RenderStatus>>,
     info: TrackInfo,
     error: Option<String>,
     promote_margin: usize,
@@ -42,7 +45,12 @@ pub struct PlayerApp {
 }
 
 impl PlayerApp {
-    pub fn new(engine: AudioEngine, frontier: Option<Arc<Frontier>>, info: TrackInfo) -> Self {
+    pub fn new(
+        engine: AudioEngine,
+        frontier: Option<Arc<Frontier>>,
+        status: Option<Arc<RenderStatus>>,
+        info: TrackInfo,
+    ) -> Self {
         // One second of slack before the switch is offered, so a toggle cannot land on
         // the edge of what exists and fall back mid-ramp.
         let promote_margin = engine.device_rate as usize;
@@ -50,6 +58,7 @@ impl PlayerApp {
         Self {
             engine,
             frontier,
+            status,
             info,
             error: None,
             promote_margin,
@@ -181,6 +190,9 @@ impl PlayerApp {
             );
         }
 
+        ui.add_space(8.0);
+        self.draw_render_status(ui, prepared_frames);
+
         ui.add_space(10.0);
         let source = if self.info.from_cache {
             "cached"
@@ -226,6 +238,51 @@ impl PlayerApp {
         if let Some(error) = &self.error {
             ui.add_space(8.0);
             ui.colored_label(egui::Color32::from_rgb(220, 90, 90), error);
+        }
+    }
+
+    /// The two things the frontier cannot say on its own: that the render stopped, and
+    /// that it is not going to catch up. Both otherwise look the same from here — an
+    /// empty generated curve and a switch that never lights.
+    fn draw_render_status(&self, ui: &mut egui::Ui, prepared_frames: usize) {
+        let Some(status) = &self.status else {
+            return;
+        };
+        if let Some(failure) = status.failure() {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 90, 90),
+                format!("rendering failed: {failure}"),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "the original plays on; the A/B switch needs generated audio, so it \
+                     stays locked",
+                )
+                .weak()
+                .size(11.0),
+            );
+            return;
+        }
+        if status.is_done() {
+            return;
+        }
+        let rate = self.engine.device_rate as usize;
+        let position = self.engine.controls.position_frames();
+        // A second of slack: the frontier runs a window ahead by design, and a hair
+        // behind is not the news this line exists to deliver.
+        let behind = position
+            .saturating_sub(prepared_frames)
+            .saturating_sub(rate);
+        if behind > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "the renderer is {:.0} s behind the playhead · the A/B switch unlocks \
+                     once it catches up · this machine renders slower than realtime",
+                    behind as f64 / rate as f64
+                ))
+                .weak()
+                .size(11.0),
+            );
         }
     }
 }

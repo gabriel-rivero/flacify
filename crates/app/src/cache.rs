@@ -31,8 +31,12 @@ use serde::{Deserialize, Serialize};
 use crate::render::Render;
 
 /// Bump this when anything about the pipeline changes the samples: window, overlap,
-/// preprocessing, the seed schedule, the limiter.
-pub const CACHE_VERSION: &str = "flacify-cache-5";
+/// preprocessing, the seed schedule, the limiter, or the layout a render is stored in.
+///
+/// 6 (2026-11-16): v5 stored each render window's planar chunk back to back, so the file
+/// was block-major while the reader treated it as channel-major. A cache hit played the
+/// right channel from the middle of the track. Every v5 entry has to be re-rendered.
+pub const CACHE_VERSION: &str = "flacify-cache-6";
 
 /// 24-bit has about 144 dB of headroom, well under the float noise floor of the model.
 

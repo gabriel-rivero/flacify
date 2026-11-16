@@ -53,17 +53,32 @@ pub struct PlayerApp {
     opened_at: std::time::Instant,
     /// The window title names the file; set once per load, not every frame.
     title_dirty: bool,
+    /// Per-bar RMS of the original, normalized, computed once per file.
+    waveform: Vec<f32>,
+    /// Device frames each waveform bar covers: at least one second, never more bars than
+    /// pixels.
+    waveform_bar_frames: usize,
 }
+
+/// No more waveform bars than this; a pixel is narrower than a bar worth drawing.
+const WAVEFORM_MAX_BARS: usize = 512;
 
 impl PlayerApp {
     pub fn new(session: Session, playback: Playback) -> Self {
+        let engine = playback.engine;
+        let (waveform, waveform_bar_frames) = waveform_bars(
+            &engine.display_original,
+            engine.device_channels,
+            engine.device_rate,
+            WAVEFORM_MAX_BARS,
+        );
         // One second of slack before the switch is offered, so a toggle cannot land on
         // the edge of what exists and fall back mid-ramp.
-        let promote_margin = playback.engine.device_rate as usize;
-        let prebuffer_frames = (playback.engine.device_rate as usize).saturating_mul(2);
+        let promote_margin = engine.device_rate as usize;
+        let prebuffer_frames = (engine.device_rate as usize).saturating_mul(2);
         Self {
             session,
-            engine: playback.engine,
+            engine,
             frontier: playback.frontier,
             status: playback.status,
             info: playback.info,
@@ -75,6 +90,8 @@ impl PlayerApp {
             started: false,
             opened_at: std::time::Instant::now(),
             title_dirty: true,
+            waveform,
+            waveform_bar_frames,
         }
     }
 
@@ -101,6 +118,14 @@ impl PlayerApp {
         self.path = playback.path;
         self.promote_margin = self.engine.device_rate as usize;
         self.prebuffer_frames = (self.engine.device_rate as usize).saturating_mul(2);
+        let (waveform, bar_frames) = waveform_bars(
+            &self.engine.display_original,
+            self.engine.device_channels,
+            self.engine.device_rate,
+            WAVEFORM_MAX_BARS,
+        );
+        self.waveform = waveform;
+        self.waveform_bar_frames = bar_frames;
         self.started = false;
         self.opened_at = std::time::Instant::now();
         self.title_dirty = true;
@@ -163,6 +188,9 @@ impl PlayerApp {
         self.draw_spectrum(ui);
 
         ui.add_space(6.0);
+        self.draw_waveform(ui);
+
+        ui.add_space(6.0);
         ui.label(
             egui::RichText::new(
                 "space toggles   ·   p plays   ·   ←/→ seek 5 s   ·   drop a file   ·   esc quits",
@@ -171,36 +199,23 @@ impl PlayerApp {
             .size(11.0),
         );
 
-        ui.add_space(16.0);
-        let mut scrub = position;
-        if ui
-            .add(
-                egui::Slider::new(&mut scrub, 0.0..=duration)
-                    .show_value(false)
-                    .trailing_fill(true),
-            )
-            .changed()
-        {
-            controls.seek_secs(scrub, rate);
-        }
-        ui.label(
-            egui::RichText::new(format!(
-                "{:02}:{:02} / {:02}:{:02}",
-                position as u64 / 60,
-                position as u64 % 60,
-                duration as u64 / 60,
-                duration as u64 % 60
-            ))
-            .weak()
-            .size(11.0),
-        );
-
-        ui.add_space(12.0);
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
             let playing = controls.is_playing();
             if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
                 controls.set_playing(!playing);
             }
+            ui.label(
+                egui::RichText::new(format!(
+                    "{:02}:{:02} / {:02}:{:02}",
+                    position as u64 / 60,
+                    position as u64 % 60,
+                    duration as u64 / 60,
+                    duration as u64 % 60
+                ))
+                .weak()
+                .size(11.0),
+            );
             let prepared_secs = prepared_frames as f64 / f64::from(rate);
             ui.label(
                 egui::RichText::new(if prepared_frames >= controls.frames {
@@ -345,6 +360,80 @@ impl PlayerApp {
 }
 
 impl PlayerApp {
+    /// The whole track as per-bar RMS, with the render frontier marked: bars the renderer
+    /// has reached are bright, the rest are dim. Click or drag anywhere to seek; this is
+    /// the transport, not a picture.
+    fn draw_waveform(&self, ui: &mut egui::Ui) {
+        let height = 64.0;
+        let (response, painter) = ui.allocate_painter(
+            egui::vec2(ui.available_width(), height),
+            egui::Sense::click_and_drag(),
+        );
+        let rect = response.rect;
+        painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(17, 19, 23));
+
+        let controls = &self.engine.controls;
+        let frames = controls.frames.max(1);
+        let prepared = self.ready_frames().min(frames);
+        let position = controls.position_frames().min(frames);
+        let bars = self.waveform.len();
+        if bars > 0 {
+            let width = rect.width().max(1.0);
+            let bar_width = width / bars as f32;
+            let mid = rect.center().y;
+            let half = (rect.height() * 0.5 - 4.0).max(1.0);
+            let accent = egui::Color32::from_rgb(64, 200, 180);
+            let dim = egui::Color32::from_rgb(64, 70, 78);
+            for (index, rms) in self.waveform.iter().enumerate() {
+                // A full-band source has nothing to generate, so there is no frontier to
+                // mark and one colour is the honest picture.
+                let colour =
+                    if !controls.has_enhanced || index * self.waveform_bar_frames < prepared {
+                        accent
+                    } else {
+                        dim
+                    };
+                // sqrt so quiet passages stay legible without flattening the peaks.
+                let reach = (rms.sqrt() * half).max(0.5);
+                let x = rect.left() + bar_width * index as f32;
+                let w = (bar_width - 1.0).max(1.0);
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x, mid - reach),
+                        egui::pos2(x + w, mid + reach),
+                    ),
+                    0.0,
+                    colour,
+                );
+            }
+        }
+
+        let x_of = |frame: usize| {
+            rect.left() + rect.width() * (frame as f32 / frames as f32).clamp(0.0, 1.0)
+        };
+        if self.frontier.is_some() && prepared < frames {
+            let x = x_of(prepared);
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(64, 200, 180)),
+            );
+        }
+        let x = x_of(position);
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(230, 232, 236)),
+        );
+
+        if response.clicked() || response.dragged() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let rate = self.engine.device_rate.max(1);
+                let fraction = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                let seconds = f64::from(fraction) * frames as f64 / f64::from(rate);
+                controls.seek_secs(seconds, rate);
+            }
+        }
+    }
+
     /// The two spectra at the playhead. This is the product's explanation: below the
     /// cutoff the curves sit on top of each other, above it they part company.
     fn draw_spectrum(&self, ui: &mut egui::Ui) {
@@ -487,6 +576,49 @@ fn frequency_at(fraction: f32, sample_rate: f32) -> f32 {
     low * (nyquist / low).powf(fraction.clamp(0.0, 1.0))
 }
 
+/// Per-bar RMS of an interleaved buffer, normalized to its loudest bar.
+///
+/// Bars are at least one second long, and there are never more bars than `max_bars`, so a
+/// very long track loses per-second detail rather than drawing sub-pixel bars. Returns the
+/// bars and the number of frames each one covers.
+fn waveform_bars(
+    interleaved: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    max_bars: usize,
+) -> (Vec<f32>, usize) {
+    let channels = channels.max(1);
+    let rate = sample_rate.max(1) as usize;
+    let frames = interleaved.len() / channels;
+    if frames == 0 || max_bars == 0 {
+        return (Vec::new(), rate);
+    }
+    let bar_frames = rate.max(frames.div_ceil(max_bars)).max(1);
+    let bars = frames.div_ceil(bar_frames);
+    let mut out = Vec::with_capacity(bars);
+    for bar in 0..bars {
+        let start = bar * bar_frames;
+        let end = ((bar + 1) * bar_frames).min(frames);
+        let mut sum = 0.0f64;
+        for frame in start..end {
+            let base = frame * channels;
+            for channel in 0..channels {
+                let sample = f64::from(interleaved[base + channel]);
+                sum += sample * sample;
+            }
+        }
+        let count = (end - start) * channels;
+        out.push((sum / count.max(1) as f64).sqrt() as f32);
+    }
+    let peak = out.iter().copied().fold(0.0f32, f32::max);
+    if peak > 1e-6 {
+        for value in &mut out {
+            *value = (*value / peak).clamp(0.0, 1.0);
+        }
+    }
+    (out, bar_frames)
+}
+
 /// `spectrum::WINDOW` frames of interleaved stereo around `centre`, if the frontier has
 /// rendered all of them.
 fn window_from_frontier(frontier: &Frontier, centre: usize) -> Option<Vec<f32>> {
@@ -575,10 +707,59 @@ impl Drop for PlayerApp {
 pub fn run(app: PlayerApp) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([560.0, 380.0])
+            .with_inner_size([560.0, 560.0])
             .with_resizable(false)
             .with_title("flacify"),
         ..Default::default()
     };
     eframe::run_native("flacify", options, Box::new(|_cc| Ok(Box::new(app))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_quiet_then_loud_audio_when_analysed_then_the_bars_follow_it() {
+        // Four seconds of stereo: -20 dBFS for two seconds, then -6 dBFS.
+        let mut buffer = Vec::with_capacity(48_000 * 4 * 2);
+        for frame in 0..48_000 * 4 {
+            let amplitude = if frame < 48_000 * 2 { 0.1 } else { 0.5 };
+            buffer.push(amplitude);
+            buffer.push(amplitude);
+        }
+        let (bars, bar_frames) = waveform_bars(&buffer, 2, 48_000, WAVEFORM_MAX_BARS);
+        assert_eq!(bar_frames, 48_000, "one bar per second");
+        assert_eq!(bars.len(), 4);
+        assert!((bars[0] - 0.2).abs() < 1e-3, "{}", bars[0]);
+        assert!((bars[3] - 1.0).abs() < 1e-3, "{}", bars[3]);
+        assert_eq!(bars[0], bars[1]);
+        assert_eq!(bars[2], bars[3]);
+    }
+
+    #[test]
+    fn given_more_seconds_than_bars_when_analysed_then_bars_do_not_exceed_the_cap() {
+        // Ten minutes of silence: 600 one-second bars is more than the width can show,
+        // so each bar has to cover several seconds instead of overlapping its neighbour.
+        let frames = 600 * 48_000;
+        let buffer = vec![0.0f32; frames * 2];
+        let (bars, bar_frames) = waveform_bars(&buffer, 2, 48_000, 100);
+        assert_eq!(bars.len(), 100);
+        assert!(bar_frames >= 6 * 48_000, "{bar_frames}");
+    }
+
+    #[test]
+    fn given_silence_when_analysed_then_the_peak_is_not_amplified_into_noise() {
+        let buffer = vec![0.0f32; 48_000 * 2];
+        let (bars, _) = waveform_bars(&buffer, 2, 48_000, WAVEFORM_MAX_BARS);
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0], 0.0);
+    }
+
+    #[test]
+    fn given_no_frames_when_analysed_then_there_are_no_bars() {
+        let (bars, bar_frames) = waveform_bars(&[], 2, 44_100, WAVEFORM_MAX_BARS);
+        assert!(bars.is_empty());
+        assert_eq!(bar_frames, 44_100);
+    }
 }

@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: draft, 2026-11-12. Estimates assume one developer at roughly 20 h/week, so
+Status: draft, 2026-11-16. Estimates assume one developer at roughly 20 h/week, so
 treat them as ±50% and as ordering, not commitments.
 
 ## The shape of it
@@ -106,9 +106,9 @@ the window (2026-11-15). The model worker is now process-scoped: it starts lazil
 first render that needs it — a cache hit or a full-band file never starts it — is reused
 for every later file in the window, and is killed when the window closes. No daemon, no
 idle 3 GB. The first uncached file in a run still pays the load; the second does not
-(ADR-013). **Still to do:** the waveform (E4-3).
+(ADR-013). The waveform landed on 2026-11-16; see the gaps at the end of this file.
 
-**The window.** The spectrum and the tags have landed; this is the rest of the target.
+**The window.** Everything in this list has landed.
 
 - Track title/artist from tags, with the file name as the fallback.
 - A real transport: play/pause, seek bar with elapsed/total, and a visible playhead.
@@ -116,6 +116,10 @@ idle 3 GB. The first uncached file in a run still pays the load; the second does
   honestly ("generated top band" / "original") and shows which is live.
 - A spectrum of both sides overlaid, with the cutoff and the generated band marked. This
   is the one picture that explains the product in a second.
+- A waveform of the whole track, with the render frontier marked and the unrendered part
+  dimmed. **Landed 2026-11-16:** per-second RMS bars in the accent colour where the
+  renderer has reached and grey beyond it, a frontier line, a playhead, and click or drag
+  anywhere to seek.
 - A status line that says what is happening: rendering (with the frontier), cached, the
   measured RTF, and the peak limiting it applied.
 - Drag a file onto the window; errors are states, never silent stops. **Landed
@@ -228,9 +232,10 @@ release where it should land.
    for later files, and dropped with the window. The second file therefore skips the load;
    how much that saves is **not measured yet** — 12.6 s includes the 8 s load, but the
    first window has not been timed alone on this machine.
-6. **No waveform.** The two spectra are there, at the playhead, with the cutoff and the
-   generated band marked (ADR-005). There is still no waveform, and the transport is text,
-   a button and a bar.
+6. ~~No waveform.~~ **Done (2026-11-16):** the whole track is drawn as per-second RMS
+   bars, bright where the renderer has reached and grey past the frontier, with a
+   frontier line and a playhead; click or drag anywhere in it to seek. It shows where the
+   generated audio exists, not what it sounds like — the gaps are at the end of this file.
 7. **No full-scale policy beyond the limiter.** The original is played as decoded, so a
    master that already peaks above 1.0 clips at the device exactly as it would in any
    player; the enhanced side is limited to 0.999 while the original is not, which can make
@@ -293,3 +298,54 @@ release where it should land.
 | render-ahead buffer | real-time low-latency mode |
 | GPU required for enhancement | CPU-only playback (passthrough works) |
 | local only | sync, cloud, accounts |
+
+## Gaps found building the waveform (2026-11-16)
+
+The waveform landed as per-second RMS bars with the render frontier marked, a playhead,
+and click-or-drag seek. It answers "does the generated audio exist here" and nothing more.
+What it does not do, in the order it would hurt:
+
+1. **It draws the original only.** The generated side has no shape on screen; the spectrum
+   is still the only place the enhanced band appears. For the A/B story an overlay — the
+   original as an outline, the generated as a fill, or two RMS curves — would show *what*
+   changed, not just where the renderer is.
+2. **The frontier moves in one-second steps.** It is `Frontier::ready_frames()`, published
+   a second at a time, so the line jumps. That is the playback granularity, not the
+   model's 5.12 s window, and the bar that contains the frontier is already bright.
+3. **Bars cap at 512.** A track much longer than ~8.5 minutes at 48 kHz trades per-second
+   detail for legible bars (the cap is one bar per pixel), so the architecture's
+   "per-second" is only true up to that length. Zoom or a min/max envelope would fix both
+   the cap and the loss of detail.
+4. **It is computed at device rate from the resampled buffer.** A 44.1 kHz output device
+   resamples before the mix, so the picture follows the device buffer, not the 48 kHz
+   source. The shape is right; the sample clock is the device's.
+5. **"Rendered" is one bit.** A cached track is all bright, a full-band source is all
+   accent with no frontier, and a partial cache (once the segmented cache lands) would
+   need its own state to say "rendered but not cached" or vice versa.
+6. **The window grew to 560×560 and is still not resizable.** That fits the added
+   waveform on this font; a larger text scale or a long status line can clip, and there
+   is no scroll.
+7. **Seeking is whole-track, not precise.** Barrier: the bar width is the finest gesture
+   (~0.2–13 s depending on length), the arrow keys still jump five seconds, and there is
+   no zoom or fine scrub.
+8. **No waveform for live or streaming sources.** The bars come from a buffer decoded into
+   memory; the v0.4 queue and the capture source have no equivalent yet.
+
+## Bug found testing a cached render (2026-11-16)
+
+A cache hit of a 619 s track played its **right channel from the wrong position**: the
+left was correct for the first 4.12 s (one render step), then both channels were a mesh of
+different blocks. The cause was not the model or the mixer. `enhance` and
+`render_into_frontier` appended each pipeline window's `[left, right]` chunk whole, so
+`Render.planar` was *block*-major, while `cache.store`, `wav::write` and
+`interleave_stereo` all read a track as *channel*-major. Cold playback hid it because the
+frontier interleaves one block at a time; only the cache and the `enhance` WAV exposed it.
+The bug predates the worker and waveform work (`3963196` and earlier).
+
+**Fixed:** a `ChannelMajor` collector joins the per-block chunks the way the pipeline's own
+tests do (`flatten` in `crates/core/tests/pipeline.rs`), with a test that fails on the old
+behaviour. **`CACHE_VERSION` is 6**; every v5 entry misses and is re-rendered once.
+
+**Left over:** the v5 entries are not deleted (eviction is E5-5), so a track that was cached
+before this fix keeps its scrambled copy on disk until eviction lands. The next play of the
+FFVII track has to render again, and the second-file time to first sound is still unmeasured.

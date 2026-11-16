@@ -59,7 +59,7 @@ doc line that would have been wrong. No issue closes on "works on my machine".
 |---|---|---|
 | E4-1 | `eframe` window, compact player chrome, always-on-top option | launches in < 1 s warm, < 3 s cold |
 | E4-2 | Spectrum view 20 Hz–24 kHz with the reconstructed band shaded | 30 fps, < 5% of a core |
-| E4-3 | Waveform with rendered frontier + unrendered dimming | frontier visible, matches the cache |
+| E4-3 | Waveform with rendered frontier + unrendered dimming | frontier visible, matches the cache — **done 2026-11-16**: per-second RMS bars, a frontier line, a playhead, and click/drag seek; the frontier is `Frontier::ready_frames()`, so it matches what has been published |
 | E4-4 | Transport, gain, A/B button + `A` key, hold-to-compare | toggle < 30 ms, no click |
 | E4-5 | First-run hardware probe → `profile.toml`, skipped on later runs | probe ≤ 40 s, re-probes on device change |
 | E4-6 | Drag and drop a file onto the window | plays, replaces current file cleanly — **done 2026-11-15**: the drop replaces the file in place, keeps the current track on a failed load, and reuses the resident worker |

@@ -176,6 +176,39 @@ pub struct Store<'a> {
     pub model_id: &'a str,
 }
 
+/// Collect the per-block `[left, right]` chunks the pipeline emits into one channel-major
+/// buffer of the shape `Track::planar` uses.
+///
+/// Each chunk is planar *within* a block, so appending them whole interleaves the channels
+/// every `step` samples. The cache, the WAV writer and `interleave_stereo` all expect the
+/// whole track channel-major; this is the one place that joins them.
+#[derive(Default)]
+struct ChannelMajor {
+    left: Vec<f32>,
+    right: Vec<f32>,
+}
+
+impl ChannelMajor {
+    fn with_capacity(frames: usize) -> Self {
+        Self {
+            left: Vec::with_capacity(frames),
+            right: Vec::with_capacity(frames),
+        }
+    }
+
+    fn push(&mut self, chunk: &[f32]) {
+        let frames = chunk.len() / 2;
+        self.left.extend_from_slice(&chunk[..frames]);
+        self.right.extend_from_slice(&chunk[frames..]);
+    }
+
+    fn finish(self) -> Vec<f32> {
+        let mut planar = self.left;
+        planar.extend_from_slice(&self.right);
+        planar
+    }
+}
+
 /// Render a whole track. `progress` is called with the number of input frames covered
 /// each time a chunk comes back from the model, so a UI can show real movement.
 pub fn enhance(
@@ -184,13 +217,13 @@ pub fn enhance(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize),
 ) -> Result<Render> {
-    let mut planar = Vec::with_capacity(track.frames * 2);
+    let mut buffer = ChannelMajor::with_capacity(track.frames);
     let streamed = enhance_streaming(track, job, cancel, progress, |chunk| {
-        planar.extend_from_slice(chunk);
+        buffer.push(chunk);
         Ok(())
     })?;
     Ok(Render {
-        planar,
+        planar: buffer.finish(),
         limit: streamed.limit,
         device: streamed.device,
         gain_db: streamed.gain_db,
@@ -360,12 +393,12 @@ pub fn render_into_frontier(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize),
 ) -> Result<Render> {
-    let mut planar = Vec::with_capacity(track.frames * 2);
+    let mut buffer = ChannelMajor::with_capacity(track.frames);
     let mut interleaved = Vec::with_capacity(crate::frontier::CHUNK_FRAMES * 2);
     let mut published = 0usize;
 
     let streamed = enhance_streaming(track, job, cancel, progress, |chunk| {
-        planar.extend_from_slice(chunk);
+        buffer.push(chunk);
         let frames = chunk.len() / 2;
         for frame in 0..frames {
             interleaved.push(chunk[frame]);
@@ -385,7 +418,7 @@ pub fn render_into_frontier(
         frontier.publish(published, interleaved);
     }
     Ok(Render {
-        planar,
+        planar: buffer.finish(),
         limit: streamed.limit,
         device: streamed.device,
         gain_db: streamed.gain_db,
@@ -538,5 +571,34 @@ mod tests {
     fn given_another_error_when_asked_then_it_is_not_a_cancellation() {
         let error = anyhow::anyhow!("the worker exited");
         assert!(!is_cancelled(&error));
+    }
+
+    #[test]
+    fn given_per_block_chunks_when_collected_then_each_channel_is_contiguous() {
+        // The pipeline emits `[left, right]` per block. Appending those whole would put
+        // the right channel's first block at sample `step`; the cache would then read the
+        // right channel from the middle of the track.
+        let mut collected = ChannelMajor::with_capacity(5);
+        collected.push(&[1.0, 2.0, 10.0, 20.0]);
+        collected.push(&[3.0, 4.0, 30.0, 40.0]);
+        collected.push(&[5.0, 50.0]);
+        assert_eq!(
+            collected.finish(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0]
+        );
+    }
+
+    #[test]
+    fn given_a_collected_channel_major_buffer_when_interleaved_then_the_first_frames_pair_up() {
+        // The cache-hit path is exactly this: collect channel-major, then interleave. Frame
+        // k must be (left[k], right[k]), not (left[k], right of some later block).
+        let mut collected = ChannelMajor::with_capacity(4);
+        collected.push(&[1.0, 2.0, 10.0, 20.0]);
+        collected.push(&[3.0, 4.0, 30.0, 40.0]);
+        let planar = collected.finish();
+        assert_eq!(
+            interleave_stereo(&planar, 4),
+            vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0]
+        );
     }
 }

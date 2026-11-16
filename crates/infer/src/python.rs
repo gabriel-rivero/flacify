@@ -49,6 +49,10 @@ const STOP_BUDGET: Duration = Duration::from_secs(5);
 /// How often the bounded waits poll the child.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// Samples the published checkpoint is late relative to its input. See
+/// [`Model::latency_samples`](crate::model::Model::latency_samples) for the measurement.
+pub const MODEL_LATENCY_SAMPLES: usize = 12;
+
 /// Where the interpreter, the worker script and the weights live.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -217,7 +221,7 @@ impl Model for PythonWorker {
     /// This is a 0.25 ms offset, well under anything audible in a switch, and it is not
     /// what made the low-band splice fail. Re-measure if the weights move.
     fn latency_samples(&self) -> usize {
-        12
+        MODEL_LATENCY_SAMPLES
     }
 
     fn name(&self) -> &str {

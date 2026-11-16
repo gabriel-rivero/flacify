@@ -5,6 +5,8 @@
 //! the file does not have — and once the frontier is comfortably ahead it flips itself,
 //! because the point of the product is hearing the difference, not finding the button.
 
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +15,7 @@ use eframe::egui;
 use crate::device::AudioEngine;
 use crate::frontier::Frontier;
 use crate::render_status::RenderStatus;
+use crate::session::{Playback, Session};
 use crate::spectrum;
 
 /// What the window needs to know about the track, none of it expensive.
@@ -30,11 +33,17 @@ pub struct TrackInfo {
 }
 
 pub struct PlayerApp {
+    /// One worker for the whole window, so a dropped file does not reload the model.
+    session: Session,
     engine: AudioEngine,
     frontier: Option<Arc<Frontier>>,
     /// Present only when this window is watching a background render.
     status: Option<Arc<RenderStatus>>,
     info: TrackInfo,
+    /// The file on screen, so an error names it and a reload knows what to ask for.
+    path: PathBuf,
+    /// Cancels this file's renderer when another file replaces it.
+    cancel: Option<Arc<AtomicBool>>,
     error: Option<String>,
     promote_margin: usize,
     /// Playback starts when this many frames of generated audio exist, so the first
@@ -42,30 +51,60 @@ pub struct PlayerApp {
     prebuffer_frames: usize,
     started: bool,
     opened_at: std::time::Instant,
+    /// The window title names the file; set once per load, not every frame.
+    title_dirty: bool,
 }
 
 impl PlayerApp {
-    pub fn new(
-        engine: AudioEngine,
-        frontier: Option<Arc<Frontier>>,
-        status: Option<Arc<RenderStatus>>,
-        info: TrackInfo,
-    ) -> Self {
+    pub fn new(session: Session, playback: Playback) -> Self {
         // One second of slack before the switch is offered, so a toggle cannot land on
         // the edge of what exists and fall back mid-ramp.
-        let promote_margin = engine.device_rate as usize;
-        let prebuffer_frames = (engine.device_rate as usize).saturating_mul(2);
+        let promote_margin = playback.engine.device_rate as usize;
+        let prebuffer_frames = (playback.engine.device_rate as usize).saturating_mul(2);
         Self {
-            engine,
-            frontier,
-            status,
-            info,
+            session,
+            engine: playback.engine,
+            frontier: playback.frontier,
+            status: playback.status,
+            info: playback.info,
+            path: playback.path,
+            cancel: playback.cancel,
             error: None,
             promote_margin,
             prebuffer_frames,
             started: false,
             opened_at: std::time::Instant::now(),
+            title_dirty: true,
         }
+    }
+
+    /// Replace what is playing, keeping the worker. A failed load leaves the current
+    /// file alone and says why, instead of stopping playback with nothing to show.
+    fn load(&mut self, path: &Path) {
+        let mut playback = match self.session.open(path) {
+            Ok(playback) => playback,
+            Err(error) => {
+                self.error = Some(format!("could not play {}: {error:#}", path.display()));
+                return;
+            }
+        };
+        // The new file owns the worker's next window; the old renderer must let go.
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.cancel = playback.cancel.take();
+        // Dropping the old engine stops its stream.
+        self.engine = playback.engine;
+        self.frontier = playback.frontier;
+        self.status = playback.status;
+        self.info = playback.info;
+        self.path = playback.path;
+        self.promote_margin = self.engine.device_rate as usize;
+        self.prebuffer_frames = (self.engine.device_rate as usize).saturating_mul(2);
+        self.started = false;
+        self.opened_at = std::time::Instant::now();
+        self.title_dirty = true;
+        self.error = None;
     }
 
     fn ready_frames(&self) -> usize {
@@ -125,9 +164,11 @@ impl PlayerApp {
 
         ui.add_space(6.0);
         ui.label(
-            egui::RichText::new("space toggles   ·   p plays   ·   ←/→ seek 5 s   ·   esc quits")
-                .weak()
-                .size(11.0),
+            egui::RichText::new(
+                "space toggles   ·   p plays   ·   ←/→ seek 5 s   ·   drop a file   ·   esc quits",
+            )
+            .weak()
+            .size(11.0),
         );
 
         ui.add_space(16.0);
@@ -465,6 +506,29 @@ fn window_from_frontier(frontier: &Frontier, centre: usize) -> Option<Vec<f32>> 
 
 impl eframe::App for PlayerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.title_dirty {
+            self.title_dirty = false;
+            let name = self
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "flacify".to_string());
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("flacify — {name}")));
+        }
+
+        // The window takes another file without restarting the app, which is what lets
+        // the resident worker pay for itself: the second file skips the weight load.
+        let dropped = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .find_map(|file| file.path.clone())
+        });
+        if let Some(path) = dropped {
+            self.load(&path);
+        }
+
         self.maybe_start();
         if let Some(engine) = Some(&self.engine) {
             let controls = &engine.controls;
@@ -495,6 +559,16 @@ impl eframe::App for PlayerApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| self.draw_transport(ui));
+    }
+}
+
+impl Drop for PlayerApp {
+    /// Closing the window stops this file's renderer; the session then drops the
+    /// worker, and `Connection::drop` kills the child.
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 

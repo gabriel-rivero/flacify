@@ -224,7 +224,8 @@ The app crate is small on purpose, one module per job:
 | module | job |
 |---|---|
 | `decode.rs` | symphonia → planar f32, channel map, polyphase resample to 48 kHz |
-| `render.rs` | decode + analyse + the pipeline + the sidecar, one track at a time |
+| `render.rs` | decode + analyse + the pipeline over the shared worker, one track at a time |
+| `session.rs` | one resident worker for the window, the cache, and a file becoming playback |
 | `player.rs` | the mixer: two buffers, one position, an 8 ms ramp, atomics only |
 | `device.rs` | `cpal` output: config, one-time resample, channel map, callback |
 | `setup.rs` | first-run provisioning: uv, CPython, wheels, weights, resumable state |

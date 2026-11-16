@@ -14,8 +14,10 @@ the same Apple Silicon (ADR-002). The working reference implementation is the Py
 `play` no longer waits for a whole render: it starts the original as soon as the device
 opens and fills a frontier behind it, 0.17 s from cache and 12.6 s cold on the M5 Max
 (model load plus the first window), then hands the A/B switch over once the frontier is
-ahead. What v0.2 still owes is the wait feeling short — a resident worker — and the rest
-of the window. The numbers are in
+ahead. The model worker is process-scoped now: it starts lazily on the first uncached file,
+is reused when another file is dropped on the window, and is killed when the window closes,
+so an idle app loads nothing. What v0.2 still owes is the rest of the window (there is no
+waveform yet). The numbers are in
 [`docs/measurements.md`](docs/measurements.md#progressive-playback-2026-11-13).
 
 Runs end to end on macOS (verified: Metal, 48 kHz out, A/B enabled), on Linux
@@ -41,7 +43,7 @@ cargo build --release
 ./target/release/flacify setup                 # once, 4-7 GB by platform
 ./target/release/flacify probe song.mp3        # cutoff, verdict, wait
 ./target/release/flacify enhance song.mp3      # -> song.mp3.flacify.wav
-./target/release/flacify play song.mp3         # window: space toggles, p plays, drag to seek
+./target/release/flacify play song.mp3         # window: space toggles, p plays, drag to seek, drop a file
 ./target/release/flacify play song.mp3 --smoke # headless audio-path check
 ```
 
@@ -51,6 +53,14 @@ and plays back at 48 kHz with the switch enabled. The generated band gains +24.6
 matching, which now holds the two sides within 0.1 dB so the toggle changes brightness,
 not level (see
 [`docs/measurements.md`](docs/measurements.md#loudness-matching-2026-11-13)).
+
+## Releases
+
+Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
+which builds the Windows binary and attaches `flacify.exe` to the GitHub release. It is the
+app only: run `flacify setup` once on the target machine (about 6.9 GB with the CUDA wheels)
+before `flacify play`. There is no installer or code signing yet; that is the packaging
+release in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## The one-paragraph pitch
 

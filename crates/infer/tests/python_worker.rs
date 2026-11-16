@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use flacify_core::Error;
 use flacify_infer::model::Model;
 use flacify_infer::python::{PythonWorker, WorkerConfig};
+use flacify_infer::WorkerSession;
 
 const FAKE_WORKER: &str = env!("CARGO_BIN_EXE_fake-flashsr-worker");
 const WINDOW: usize = 1024;
@@ -100,6 +101,36 @@ fn given_a_window_of_the_wrong_size_when_run_then_it_is_rejected_before_the_work
     let out = worker.run(&input, &noise, 2, WINDOW).unwrap();
     assert_eq!(out, input);
     worker.shutdown();
+}
+
+#[test]
+fn given_a_worker_session_when_two_renders_use_it_then_the_child_survives_between_them() {
+    let session = WorkerSession::new(config());
+    assert!(!session.is_loaded(), "nothing spawns before it is needed");
+
+    let mut first = session
+        .clone()
+        .model()
+        .expect("the fake worker should start");
+    assert!(session.is_loaded());
+    let input = signal(2 * WINDOW);
+    let out = first
+        .run(&input, &noise(NOISE_LEN_STEREO), 2, WINDOW)
+        .unwrap();
+    assert_eq!(out, input);
+    drop(first);
+
+    // Dropping one render's handle must not stop the child: the window may still take
+    // another file, and the point of the session is that it does not load twice.
+    assert!(session.is_loaded());
+    let mut second = session
+        .clone()
+        .model()
+        .expect("the worker is still running");
+    let out = second
+        .run(&input, &noise(NOISE_LEN_STEREO), 2, WINDOW)
+        .unwrap();
+    assert_eq!(out, input);
 }
 
 #[test]

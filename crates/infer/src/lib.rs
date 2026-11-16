@@ -9,7 +9,9 @@ pub mod engine;
 pub mod model;
 pub mod noise;
 pub mod python;
+pub mod session;
 
 pub use engine::Engine;
 pub use model::{FixedModel, IdentityModel, Model};
 pub use noise::fill_normal;
+pub use session::{ResidentModel, WorkerSession};

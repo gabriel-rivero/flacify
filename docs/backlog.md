@@ -62,7 +62,7 @@ doc line that would have been wrong. No issue closes on "works on my machine".
 | E4-3 | Waveform with rendered frontier + unrendered dimming | frontier visible, matches the cache |
 | E4-4 | Transport, gain, A/B button + `A` key, hold-to-compare | toggle < 30 ms, no click |
 | E4-5 | First-run hardware probe → `profile.toml`, skipped on later runs | probe ≤ 40 s, re-probes on device change |
-| E4-6 | Drag and drop a file onto the window | plays, replaces current file cleanly |
+| E4-6 | Drag and drop a file onto the window | plays, replaces current file cleanly — **done 2026-11-15**: the drop replaces the file in place, keeps the current track on a failed load, and reuses the resident worker |
 | E4-7 | Status surface: RTF, buffer, dropouts, EP, mode | matches `--stats` output |
 | E4-8 | Failure states: `Passthrough`, `Rendering`, `Blocked` with a reason | every failure path reachable in a test |
 
@@ -94,7 +94,7 @@ doc line that would have been wrong. No issue closes on "works on my machine".
 | E7-2 | Manual model-file escape hatch | user can point at a local `.onnx` |
 | E7-3 | Licence screen + attribution screen (`cargo-about`) | shown once, stored |
 | E7-4 | macOS `.app` + `.dmg`, signed and notarised | launches on a clean Mac with no dialog |
-| E7-5 | Windows `.msi` (unsigned), Linux AppImage + `.deb` | installs and plays |
+| E7-5 | Windows `.msi` (unsigned), Linux AppImage + `.deb` | installs and plays — partial 2026-11-16: a `v*` tag attaches a raw `flacify.exe`; no installer yet |
 | E7-6 | `flacify diagnose` bundle | one file to paste into an issue |
 
 ## E8 — Quality harness

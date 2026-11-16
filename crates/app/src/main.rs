@@ -2,8 +2,8 @@
 //!
 //! The app is the whole product minus the model: decode, analysis, the windowing
 //! pipeline, the buffer policy and the A/B switch are Rust. The model runs in a Python
-//! sidecar the app installs and owns (ADR-010), which is why `setup` and
-//! `worker_config` exist at all.
+//! sidecar the app installs and owns (ADR-010), and [`session`] keeps that sidecar alive
+//! for the life of the app so a second file does not load it again.
 
 mod cache;
 mod decode;
@@ -14,6 +14,7 @@ mod loudness;
 mod player;
 mod render;
 mod render_status;
+mod session;
 mod setup;
 mod spectrum;
 mod splice;
@@ -21,16 +22,14 @@ mod ui;
 mod wav;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use flacify_core::{plan, Probe, SAMPLE_RATE};
-use flacify_infer::python::WorkerConfig;
 
-use crate::frontier::Frontier;
-use crate::render_status::RenderStatus;
+use crate::session::{Playback, Session};
 
 #[derive(Parser)]
 #[command(
@@ -125,22 +124,6 @@ fn run_setup() -> Result<()> {
     Ok(())
 }
 
-fn worker_config(paths: &setup::Paths) -> Result<WorkerConfig> {
-    if !paths.is_ready() {
-        anyhow::bail!(
-            "the model is not installed yet. Run `flacify setup` once (about 6 GB), \
-             or set FLACIFY_HOME if it lives somewhere else."
-        );
-    }
-    Ok(WorkerConfig {
-        program: paths.venv_python(),
-        worker_script: paths.worker_script(),
-        model_dir: paths.models_dir(),
-        flashsr_dir: Some(paths.flashsr_dir()),
-        device: "auto".to_string(),
-    })
-}
-
 fn probe(path: &Path, rtf: f64) -> Result<()> {
     let loaded = render::load(path)?;
     let (track, analysis) = (&loaded.track, &loaded.analysis);
@@ -195,9 +178,7 @@ fn mode_label(plan: &flacify_core::Plan) -> String {
 
 fn enhance(file: &Path, out: Option<PathBuf>, splice: bool) -> Result<()> {
     let paths = setup::Paths::discover()?;
-    let config = worker_config(&paths)?;
-    let cache = cache::Cache::new(paths.cache_dir());
-    let model_id = cache::model_id(&paths.models_dir());
+    let session = Session::new(&paths, splice)?;
     let out = out.unwrap_or_else(|| {
         let mut name = file.file_name().unwrap_or_default().to_os_string();
         name.push(".flacify.wav");
@@ -209,10 +190,13 @@ fn enhance(file: &Path, out: Option<PathBuf>, splice: bool) -> Result<()> {
     render::enhance_file(
         file,
         &out,
-        &config,
-        &cache,
-        &model_id,
+        session.worker(),
+        render::Store {
+            cache: session.cache(),
+            model_id: session.model_id(),
+        },
         splice,
+        &AtomicBool::new(false),
         &mut |done, total| {
             if total == 0 {
                 return;
@@ -239,182 +223,36 @@ fn enhance(file: &Path, out: Option<PathBuf>, splice: bool) -> Result<()> {
 
 fn play(file: &Path, smoke: bool, splice: bool) -> Result<()> {
     let paths = setup::Paths::discover()?;
-    let config = worker_config(&paths)?;
-    let cache = Arc::new(cache::Cache::new(paths.cache_dir()));
-    let model_id = cache::model_id(&paths.models_dir());
+    let session = Session::new(&paths, splice)?;
     let started = Instant::now();
+    // `open` is the only work between pressing play and hearing the file: decode,
+    // analysis and the device. The renderer runs behind the playhead from here on.
+    let mut playback = session.open(file)?;
 
-    // Decode and analyse first: this is the only work between pressing play and hearing
-    // the file. Everything else happens behind the playhead.
-    let render::Loaded {
-        track, analysis, ..
-    } = render::load(file)?;
-    let original = track.interleaved();
-    let tags = decode::tags(file);
-    let info_base = (
-        file_name(file),
-        tags,
-        analysis.cutoff_hz,
-        track.frames as f64 / f64::from(SAMPLE_RATE),
-    );
-
-    if analysis.looks_full_band() {
-        eprintln!(
-            "already full-band ({:.4}% of the spectrum above 21 kHz); nothing to generate",
-            analysis.high_band_ratio * 100.0
-        );
-        let engine = device::AudioEngine::start(&original, None)?;
-        let info = ui::TrackInfo {
-            name: info_base.0,
-            title: info_base.1.title,
-            artist: info_base.1.artist,
-            cutoff_hz: info_base.2,
-            audio_secs: info_base.3,
-            device: "none".to_string(),
-            from_cache: false,
-            gain_db: 0.0,
-        };
-        finish(engine, None, None, info, smoke, started)
+    if smoke {
+        let result = report(&playback, started);
+        playback.cancel();
+        result
     } else {
-        let key = cache::key(
-            &render::sample_hash(&track),
-            render::WINDOW,
-            render::OVERLAP,
-            &model_id,
-            splice,
-        );
-        match cache.load(&key)? {
-            Some(cached) => {
-                eprintln!(
-                    "cache hit: {:.0} s of audio, nothing to render",
-                    info_base.3
-                );
-                let enhanced = render::interleave_stereo(&cached.planar, track.frames);
-                let engine = device::AudioEngine::start(&original, Some(&enhanced))?;
-                let info = ui::TrackInfo {
-                    name: info_base.0,
-                    title: info_base.1.title,
-                    artist: info_base.1.artist,
-                    cutoff_hz: info_base.2,
-                    audio_secs: info_base.3,
-                    device: cached.meta.device,
-                    from_cache: true,
-                    gain_db: cached.meta.gain_db,
-                };
-                finish(engine, None, None, info, smoke, started)
-            }
-            None if !device::progressive_supported() => {
-                eprintln!(
-                    "this output device is not 48 kHz stereo, so the track is rendered \
-                     before playback starts"
-                );
-                let started = Instant::now();
-                let (rendered, from_cache) = render::enhance_or_cached(
-                    &track,
-                    Some(analysis.cutoff_hz),
-                    &config,
-                    &cache,
-                    &model_id,
-                    splice,
-                    &mut |_| {},
-                )?;
-                let enhanced = render::interleave_stereo(&rendered.planar, track.frames);
-                let engine = device::AudioEngine::start(&original, Some(&enhanced))?;
-                let info = ui::TrackInfo {
-                    name: info_base.0,
-                    title: info_base.1.title,
-                    artist: info_base.1.artist,
-                    cutoff_hz: info_base.2,
-                    audio_secs: info_base.3,
-                    device: rendered.device,
-                    from_cache,
-                    gain_db: rendered.gain_db,
-                };
-                eprintln!(
-                    "rendered {:.0} s of audio in {:.0} s",
-                    info_base.3,
-                    started.elapsed().as_secs_f64()
-                );
-                finish(engine, None, None, info, smoke, started)
-            }
-            None => {
-                let frontier = Frontier::new(track.frames);
-                let status = RenderStatus::new();
-                let cutoff = analysis.cutoff_hz;
-                let seed = render::seed_for(&track);
-                {
-                    let frontier = Arc::clone(&frontier);
-                    let cache = Arc::clone(&cache);
-                    let config = config.clone();
-                    let status = Arc::clone(&status);
-                    std::thread::spawn(move || {
-                        let result = render::render_into_frontier(
-                            &track,
-                            Some(cutoff),
-                            &config,
-                            seed,
-                            splice,
-                            &frontier,
-                            &mut |_| {},
-                        );
-                        match result {
-                            Ok(render) => {
-                                status.finish();
-                                if let Err(error) = cache.store(&key, &render, cutoff) {
-                                    tracing::warn!(%error, "could not cache the render");
-                                }
-                            }
-                            Err(error) => {
-                                // The window shows this too; tracing is for the terminal.
-                                tracing::error!(%error, "rendering failed");
-                                status.fail(format!("{error:#}"));
-                            }
-                        }
-                    });
-                }
-                let engine =
-                    device::AudioEngine::start_progressive(&original, Arc::clone(&frontier))?;
-                let info = ui::TrackInfo {
-                    name: info_base.0,
-                    title: info_base.1.title,
-                    artist: info_base.1.artist,
-                    cutoff_hz: info_base.2,
-                    audio_secs: info_base.3,
-                    device: "rendering".to_string(),
-                    from_cache: false,
-                    gain_db: 0.0,
-                };
-                finish(engine, Some(frontier), Some(status), info, smoke, started)
-            }
-        }
+        ui::run(ui::PlayerApp::new(session, playback)).map_err(|error| anyhow::anyhow!("{error}"))
     }
 }
 
-/// Hand the engine to the window, or report what a headless run saw.
+/// Report what a headless run saw.
 ///
 /// Playback starts once the frontier is two seconds ahead, so the first note is already
 /// the generated signal and the frontier stays ahead from there (it runs at about 1.28x
 /// realtime once the model is loaded). A patience budget catches the slow machine that
 /// never gets there: it starts on the original and the automatic promotion does the rest.
-fn finish(
-    engine: device::AudioEngine,
-    frontier: Option<Arc<Frontier>>,
-    status: Option<Arc<RenderStatus>>,
-    info: ui::TrackInfo,
-    smoke: bool,
-    started: Instant,
-) -> Result<()> {
+fn report(playback: &Playback, started: Instant) -> Result<()> {
+    let engine = &playback.engine;
+    let info = &playback.info;
     let rate = engine.device_rate as usize;
-
-    if !smoke {
-        return ui::run(ui::PlayerApp::new(engine, frontier, status, info))
-            .map_err(|error| anyhow::anyhow!("{error}"));
-    }
 
     let prebuffer = 2 * rate;
     let patience = 30.0;
     while started.elapsed().as_secs_f64() < patience {
-        let ready = match &frontier {
+        let ready = match &playback.frontier {
             Some(frontier) => frontier.ready_frames(),
             None => usize::MAX,
         };
@@ -435,7 +273,7 @@ fn finish(
     let until = started.elapsed().as_secs_f64() + watch;
     while started.elapsed().as_secs_f64() < until {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let ready = match &frontier {
+        let ready = match &playback.frontier {
             Some(frontier) => frontier.ready_frames(),
             None => (info.audio_secs * rate as f64) as usize,
         };
@@ -474,7 +312,7 @@ fn finish(
         peak_ready as f64 / f64::from(engine.device_rate),
         info.audio_secs
     );
-    if let Some(failure) = status.as_ref().and_then(|status| status.failure()) {
+    if let Some(failure) = playback.status.as_ref().and_then(|status| status.failure()) {
         println!("render    failed: {failure}");
     }
     match live {
@@ -499,10 +337,4 @@ fn finish(
         anyhow::bail!("the device never pulled audio");
     }
     Ok(())
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
 }

@@ -1,0 +1,37 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: build windows exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The workspace already builds and tests on windows-latest, so a release build
+      # needs nothing beyond the toolchain. The exe is the app alone: `flacify setup`
+      # still has to run once on the target machine for the sidecar and the weights.
+      - name: Build the release binary
+        run: cargo build --release --bin flacify
+
+      - name: Attach the exe to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/flacify.exe
+          fail_on_unmatched_files: true
+          body: |
+            `flacify.exe` is the app. It still needs `flacify setup` once on the
+            machine (about 6.9 GB: Python sidecar, wheels and weights) before
+            `flacify play` can enhance anything. A machine without a CUDA or Metal
+            accelerator renders slower than realtime; it still plays, and the A/B
+            switch unlocks late.

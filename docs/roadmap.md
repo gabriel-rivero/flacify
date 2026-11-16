@@ -99,12 +99,14 @@ realtime, so there is no reason to wait for it:
 Exit: first sound ≤ 2 s from cache (met: 0.17 s), ≤ 15 s cold (met: 12.6 s), toggle live
 with the first note (met), no dropouts in a five-minute session (not yet exercised).
 
-**Landed so far (2026-11-13):** progressive playback with a prebuffer, automatic promotion
+**Landed so far (2026-11-15):** progressive playback with a prebuffer, automatic promotion
 once, a draggable seek bar, the frontier progress bar and the status line; then the two
-spectra, title and artist from tags, and a device stream-error counter (2026-11-13). **Still
-to do:** drag-and-drop and a resident worker so a cold play costs nothing. That last one is
-the difference between 12.6 s and ~4 s and belongs with the app (v0.3), because it is the
-app that owns the worker's lifetime.
+spectra, title and artist from tags, a device stream-error counter, and drag-and-drop onto
+the window (2026-11-15). The model worker is now process-scoped: it starts lazily on the
+first render that needs it — a cache hit or a full-band file never starts it — is reused
+for every later file in the window, and is killed when the window closes. No daemon, no
+idle 3 GB. The first uncached file in a run still pays the load; the second does not
+(ADR-013). **Still to do:** the waveform (E4-3).
 
 **The window.** The spectrum and the tags have landed; this is the rest of the target.
 
@@ -116,7 +118,9 @@ app that owns the worker's lifetime.
   is the one picture that explains the product in a second.
 - A status line that says what is happening: rendering (with the frontier), cached, the
   measured RTF, and the peak limiting it applied.
-- Drag a file onto the window; errors are states, never silent stops.
+- Drag a file onto the window; errors are states, never silent stops. **Landed
+  2026-11-15:** a drop replaces the file in place, a failed load keeps the current track
+  and names the file it could not open, and the worker is reused across drops.
 
 **Honesty work that belongs with the toggle.** Both landed and both were measured.
 Loudness matching brought the two sides within 0.1 dB on a steady track, so the switch now
@@ -219,8 +223,11 @@ release where it should land.
    *streaming* track arrives with the queue in v0.4.
 5. ~~Whole-track render before play.~~ **Done (2026-11-13):** the player starts on the
    original and promotes itself once the frontier passes the playhead (ADR-012); 0.17 s
-   from cache and 12.6 s cold on the M5 Max, then the switch is live. What remains is the
-   resident worker, which turns the cold 12.6 s into ~4 s.
+   from cache and 12.6 s cold on the M5 Max, then the switch is live. The resident worker
+   landed on 2026-11-15 (ADR-013): it is started by the first render that needs it, reused
+   for later files, and dropped with the window. The second file therefore skips the load;
+   how much that saves is **not measured yet** — 12.6 s includes the 8 s load, but the
+   first window has not been timed alone on this machine.
 6. **No waveform.** The two spectra are there, at the playhead, with the cutoff and the
    generated band marked (ADR-005). There is still no waveform, and the transport is text,
    a button and a bar.
@@ -264,8 +271,8 @@ release where it should land.
     environment variable (a per-platform default, or a documented `setup` flag), the rest
     of the device matrix (WASAPI/PipeWire, 96 kHz, 5.1), and a decision on the accelerator.
 12. **Metadata is partial.** Title and artist come from tags, with the filename as the
-    fallback; duration comes from the decode. There is no artwork, no album or year, and no
-    drag and drop.
+    fallback; duration comes from the decode. There is no artwork and no album or year.
+    Drag and drop landed on 2026-11-15, and it replaces the current file in place.
 
 **Explicitly parked**
 

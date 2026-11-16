@@ -6,13 +6,39 @@
 //! `debug_assert` at the end is the cheap way to notice if it ever stops holding.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use flacify_core::{Block, Pipeline, Preprocessor, SAMPLE_RATE};
-use flacify_infer::python::{PythonWorker, WorkerConfig};
-use flacify_infer::Engine;
+use flacify_infer::{Engine, WorkerSession};
 
 use crate::decode;
+
+/// The render was superseded by another file. Not a failure: the window moved on.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("render cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// Whether an error means the render was cancelled rather than broken.
+pub fn is_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Cancelled>().is_some()
+}
+
+/// One window of check: cancelled renders stop before the next expensive call.
+fn check_cancel(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(anyhow::Error::new(Cancelled));
+    }
+    Ok(())
+}
 
 /// The model's trained window: 5.12 s of 48 kHz audio.
 pub const WINDOW: usize = 245_760;
@@ -135,29 +161,34 @@ pub struct Render {
     pub lufs_output: f64,
 }
 
+/// Everything one render needs besides the audio: the model, the band, the seed and
+/// whether to keep the input's low band.
+pub struct Job {
+    pub session: Arc<WorkerSession>,
+    pub cutoff_hz: Option<u32>,
+    pub seed: u64,
+    pub splice_low_band: bool,
+}
+
+/// Where a finished render goes, and what identifies it in the cache.
+pub struct Store<'a> {
+    pub cache: &'a crate::cache::Cache,
+    pub model_id: &'a str,
+}
+
 /// Render a whole track. `progress` is called with the number of input frames covered
 /// each time a chunk comes back from the model, so a UI can show real movement.
 pub fn enhance(
     track: &Track,
-    cutoff_hz: Option<u32>,
-    worker: &WorkerConfig,
-    seed: u64,
-    splice_low_band: bool,
+    job: Job,
+    cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize),
 ) -> Result<Render> {
     let mut planar = Vec::with_capacity(track.frames * 2);
-    let streamed = enhance_streaming(
-        track,
-        cutoff_hz,
-        worker,
-        seed,
-        splice_low_band,
-        progress,
-        |chunk| {
-            planar.extend_from_slice(chunk);
-            Ok(())
-        },
-    )?;
+    let streamed = enhance_streaming(track, job, cancel, progress, |chunk| {
+        planar.extend_from_slice(chunk);
+        Ok(())
+    })?;
     Ok(Render {
         planar,
         limit: streamed.limit,
@@ -189,18 +220,17 @@ const MAX_GAIN_DB: f64 = 6.0;
 
 pub fn enhance_streaming(
     track: &Track,
-    cutoff_hz: Option<u32>,
-    worker: &WorkerConfig,
-    seed: u64,
-    splice_low_band: bool,
+    job: Job,
+    cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize),
     mut on_audio: impl FnMut(&[f32]) -> Result<()>,
 ) -> Result<Streamed> {
-    let model = PythonWorker::spawn(worker).context("starting the model worker")?;
+    let model = job.session.model().context("starting the model worker")?;
     let hello = model.hello();
     // The worker's own "ready on cuda" line goes to its stderr, which is captured and
     // only surfaced when an inference call fails; say it out loud here instead, where
-    // RUST_LOG can reach it.
+    // RUST_LOG can reach it. On a resident worker this repeats per file, which is the
+    // price of not threading a "did it just start" flag through the session.
     tracing::info!(
         device = %hello.device,
         torch = %hello.torch,
@@ -208,8 +238,8 @@ pub fn enhance_streaming(
         "model ready"
     );
     let device = hello.device.clone();
-    let engine = Engine::new(model, 2, WINDOW, cutoff_hz)?;
-    let mut pipeline = Pipeline::new(engine, 2, WINDOW, OVERLAP, seed)?;
+    let engine = Engine::new(model, 2, WINDOW, job.cutoff_hz)?;
+    let mut pipeline = Pipeline::new(engine, 2, WINDOW, OVERLAP, job.seed)?;
 
     let mut report = crate::limit::LimitReport::default();
     let mut emitted = 0usize;
@@ -228,7 +258,7 @@ pub fn enhance_streaming(
 
     // The splice needs the input that produced this window, which is the same frame range
     // of the track: the pipeline keeps output aligned with input, sample for sample.
-    let splicer = match (splice_low_band, cutoff_hz) {
+    let splicer = match (job.splice_low_band, job.cutoff_hz) {
         (true, Some(cutoff)) => Some(Preprocessor::new(cutoff)?),
         _ => None,
     };
@@ -289,6 +319,7 @@ pub fn enhance_streaming(
 
     let mut start = 0;
     while start < track.frames {
+        check_cancel(cancel)?;
         let end = (start + CHUNK).min(track.frames);
         let mut interleaved = Vec::with_capacity((end - start) * 2);
         interleaved.extend_from_slice(&track.channel(0)[start..end]);
@@ -300,6 +331,7 @@ pub fn enhance_streaming(
         progress(end);
         start = end;
     }
+    check_cancel(cancel)?;
     for out in pipeline.finish()? {
         emit(&out, &mut report)?;
     }
@@ -323,41 +355,31 @@ pub fn enhance_streaming(
 /// decides when to store it.
 pub fn render_into_frontier(
     track: &Track,
-    cutoff_hz: Option<u32>,
-    worker: &WorkerConfig,
-    seed: u64,
-    splice_low_band: bool,
+    job: Job,
     frontier: &crate::frontier::Frontier,
+    cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize),
 ) -> Result<Render> {
     let mut planar = Vec::with_capacity(track.frames * 2);
     let mut interleaved = Vec::with_capacity(crate::frontier::CHUNK_FRAMES * 2);
     let mut published = 0usize;
 
-    let streamed = enhance_streaming(
-        track,
-        cutoff_hz,
-        worker,
-        seed,
-        splice_low_band,
-        progress,
-        |chunk| {
-            planar.extend_from_slice(chunk);
-            let frames = chunk.len() / 2;
-            for frame in 0..frames {
-                interleaved.push(chunk[frame]);
-                interleaved.push(chunk[frames + frame]);
-            }
-            while interleaved.len() >= crate::frontier::CHUNK_FRAMES * 2 {
-                let chunk: Vec<f32> = interleaved
-                    .drain(..crate::frontier::CHUNK_FRAMES * 2)
-                    .collect();
-                frontier.publish(published, chunk);
-                published += 1;
-            }
-            Ok(())
-        },
-    )?;
+    let streamed = enhance_streaming(track, job, cancel, progress, |chunk| {
+        planar.extend_from_slice(chunk);
+        let frames = chunk.len() / 2;
+        for frame in 0..frames {
+            interleaved.push(chunk[frame]);
+            interleaved.push(chunk[frames + frame]);
+        }
+        while interleaved.len() >= crate::frontier::CHUNK_FRAMES * 2 {
+            let chunk: Vec<f32> = interleaved
+                .drain(..crate::frontier::CHUNK_FRAMES * 2)
+                .collect();
+            frontier.publish(published, chunk);
+            published += 1;
+        }
+        Ok(())
+    })?;
 
     if !interleaved.is_empty() {
         frontier.publish(published, interleaved);
@@ -378,21 +400,19 @@ pub fn render_into_frontier(
 /// of pretending it did 95 s of work.
 pub fn enhance_or_cached(
     track: &Track,
-    cutoff_hz: Option<u32>,
-    worker: &WorkerConfig,
-    cache: &crate::cache::Cache,
-    model_id: &str,
-    splice_low_band: bool,
+    job: Job,
+    store: Store,
+    cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize),
 ) -> Result<(Render, bool)> {
     let key = crate::cache::key(
         &sample_hash(track),
         WINDOW,
         OVERLAP,
-        model_id,
-        splice_low_band,
+        store.model_id,
+        job.splice_low_band,
     );
-    if let Some(cached) = cache.load(&key)? {
+    if let Some(cached) = store.cache.load(&key)? {
         progress(track.frames);
         let render = Render {
             planar: cached.planar,
@@ -409,16 +429,10 @@ pub fn enhance_or_cached(
         return Ok((render, true));
     }
 
-    let render = enhance(
-        track,
-        cutoff_hz,
-        worker,
-        seed_for(track),
-        splice_low_band,
-        progress,
-    )?;
+    let cutoff_hz = job.cutoff_hz;
+    let render = enhance(track, job, cancel, progress)?;
     if let Some(cutoff) = cutoff_hz {
-        cache.store(&key, &render, cutoff)?;
+        store.cache.store(&key, &render, cutoff)?;
     }
     Ok((render, false))
 }
@@ -427,10 +441,10 @@ pub fn enhance_or_cached(
 pub fn enhance_file(
     input: &Path,
     output: &Path,
-    worker: &WorkerConfig,
-    cache: &crate::cache::Cache,
-    model_id: &str,
+    session: Arc<WorkerSession>,
+    store: Store,
     splice_low_band: bool,
+    cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<()> {
     let Loaded {
@@ -466,11 +480,14 @@ pub fn enhance_file(
     let frames = track.frames;
     let (rendered, from_cache) = enhance_or_cached(
         &track,
-        Some(analysis.cutoff_hz),
-        worker,
-        cache,
-        model_id,
-        splice_low_band,
+        Job {
+            session,
+            cutoff_hz: Some(analysis.cutoff_hz),
+            seed: seed_for(&track),
+            splice_low_band,
+        },
+        store,
+        cancel,
         &mut |done| progress(done, frames),
     )?;
     if from_cache {
@@ -497,4 +514,29 @@ pub fn enhance_file(
     }
     crate::wav::write(output, SAMPLE_RATE, 2, &rendered.planar)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_a_set_token_when_checked_then_the_render_stops_as_cancelled() {
+        let cancel = AtomicBool::new(true);
+        let error = check_cancel(&cancel).unwrap_err();
+        assert!(is_cancelled(&error), "{error:#}");
+        assert_eq!(error.to_string(), "render cancelled");
+    }
+
+    #[test]
+    fn given_an_unset_token_when_checked_then_it_is_not_cancelled() {
+        let cancel = AtomicBool::new(false);
+        assert!(check_cancel(&cancel).is_ok());
+    }
+
+    #[test]
+    fn given_another_error_when_asked_then_it_is_not_a_cancellation() {
+        let error = anyhow::anyhow!("the worker exited");
+        assert!(!is_cancelled(&error));
+    }
 }

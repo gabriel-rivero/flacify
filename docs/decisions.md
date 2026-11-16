@@ -242,7 +242,7 @@ then starts already enhanced. Measured: 12.6 s to first audio cold (8 s load + t
 window), 0.17 s on a cache hit, toggle live from the first note. The automatic promotion
 stays for the case where a slow machine reaches the patience budget first and starts on
 the original anyway. The remaining 8 s is the model load; a resident worker (started by
-the app, not by each play) removes it, and that is packaging work, not playback work.
+the app, not by each play) removes it from later files, which is ADR-013.
 
 **Consequences:**
 
@@ -260,6 +260,48 @@ the app, not by each play) removes it, and that is packaging work, not playback 
   enhanced outright costs a full window of render (2.8 s) plus a prebuffer before any
   sound, and needs the queue before the first note. Starting on the original costs a decode
   and lets the frontier do the catching up.
+
+---
+
+## ADR-013 — The worker lives as long as the app, and each file owns its renderer
+
+**Status:** accepted, v0.2.
+
+**Context:** loading the weights costs 8 s on the M5 Max and 21.9 s on the 4060 Ti under
+Windows. ADR-012 took the load out of the path to first sound by starting on the original,
+but every play still paid it again — including a second file in the same window. The
+obvious fix, a background daemon that keeps the model loaded, is wrong for a local player:
+it holds roughly 3 GB and a GPU context for an app that may not be playing anything, and
+nobody asked for a service.
+
+**Decision:** the worker's lifetime is the process's, and nothing more.
+
+- One `WorkerSession` per `flacify play`. The child starts lazily, on the first render that
+  needs it. A cache hit or a full-band source never starts it (`crates/infer/src/session.rs`).
+- Every render in that window borrows the same child (`ResidentModel` locks it per window),
+  so a second file — dragged in, or opened after the first — skips the load.
+- Closing the window drops the session, which drops the child (`Connection::drop` kills
+  it). No daemon, no service, no idle model.
+- A failed exchange drops the child and clears the session's slot, so the next render
+  starts a fresh one. That is restart at the file boundary, not mid-render.
+- Each file owns a cancellation token. Replacing the file sets it; the renderer returns at
+  the next window boundary instead of racing the new file for the GPU, and a cancelled
+  render is never cached (`crates/app/src/session.rs`, `render.rs`).
+
+**Consequences:**
+
+- The second uncached file in a run no longer pays the 8–22 s load; the first still does.
+  That is the price of not keeping a service alive. **Not measured yet**: 12.6 s cold on
+  the M5 Max includes the 8 s load, but the first window alone has not been timed, so the
+  saving is an inference from the parts, not a number. It goes in `measurements.md` when a
+  second file is played on the same machine.
+- Drag-and-drop is now the feature that exercises the reuse: the window plays one file and
+  takes another without restarting.
+- Supervision is still partial (gap 10). A mid-render death fails that file and the next
+  file retries with a new child; a model that wedges with no output and no error still
+  blocks its caller.
+- One worker means two renders never overlap. The cancellation token, not concurrency, is
+  what makes a file switch quick.
 
 ---
 

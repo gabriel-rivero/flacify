@@ -277,9 +277,12 @@ problem, and it buys seek, instant replay, and a zero-GPU second listen.
 
 - **Key**: `blake3(source bytes) + blake3(weights) + pipeline version + window +
   overlap + dtype + seed policy`. Any change invalidates.
-- **Layout**: `cache/<key>/manifest.json` plus `seg-000001.flac` … in 30 s segments.
-  Segments let a partial render be playable and a settings change invalidate only
-  what it must.
+- **Layout**: `cache/<key>/manifest.json` plus `seg-000000.flac` … in 7-step segments
+  (1 384 320 frames, 28.84 s at the default window). A segment starts on a multiple of
+  `window - overlap`, so its length is derived from the settings and is not a wall-clock
+  30 s. Segments let a partial render be playable and a settings change invalidate only
+  what it must. The manifest is the source of truth: a segment it does not list is not
+  part of the entry.
 - **Format**: FLAC, 24-bit. This is what FLAC is for: lossless storage of the
   generated signal. Output f32 rounded to 24-bit is transparent (−144 dB quantisation
   floor) and roughly half the size of raw float.

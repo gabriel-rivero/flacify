@@ -199,7 +199,8 @@ release where it should land.
 
 1. ~~No FLAC out.~~ **Partly done (2026-11-17):** `enhance` writes 24-bit FLAC when the
    output name ends in `.flac`, and 32-bit float WAV otherwise, which is 3× larger than
-   FLAC. The cache still writes WAV; moving it to FLAC segments is V4-3 in
+   FLAC. The cache writes FLAC segments behind a manifest; its key still hashes the
+   decoded samples rather than the file bytes, which is the rest of V4-3 in
    [`v0.4-plan.md`](v0.4-plan.md).
 2. ~~No loudness match.~~ **Done (2026-11-13):** the generated side was 1.49 LU louder;
    BS.1770 matching brings the step to −0.10 LU, measured twice (the app's meter and an

@@ -1,4 +1,4 @@
-//! Render once, play forever: the FLAC cache.
+//! Render once, play forever: the segmented FLAC cache.
 //!
 //! Rendering a three-minute track costs about 95 s at RTF 0.54, and without a cache
 //! every play pays it again. The cache is keyed by everything that can change the
@@ -6,21 +6,18 @@
 //! model weights — so a hit is exactly the audio a fresh render would have produced,
 //! and a change to any of those misses instead of serving the wrong file.
 //!
-//! One entry is one track: the finished stream as a 32-bit float WAV plus a small JSON
-//! sidecar. A finished entry is written to a temporary directory and renamed, so a
-//! half-written render can never be read back; the cost is that an interrupted render
-//! starts over rather than resuming.
+//! One entry is one track: `manifest.json` plus 24-bit FLAC segments of
+//! `7 * (window - overlap)` frames each. The manifest is the source of truth for what
+//! the entry holds; a segment it does not list is not part of the track. This module
+//! reads and writes whole entries today; the segment layout is the one the incremental
+//! renderer will fill.
 //!
-//! **Why not FLAC yet.** The intent (ADR-003) is a FLAC cache, and `flacenc` writes one.
-//! But symphonia 0.5.5 *and* claxon both decode `flacenc`'s stereo output with a broken
-//! second channel — channel 0 exact, channel 1 zeroes and then noise — while libFLAC
-//! (via libsndfile) reads the same bytes perfectly. It reproduces at 16 and 24 bits, with
-//! side coding on and off, with LPC on and off, and single- or multi-threaded. Two
-//! independent decoders agreeing means the file, not the readers, is the odd one out.
-//! Float WAV is exact, costs about 69 MB for a three-minute track instead of ~30 MB, and
-//! keeps the cache honest until that is resolved. Roadmap: cache, item 1.
+//! A finished entry is written to a temporary directory and renamed, so a half-written
+//! render can never be read back; the cost is that an interrupted render starts over
+//! rather than resuming. A corrupt entry is an error, not a miss: silence about one is
+//! how you end up debugging audio that plays the wrong thing.
 //!
-//! Seeking needs nothing from the cache beyond what playback already does: the file is
+//! Seeking needs nothing from the cache beyond what playback already does: the entry is
 //! decoded into memory and the playhead is an index.
 
 use std::path::{Path, PathBuf};
@@ -36,15 +33,36 @@ use crate::render::Render;
 /// 6 (2026-11-16): v5 stored each render window's planar chunk back to back, so the file
 /// was block-major while the reader treated it as channel-major. A cache hit played the
 /// right channel from the middle of the track. Every v5 entry has to be re-rendered.
-pub const CACHE_VERSION: &str = "flacify-cache-6";
+///
+/// 7 (2026-11-17): an entry is a manifest plus FLAC segments. Every v6 entry misses; its
+/// directory is left for eviction rather than deleted here.
+pub const CACHE_VERSION: &str = "flacify-cache-7";
 
-/// 24-bit has about 144 dB of headroom, well under the float noise floor of the model.
+/// Steps per segment. A segment has to start on a multiple of `window - overlap`, so its
+/// length is derived from the settings and is not a wall-clock 30 s.
+const STEPS_PER_SEGMENT: usize = 7;
 
+/// The one file in an entry that is not audio.
+const MANIFEST: &str = "manifest.json";
+
+/// One FLAC file of an entry, as the manifest describes it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Segment {
+    /// Position in the track; also the number in the file name.
+    pub index: usize,
+    pub frames: usize,
+    pub bytes: u64,
+}
+
+/// The manifest of one entry: where the audio came from, what the limiter did to it, and
+/// which segments hold it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Meta {
     pub version: String,
     pub frames: usize,
     pub sample_rate: u32,
+    #[serde(default)]
+    pub frames_per_segment: usize,
     pub cutoff_hz: u32,
     /// The audio and settings that produced this entry. Stored so `find` can match it
     /// when the model is not installed and its id cannot be computed. Empty on entries
@@ -69,9 +87,17 @@ pub struct Meta {
     /// accepted, which is a deliberate prototype compromise (fp32 devices agree to
     /// within the gate, but they are not bit-identical).
     pub device: String,
+    /// Every segment of the track, in order from the first frame.
+    #[serde(default)]
+    pub segments: Vec<Segment>,
+    /// Unix seconds, for eviction: `store` sets both, `load` moves `last_used`.
+    #[serde(default)]
+    pub last_used: u64,
+    #[serde(default)]
+    pub created_at: u64,
 }
 
-/// What identifies an entry, in a form that can also be written into `meta.json`.
+/// What identifies an entry, in a form that can also be written into `manifest.json`.
 ///
 /// The directory name is their hash, but a lookup on a machine without the model cannot
 /// recompute that hash: the model id comes from files that are gone. The stored fields let
@@ -97,6 +123,7 @@ impl Fields {
     }
 }
 
+#[derive(Debug)]
 pub struct Cached {
     pub planar: Vec<f32>,
     pub meta: Meta,
@@ -115,8 +142,9 @@ impl Cache {
         self.root.join(key)
     }
 
-    /// `None` when there is no entry; an error when there is one and it cannot be read,
-    /// because silence about a corrupt cache entry is how you end up debugging audio.
+    /// `None` when there is no entry, or when it was written by another version; an error
+    /// when there is one and it cannot be read, because silence about a corrupt cache
+    /// entry is how you end up debugging audio.
     pub fn load(&self, key: &str) -> Result<Option<Cached>> {
         self.load_dir(&self.entry_dir(key))
     }
@@ -145,7 +173,7 @@ impl Cache {
                 || meta.window != fields.window
                 || meta.overlap != fields.overlap
                 || meta.splice != fields.splice
-                || !dir.join("audio.wav").is_file()
+                || !dir.join(MANIFEST).is_file()
             {
                 continue;
             }
@@ -168,46 +196,70 @@ impl Cache {
         meta.window = fields.window;
         meta.overlap = fields.overlap;
         meta.splice = fields.splice;
-        let path = dir.join("meta.json");
-        let temp = dir.join("meta.json.tmp");
-        std::fs::write(&temp, serde_json::to_string_pretty(&meta)? + "\n")
-            .with_context(|| format!("writing {}", temp.display()))?;
-        std::fs::rename(&temp, &path).with_context(|| format!("replacing {}", path.display()))
+        write_manifest(&dir, &meta)
     }
 
     fn load_dir(&self, dir: &Path) -> Result<Option<Cached>> {
-        let Some(meta) = self.read_meta(dir)? else {
+        let Some(mut meta) = self.read_meta(dir)? else {
             return Ok(None);
         };
-        let audio_path = dir.join("audio.wav");
-        if meta.version != CACHE_VERSION || !audio_path.is_file() {
+        if meta.version != CACHE_VERSION {
             return Ok(None);
         }
+        let manifest = dir.join(MANIFEST);
+        validate_manifest(&manifest, &meta)?;
 
-        let mut planar = read_audio(&audio_path)?;
-        if planar.len() / 2 < meta.frames {
-            anyhow::bail!(
-                "{} holds {} frames, its metadata says {}",
-                audio_path.display(),
-                planar.len() / 2,
-                meta.frames
+        // Each segment is channel-major for its own frame range; the entry is channel-major
+        // for the whole track, so the planes are gathered separately and joined once.
+        let mut left = Vec::with_capacity(meta.frames);
+        let mut right = Vec::with_capacity(meta.frames);
+        for segment in &meta.segments {
+            let path = dir.join(segment_name(segment.index));
+            anyhow::ensure!(
+                path.is_file(),
+                "{} names a segment that is missing: {}",
+                manifest.display(),
+                path.display()
             );
+            let decoded = crate::decode::decode(&path).with_context(|| {
+                format!("reading segment {} of {}", segment.index, dir.display())
+            })?;
+            anyhow::ensure!(
+                decoded.sample_rate == flacify_core::SAMPLE_RATE && decoded.channels == 2,
+                "{} is {} Hz with {} channels; cache segments are 48 kHz stereo",
+                path.display(),
+                decoded.sample_rate,
+                decoded.channels
+            );
+            anyhow::ensure!(
+                decoded.frames == segment.frames,
+                "{} holds {} frames, {} says {}",
+                path.display(),
+                decoded.frames,
+                manifest.display(),
+                segment.frames
+            );
+            left.extend_from_slice(&decoded.planar[..segment.frames]);
+            right.extend_from_slice(&decoded.planar[segment.frames..]);
         }
-        // The encoder pads the last block; the metadata is the authority.
-        planar.truncate(meta.frames * 2);
-        if planar.len() / 2 != meta.frames {
-            anyhow::bail!(
-                "{} holds {} frames, its metadata says {}",
-                audio_path.display(),
-                planar.len() / 2,
-                meta.frames
+        let mut planar = left;
+        planar.extend_from_slice(&right);
+
+        meta.last_used = now();
+        if let Err(error) = write_manifest(dir, &meta) {
+            // A playable entry matters more than its timestamp: eviction will read the
+            // stale time as an older entry, not as a corrupt one.
+            tracing::warn!(
+                %error,
+                entry = %dir.display(),
+                "could not record when the cache entry was last used"
             );
         }
         Ok(Some(Cached { planar, meta }))
     }
 
     fn read_meta(&self, dir: &Path) -> Result<Option<Meta>> {
-        let path = dir.join("meta.json");
+        let path = dir.join(MANIFEST);
         if !path.is_file() {
             return Ok(None);
         }
@@ -218,8 +270,9 @@ impl Cache {
         Ok(Some(meta))
     }
 
-    /// Write a finished render. Everything lands in `<key>.tmp` first and is renamed,
-    /// so a reader never sees a partial entry.
+    /// Write a finished render as one segment per `7 * (window - overlap)` frames.
+    /// Everything lands in `<key>.tmp` first and is renamed, so a reader never sees a
+    /// partial entry.
     pub fn store(
         &self,
         key: &str,
@@ -227,7 +280,15 @@ impl Cache {
         cutoff_hz: u32,
         fields: &Fields,
     ) -> Result<PathBuf> {
+        anyhow::ensure!(
+            render.planar.len() % 2 == 0,
+            "a render of {} samples is not whole stereo frames",
+            render.planar.len()
+        );
         let frames = render.planar.len() / 2;
+        anyhow::ensure!(frames > 0, "a cache entry needs at least one frame");
+        let segment_frames = frames_per_segment(fields.window, fields.overlap)?;
+
         let final_dir = self.entry_dir(key);
         let temp_dir = self.root.join(format!("{key}.tmp"));
         if temp_dir.exists() {
@@ -237,13 +298,28 @@ impl Cache {
         std::fs::create_dir_all(&temp_dir)
             .with_context(|| format!("creating {}", temp_dir.display()))?;
 
-        let audio_path = temp_dir.join("audio.wav");
-        write_audio(&audio_path, &render.planar)?;
+        let mut segments = Vec::new();
+        for (index, start) in (0..frames).step_by(segment_frames).enumerate() {
+            let count = segment_frames.min(frames - start);
+            let path = temp_dir.join(segment_name(index));
+            let slice = stereo_slice(&render.planar, frames, start, count);
+            crate::flac::write(&path, flacify_core::SAMPLE_RATE, 2, &slice)?;
+            let bytes = std::fs::metadata(&path)
+                .with_context(|| format!("measuring {}", path.display()))?
+                .len();
+            segments.push(Segment {
+                index,
+                frames: count,
+                bytes,
+            });
+        }
 
+        let created_at = now();
         let meta = Meta {
             version: CACHE_VERSION.to_string(),
             frames,
             sample_rate: flacify_core::SAMPLE_RATE,
+            frames_per_segment: segment_frames,
             cutoff_hz,
             sample_hash: fields.sample_hash.clone(),
             window: fields.window,
@@ -254,12 +330,11 @@ impl Cache {
             limited_samples: render.limit.limited_samples,
             gain_db: render.gain_db,
             device: render.device.clone(),
+            segments,
+            last_used: created_at,
+            created_at,
         };
-        std::fs::write(
-            temp_dir.join("meta.json"),
-            serde_json::to_string_pretty(&meta)? + "\n",
-        )
-        .with_context(|| format!("writing metadata in {}", temp_dir.display()))?;
+        write_manifest(&temp_dir, &meta)?;
 
         if final_dir.exists() {
             std::fs::remove_dir_all(&final_dir)
@@ -271,29 +346,86 @@ impl Cache {
     }
 }
 
-/// Read a cached track back as planar stereo at 48 kHz. Also used by tests that need a
-/// decoder for a file the cache wrote.
-fn read_audio(path: &Path) -> Result<Vec<f32>> {
-    let decoded = crate::decode::decode(path)?;
-    if decoded.sample_rate != flacify_core::SAMPLE_RATE || decoded.channels != 2 {
-        anyhow::bail!(
-            "{} is {} Hz with {} channels; cache entries are 48 kHz stereo",
-            path.display(),
-            decoded.sample_rate,
-            decoded.channels
-        );
-    }
-    let planar = crate::decode::to_stereo_48k(&decoded)?;
-    if planar.len() != decoded.frames * 2 {
-        anyhow::bail!("{} decodes to an unexpected length", path.display());
-    }
-    Ok(planar)
+/// Frames per segment, derived from the settings so that every segment starts on a
+/// multiple of the render step.
+fn frames_per_segment(window: usize, overlap: usize) -> Result<usize> {
+    let step = window
+        .checked_sub(overlap)
+        .filter(|step| *step > 0)
+        .with_context(|| format!("window {window} is not longer than overlap {overlap}"))?;
+    step.checked_mul(STEPS_PER_SEGMENT)
+        .with_context(|| format!("{step} frames per step overflows a segment length"))
 }
 
-/// Write the finished stream as a 32-bit float WAV, which is exact: every byte of the
-/// model's output survives, and a person can open a cache entry to hear what it holds.
-fn write_audio(path: &Path, planar: &[f32]) -> Result<()> {
-    crate::wav::write(path, flacify_core::SAMPLE_RATE, 2, planar)
+/// A manifest has to describe the exact partition of its own frame count into its own
+/// segments. Anything else is a corrupt entry, and a corrupt entry is an error.
+fn validate_manifest(manifest: &Path, meta: &Meta) -> Result<()> {
+    let expected_frames = frames_per_segment(meta.window, meta.overlap)
+        .with_context(|| format!("{} has no usable segment length", manifest.display()))?;
+    anyhow::ensure!(
+        meta.frames_per_segment == expected_frames,
+        "{} says {}-frame segments, its window {} and overlap {} give {expected_frames}",
+        manifest.display(),
+        meta.frames_per_segment,
+        meta.window,
+        meta.overlap
+    );
+
+    let mut remaining = meta.frames;
+    for (position, segment) in meta.segments.iter().enumerate() {
+        anyhow::ensure!(
+            segment.index == position,
+            "{} lists segment {} at position {position}",
+            manifest.display(),
+            segment.index
+        );
+        let expected = remaining.min(meta.frames_per_segment);
+        anyhow::ensure!(
+            segment.frames == expected,
+            "{} says segment {} holds {} frames, the track needs {expected}",
+            manifest.display(),
+            segment.index,
+            segment.frames
+        );
+        remaining -= expected;
+    }
+    anyhow::ensure!(
+        remaining == 0,
+        "{} promises {} frames but its segments hold {}",
+        manifest.display(),
+        meta.frames,
+        meta.frames - remaining
+    );
+    Ok(())
+}
+
+/// Cut one channel-major slice out of a whole-track buffer.
+fn stereo_slice(planar: &[f32], total_frames: usize, start: usize, frames: usize) -> Vec<f32> {
+    let mut slice = Vec::with_capacity(frames * 2);
+    slice.extend_from_slice(&planar[start..start + frames]);
+    let right = total_frames + start;
+    slice.extend_from_slice(&planar[right..right + frames]);
+    slice
+}
+
+fn segment_name(index: usize) -> String {
+    format!("seg-{index:06}.flac")
+}
+
+/// Write the manifest through a temporary file in the same directory, so a reader never
+/// sees half of one.
+fn write_manifest(dir: &Path, meta: &Meta) -> Result<()> {
+    let path = dir.join(MANIFEST);
+    let temp = dir.join(format!("{MANIFEST}.tmp"));
+    std::fs::write(&temp, serde_json::to_string_pretty(meta)? + "\n")
+        .with_context(|| format!("writing {}", temp.display()))?;
+    std::fs::rename(&temp, &path).with_context(|| format!("replacing {}", path.display()))
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Everything that can change the rendered samples, hashed into a directory name.
@@ -353,6 +485,10 @@ mod tests {
     use super::*;
     use crate::limit::LimitReport;
 
+    /// One 24-bit step: `flac` rounds to this, and a sample already on the grid survives
+    /// the round trip unchanged.
+    const QUANTUM: f32 = 1.0 / 8_388_608.0;
+
     fn temp_cache(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "flacify-cache-{name}-{}-{}",
@@ -365,12 +501,14 @@ mod tests {
         dir
     }
 
+    /// A render whose samples are all exact 24-bit values, so a round trip either returns
+    /// them unchanged or shows the bug.
     fn render_of(frames: usize) -> Render {
         let mut planar = Vec::with_capacity(frames * 2);
         for channel in 0..2 {
             for frame in 0..frames {
-                let value = (frame as f32 * 0.01).sin() * 0.4 + channel as f32 * 0.1;
-                planar.push(value);
+                let step = (frame as i32 * (7_919 + channel * 3_217)) % 4_096 - 2_048;
+                planar.push(step as f32 * QUANTUM);
             }
         }
         Render {
@@ -387,6 +525,7 @@ mod tests {
         }
     }
 
+    /// The shipped settings: a 245 760-frame window with a 48 000-frame overlap.
     fn fields() -> Fields {
         Fields {
             sample_hash: "samples".into(),
@@ -397,61 +536,142 @@ mod tests {
         }
     }
 
+    /// The same entry with 16 800-frame segments, so a test can span several of them
+    /// without encoding a minute of audio.
+    fn fields_with_short_segments() -> Fields {
+        Fields {
+            window: 4_800,
+            overlap: 2_400,
+            ..fields()
+        }
+    }
+
+    fn manifest_path(cache: &Cache, key: &str) -> PathBuf {
+        cache.entry_dir(key).join(MANIFEST)
+    }
+
+    fn stored_meta(cache: &Cache, key: &str) -> Meta {
+        let path = manifest_path(cache, key);
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("reading the manifest"))
+            .expect("parsing the manifest")
+    }
+
+    fn store_meta(cache: &Cache, key: &str, meta: &Meta) {
+        std::fs::write(
+            manifest_path(cache, key),
+            serde_json::to_string_pretty(meta).expect("serialising the manifest"),
+        )
+        .expect("writing the manifest");
+    }
+
     #[test]
-    fn given_a_stored_render_when_loaded_then_the_samples_survive_the_round_trip() {
+    fn given_a_render_that_does_not_fill_its_last_segment_when_stored_and_loaded_then_the_samples_and_frame_count_match(
+    ) {
         let root = temp_cache("roundtrip");
         let cache = Cache::new(root.clone());
-        let render = render_of(4_800);
+        let fields = fields_with_short_segments();
+        let frames = 16_800 * 2 + 5_000;
+        let render = render_of(frames);
         cache
-            .store("key", &render, 15_328, &fields())
+            .store("key", &render, 15_328, &fields)
             .expect("storing");
 
         let cached = cache.load("key").expect("loading").expect("an entry");
-        assert_eq!(cached.meta.frames, 4_800);
+        assert_eq!(cached.meta.frames, frames);
         assert_eq!(cached.meta.cutoff_hz, 15_328);
+        assert_eq!(cached.meta.segments.len(), 3);
         assert_eq!(cached.planar.len(), render.planar.len());
-        println!(
-            "DEBUG expected {:?} got {:?} len {} vs {}",
-            &render.planar[..6],
-            &cached.planar[..6],
-            render.planar.len(),
-            cached.planar.len()
-        );
-        let (index, worst) = cached
-            .planar
-            .iter()
-            .zip(render.planar.iter())
-            .enumerate()
-            .map(|(i, (a, b))| (i, (a - b).abs()))
-            .fold(
-                (0usize, 0.0f32),
-                |acc, item| if item.1 > acc.1 { item } else { acc },
-            );
-        let bad: Vec<usize> = cached
-            .planar
-            .iter()
-            .zip(render.planar.iter())
-            .enumerate()
-            .filter(|(_, (a, b))| (*a - *b).abs() > 1e-3)
-            .map(|(i, _)| i)
-            .collect();
-        for frame in [0usize, 1, 100, 1000, 2048, 3581, 4095, 4200, 4799] {
-            println!(
-                "DEBUG f{frame}: got {:.5} want {:.5}",
-                cached.planar[4800 + frame],
-                render.planar[4800 + frame]
-            );
+        for (index, (&expected, &actual)) in render.planar.iter().zip(&cached.planar).enumerate() {
+            assert_eq!(actual, expected, "sample {index}: {actual} != {expected}");
         }
-        println!(
-            "DEBUG worst at {index}: expected {:?} got {:?}; {} samples off by >1e-3, first {:?} last {:?}",
-            render.planar.get(index),
-            cached.planar.get(index),
-            bad.len(),
-            bad.first(),
-            bad.last()
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_stored_entry_when_read_back_then_each_manifest_segment_probes_and_decodes_and_the_frames_add_up(
+    ) {
+        let root = temp_cache("segments");
+        let cache = Cache::new(root.clone());
+        let fields = fields_with_short_segments();
+        cache
+            .store("key", &render_of(16_800 * 2 + 500), 12_000, &fields)
+            .expect("storing");
+
+        let dir = cache.entry_dir("key");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("listing the entry")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "manifest.json",
+                "seg-000000.flac",
+                "seg-000001.flac",
+                "seg-000002.flac"
+            ]
         );
-        // 24-bit quantum is 6e-8; allow a little more for the encoder's rounding.
-        assert!(worst < 1e-6, "worst sample error {worst}");
+
+        let meta = stored_meta(&cache, "key");
+        assert_eq!(meta.frames_per_segment, 16_800);
+        assert_eq!(meta.segments.len(), 3);
+        let mut decoded_frames = 0;
+        for segment in &meta.segments {
+            let path = dir.join(segment_name(segment.index));
+            let decoded = crate::decode::decode(&path).expect("decoding a segment");
+            assert_eq!(decoded.sample_rate, 48_000);
+            assert_eq!(decoded.channels, 2);
+            assert_eq!(decoded.frames, segment.frames);
+            assert_eq!(
+                std::fs::metadata(&path).expect("measuring a segment").len(),
+                segment.bytes
+            );
+            decoded_frames += decoded.frames;
+        }
+        assert_eq!(decoded_frames, meta.frames);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_track_shorter_than_one_segment_when_stored_then_the_entry_holds_exactly_one_segment()
+    {
+        let root = temp_cache("one-segment");
+        let cache = Cache::new(root.clone());
+        cache
+            .store("key", &render_of(2_400), 12_000, &fields())
+            .expect("storing");
+
+        let meta = stored_meta(&cache, "key");
+        assert_eq!(meta.segments.len(), 1);
+        assert_eq!(meta.segments[0].frames, 2_400);
+        let dir = cache.entry_dir("key");
+        assert!(dir.join("seg-000000.flac").is_file());
+        assert!(!dir.join("seg-000001.flac").exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_an_entry_whose_last_used_is_old_when_loaded_then_the_manifest_records_the_new_time() {
+        let root = temp_cache("last-used");
+        let cache = Cache::new(root.clone());
+        cache
+            .store("key", &render_of(240), 12_000, &fields())
+            .expect("storing");
+        let mut meta = stored_meta(&cache, "key");
+        assert!(meta.created_at > 0, "created_at is set on store");
+        meta.last_used = 1;
+        store_meta(&cache, "key", &meta);
+
+        let cached = cache.load("key").expect("loading").expect("an entry");
+        assert!(cached.meta.last_used > 1);
+        assert_eq!(stored_meta(&cache, "key").last_used, cached.meta.last_used);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -470,13 +690,232 @@ mod tests {
         cache
             .store("key", &render_of(240), 12_000, &fields())
             .expect("storing");
-        let meta_path = cache.entry_dir("key").join("meta.json");
-        let mut meta: Meta =
-            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        let mut meta = stored_meta(&cache, "key");
         meta.version = "something-older".into();
-        std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+        store_meta(&cache, "key", &meta);
 
         assert!(cache.load("key").expect("no error").is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_manifest_that_names_a_missing_segment_when_loaded_then_it_is_an_error_naming_the_entry(
+    ) {
+        let root = temp_cache("missing-segment");
+        let cache = Cache::new(root.clone());
+        let fields = fields_with_short_segments();
+        cache
+            .store("key", &render_of(17_800), 12_000, &fields)
+            .expect("storing");
+        std::fs::remove_file(cache.entry_dir("key").join("seg-000001.flac"))
+            .expect("removing a segment");
+
+        let error = cache
+            .load("key")
+            .expect_err("a missing segment is an error");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&manifest_path(&cache, "key").display().to_string()),
+            "{text}"
+        );
+        assert!(text.contains("seg-000001.flac"), "{text}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_manifest_with_a_gap_in_its_segment_indexes_when_loaded_then_it_is_an_error() {
+        let root = temp_cache("index-gap");
+        let cache = Cache::new(root.clone());
+        let fields = fields_with_short_segments();
+        cache
+            .store("key", &render_of(17_800), 12_000, &fields)
+            .expect("storing");
+        let mut meta = stored_meta(&cache, "key");
+        meta.segments[1].index = 2;
+        store_meta(&cache, "key", &meta);
+
+        let error = cache.load("key").expect_err("a gap is an error");
+        assert!(format!("{error:#}").contains("position 1"), "{error:#}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_manifest_whose_segments_are_out_of_order_when_loaded_then_it_is_an_error() {
+        let root = temp_cache("out-of-order");
+        let cache = Cache::new(root.clone());
+        let fields = fields_with_short_segments();
+        cache
+            .store("key", &render_of(17_800), 12_000, &fields)
+            .expect("storing");
+        let mut meta = stored_meta(&cache, "key");
+        meta.segments.swap(0, 1);
+        store_meta(&cache, "key", &meta);
+
+        let error = cache.load("key").expect_err("out of order is an error");
+        assert!(format!("{error:#}").contains("position 0"), "{error:#}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_manifest_whose_segment_length_disagrees_with_its_window_when_loaded_then_it_is_an_error(
+    ) {
+        let root = temp_cache("segment-length");
+        let cache = Cache::new(root.clone());
+        cache
+            .store("key", &render_of(240), 12_000, &fields())
+            .expect("storing");
+        let mut meta = stored_meta(&cache, "key");
+        meta.frames_per_segment += 1;
+        store_meta(&cache, "key", &meta);
+
+        let error = cache
+            .load("key")
+            .expect_err("a wrong segment length is an error");
+        assert!(format!("{error:#}").contains("window 245760"), "{error:#}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_manifest_with_no_usable_segment_length_when_loaded_then_it_is_an_error() {
+        let root = temp_cache("no-window");
+        let cache = Cache::new(root.clone());
+        cache
+            .store("key", &render_of(240), 12_000, &fields())
+            .expect("storing");
+        let mut meta = stored_meta(&cache, "key");
+        meta.window = 0;
+        meta.overlap = 0;
+        meta.frames_per_segment = 0;
+        store_meta(&cache, "key", &meta);
+
+        let error = cache.load("key").expect_err("no step is an error");
+        assert!(
+            format!("{error:#}").contains("no usable segment length"),
+            "{error:#}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_manifest_that_stops_before_the_last_frames_when_loaded_then_it_is_an_error() {
+        let root = temp_cache("short-manifest");
+        let cache = Cache::new(root.clone());
+        let fields = fields_with_short_segments();
+        cache
+            .store("key", &render_of(17_800), 12_000, &fields)
+            .expect("storing");
+        let mut meta = stored_meta(&cache, "key");
+        meta.segments.pop();
+        store_meta(&cache, "key", &meta);
+
+        let error = cache
+            .load("key")
+            .expect_err("a manifest without its last segment is an error");
+        assert!(
+            format!("{error:#}").contains("promises 17800 frames"),
+            "{error:#}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_manifest_that_understates_a_segment_when_loaded_then_it_is_an_error() {
+        let root = temp_cache("segment-frames");
+        let cache = Cache::new(root.clone());
+        cache
+            .store("key", &render_of(240), 12_000, &fields())
+            .expect("storing");
+        let mut meta = stored_meta(&cache, "key");
+        meta.segments[0].frames = 200;
+        store_meta(&cache, "key", &meta);
+
+        let error = cache.load("key").expect_err("a short segment is an error");
+        assert!(format!("{error:#}").contains("needs 240"), "{error:#}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_segment_that_decodes_to_another_length_when_loaded_then_it_is_an_error() {
+        let root = temp_cache("segment-truncated");
+        let cache = Cache::new(root.clone());
+        cache
+            .store("key", &render_of(240), 12_000, &fields())
+            .expect("storing");
+        let path = cache.entry_dir("key").join("seg-000000.flac");
+        crate::flac::write(&path, 48_000, 2, &render_of(200).planar).expect("rewriting a segment");
+
+        let error = cache.load("key").expect_err("a short decode is an error");
+        assert!(
+            format!("{error:#}").contains("holds 200 frames"),
+            "{error:#}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_segment_at_the_wrong_rate_when_loaded_then_it_is_an_error() {
+        let root = temp_cache("segment-rate");
+        let cache = Cache::new(root.clone());
+        cache
+            .store("key", &render_of(240), 12_000, &fields())
+            .expect("storing");
+        let path = cache.entry_dir("key").join("seg-000000.flac");
+        crate::flac::write(&path, 44_100, 2, &render_of(240).planar).expect("rewriting a segment");
+
+        let error = cache
+            .load("key")
+            .expect_err("a 44.1 kHz segment is an error");
+        assert!(format!("{error:#}").contains("44100 Hz"), "{error:#}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_render_with_no_frames_when_stored_then_it_is_an_error() {
+        let root = temp_cache("empty");
+        let cache = Cache::new(root.clone());
+        let error = cache
+            .store("key", &render_of(0), 12_000, &fields())
+            .expect_err("an entry needs a frame");
+        assert!(
+            format!("{error:#}").contains("at least one frame"),
+            "{error:#}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_buffer_that_is_not_whole_stereo_frames_when_stored_then_it_is_an_error() {
+        let root = temp_cache("odd");
+        let cache = Cache::new(root.clone());
+        let mut render = render_of(2);
+        render.planar.pop();
+        let error = cache
+            .store("key", &render, 12_000, &fields())
+            .expect_err("3 samples are not whole frames");
+        assert!(
+            format!("{error:#}").contains("not whole stereo frames"),
+            "{error:#}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_an_entry_whose_manifest_cannot_be_rewritten_when_loaded_then_it_still_plays() {
+        let root = temp_cache("read-only");
+        let cache = Cache::new(root.clone());
+        cache
+            .store("key", &render_of(240), 12_000, &fields())
+            .expect("storing");
+        let dir = cache.entry_dir("key");
+        let original = std::fs::metadata(&dir).expect("stat").permissions();
+        let mut read_only_permissions = original.clone();
+        read_only_permissions.set_readonly(true);
+        std::fs::set_permissions(&dir, read_only_permissions).expect("making the entry read-only");
+
+        let loaded = cache.load("key").expect("a read-only entry still loads");
+
+        std::fs::set_permissions(&dir, original).expect("restoring the permissions");
+        assert!(loaded.is_some());
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -535,14 +974,39 @@ mod tests {
             cache.find(&fields()).expect("searching").is_some(),
             "the annotation makes it findable"
         );
+        let meta = stored_meta(&cache, &key);
+        assert_eq!(meta.sample_hash, "samples");
+        assert_eq!(meta.segments.len(), 1, "annotating keeps the segment table");
         std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn given_the_same_inputs_when_keyed_twice_then_the_key_matches_and_a_window_change_moves_it() {
+    fn given_the_shipped_settings_when_a_segment_is_derived_then_it_holds_seven_steps() {
+        assert_eq!(
+            frames_per_segment(245_760, 48_000).expect("a segment"),
+            1_384_320
+        );
+        assert!(frames_per_segment(48_000, 48_000).is_err(), "a zero step");
+        assert!(
+            frames_per_segment(24_000, 48_000).is_err(),
+            "overlap is longer"
+        );
+        assert!(
+            frames_per_segment(usize::MAX, 0).is_err(),
+            "a segment length that overflows"
+        );
+    }
+
+    #[test]
+    fn given_the_same_inputs_when_keyed_twice_then_the_key_matches_and_a_setting_change_moves_it() {
         let a = key("samples", 245_760, 48_000, "model", false);
         assert_eq!(a, key("samples", 245_760, 48_000, "model", false));
+        assert_eq!(a, fields().key());
+        // Pinned so a change to the hash inputs shows up as a changed key, not as a silent
+        // reuse of every v7 entry. The value is run-independent: blake3 over the six parts.
+        assert_eq!(a, "5c4cfc1370d5569fb0be85ade77632f3");
         assert_ne!(a, key("samples", 122_880, 48_000, "model", false));
+        assert_ne!(a, key("samples", 245_760, 24_000, "model", false));
         assert_ne!(a, key("samples", 245_760, 48_000, "other-model", false));
         assert_ne!(a, key("samples", 245_760, 48_000, "model", true));
         assert_eq!(a.len(), 32);

@@ -264,6 +264,9 @@ pub fn decode(path: &Path) -> Result<Decoded> {
 /// returned unchanged. One channel is duplicated to both sides; more than two keeps the
 /// first two, which are front-left and front-right for the layouts we expect, so a real
 /// downmix is not attempted yet.
+///
+/// The whole-file mapping: `probe` uses it so a diagnosis writes nothing to disk, while
+/// playback and rendering go through the chunked source tier.
 pub fn to_stereo_48k(decoded: &Decoded) -> Result<Vec<f32>> {
     let [left, right] = stereo_planes(decoded)?;
     if decoded.sample_rate == SAMPLE_RATE {
@@ -292,34 +295,42 @@ pub fn to_stereo_48k(decoded: &Decoded) -> Result<Vec<f32>> {
 
 /// Split the planar input into the left and right planes `to_stereo_48k` resamples.
 fn stereo_planes(decoded: &Decoded) -> Result<[Vec<f32>; 2]> {
-    anyhow::ensure!(decoded.channels > 0, "decoded audio has no channels");
-    anyhow::ensure!(
-        decoded.planar.len() == decoded.channels * decoded.frames,
-        "planar data is {} samples for {} channels x {} frames",
-        decoded.planar.len(),
-        decoded.channels,
-        decoded.frames
-    );
-
-    let frames = decoded.frames;
-    if decoded.channels == 1 {
-        let mono = &decoded.planar[..frames];
-        return Ok([mono.to_vec(), mono.to_vec()]);
-    }
+    let [left, right] = stereo_planes_of(decoded.channels, &decoded.planar, decoded.frames)?;
     if decoded.channels > 2 {
         tracing::warn!(
             channels = decoded.channels,
             "downmix is not implemented; keeping the first two channels"
         );
     }
-    Ok([
-        decoded.planar[..frames].to_vec(),
-        decoded.planar[frames..2 * frames].to_vec(),
-    ])
+    Ok([left.to_vec(), right.to_vec()])
+}
+
+/// The left and right planes of one buffer of planar samples: one channel is duplicated
+/// to both sides, more than two keeps the first two.
+///
+/// The caller decides whether keeping the first two of a real downmix is worth a warning,
+/// because a whole-file pass warns once and a chunked pass must not warn per chunk.
+pub(crate) fn stereo_planes_of(
+    channels: usize,
+    planar: &[f32],
+    frames: usize,
+) -> Result<[&[f32]; 2]> {
+    anyhow::ensure!(channels > 0, "decoded audio has no channels");
+    anyhow::ensure!(
+        planar.len() == channels * frames,
+        "planar data is {} samples for {channels} channels x {frames} frames",
+        planar.len()
+    );
+
+    if channels == 1 {
+        let mono = &planar[..frames];
+        return Ok([mono, mono]);
+    }
+    Ok([&planar[..frames], &planar[frames..2 * frames]])
 }
 
 /// Express `target / source` as `up / down` with the greatest common divisor removed.
-fn reduced_ratio(target: u32, source: u32) -> (usize, usize) {
+pub(crate) fn reduced_ratio(target: u32, source: u32) -> (usize, usize) {
     let divisor = gcd(target as usize, source as usize);
     (target as usize / divisor, source as usize / divisor)
 }
@@ -333,11 +344,11 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
     a
 }
 
-fn to_f64(samples: &[f32]) -> Vec<f64> {
+pub(crate) fn to_f64(samples: &[f32]) -> Vec<f64> {
     samples.iter().map(|&sample| f64::from(sample)).collect()
 }
 
-fn to_f32(samples: &[f64]) -> Vec<f32> {
+pub(crate) fn to_f32(samples: &[f64]) -> Vec<f32> {
     samples.iter().map(|&sample| sample as f32).collect()
 }
 

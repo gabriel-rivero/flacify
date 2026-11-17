@@ -119,7 +119,7 @@ impl Session {
             analysis,
             source_hash,
             ..
-        } = render::load(file)?;
+        } = render::load(file, self.cache.root())?;
         let original = track.interleaved();
         let tags = decode::tags(file);
         let name = file_name(file);

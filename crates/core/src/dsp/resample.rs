@@ -8,6 +8,12 @@
 //! scipy zero-pads the filter so that output sample 0 is centred; the padding only
 //! changes which convolution samples are kept, never their values, so this port keeps
 //! the unpadded taps and applies the same offset when it reads them.
+//!
+//! Input before the first sample and past the last one reads as zero, and each output
+//! sample sums its taps in a fixed order, so splitting the input into chunks cannot
+//! change a value. An output sample is final once its newest input sample has been
+//! pushed: at most the last `post_roll()` outputs of everything pushed so far wait for
+//! the next push, and `finish()` resolves them against the end-of-input zeros.
 
 use crate::error::{Error, Result};
 
@@ -81,54 +87,144 @@ impl Resampler {
         if self.is_passthrough() {
             return x.to_vec();
         }
-        let n_in = x.len();
-        let n_out = output_count(n_in, self.up, self.down);
-        let pre_pad = self.pre_pad;
-
-        // scipy appends whatever zero taps make the convolution long enough to hold the
-        // slice it keeps. Those taps are zero, so only the bound below matters here.
-        let mut post_pad = 0;
-        while convolved_len(
-            n_in,
-            self.taps.len() + pre_pad + post_pad,
-            self.up,
-            self.down,
-        ) < n_out + self.pre_remove
-        {
-            post_pad += 1;
-        }
-
+        let n_out = output_count(x.len(), self.up, self.down);
         let mut out = Vec::with_capacity(n_out);
         for i in 0..n_out {
-            // Index into the convolution of the upsampled input with the filter.
-            let n = self.pre_remove + i;
-            let centre = n * self.down;
-            let phase = centre % self.up;
-            // Largest read offset that maps back inside `x`.
-            let last = centre / self.up;
-            let mut r = last.saturating_sub(n_in.saturating_sub(1));
-            if pre_pad > phase {
-                r = r.max((pre_pad - phase).div_ceil(self.up));
-            }
-            let mut acc = 0.0;
-            while r <= last {
-                let tap = phase + r * self.up - pre_pad;
-                if tap >= self.taps.len() {
-                    break;
-                }
-                acc += self.taps[tap] * x[last - r];
-                r += 1;
-            }
-            out.push(acc);
+            out.push(self.output_sample(x, 0, i));
         }
         out
     }
+
+    /// Output sample `i` of the whole signal, read from a window whose first sample is
+    /// input index `first_index`.
+    fn output_sample(&self, window: &[f64], first_index: usize, i: usize) -> f64 {
+        // Index into the convolution of the upsampled input with the padded filter.
+        let centre = (self.pre_remove + i) * self.down;
+        let phase = centre % self.up;
+        // Newest input sample this output reads, in window coordinates.
+        let last = centre / self.up - first_index;
+        // Largest read offset that maps back inside `window`.
+        let mut r = last.saturating_sub(window.len().saturating_sub(1));
+        if self.pre_pad > phase {
+            r = r.max((self.pre_pad - phase).div_ceil(self.up));
+        }
+        let mut acc = 0.0;
+        while r <= last {
+            let tap = phase + r * self.up - self.pre_pad;
+            if tap >= self.taps.len() {
+                break;
+            }
+            acc += self.taps[tap] * window[last - r];
+            r += 1;
+        }
+        acc
+    }
+
+    /// Input samples before a chunk start that the filter still reads, and the number a
+    /// caller keeping its own overlap must repeat in front of a chunk.
+    pub fn pre_roll(&self) -> usize {
+        if self.is_passthrough() {
+            return 0;
+        }
+        // The furthest tap back from `last` needs `phase + r * up - pre_pad < taps.len()`.
+        (self.pre_pad + self.taps.len() - 1) / self.up
+    }
+
+    /// At most this many output samples at the end of everything pushed so far are not
+    /// final yet: output `i` reads input up to `(pre_remove + i) * down / up`, so the
+    /// first one still waiting is `n_out - pre_remove`.
+    pub fn post_roll(&self) -> usize {
+        if self.is_passthrough() {
+            return 0;
+        }
+        self.pre_remove
+    }
+
+    /// Starts a pass over an input that arrives in chunks.
+    pub fn chunked(&self) -> ChunkedResampler<'_> {
+        ChunkedResampler::new(self)
+    }
 }
 
-/// `ceil(((n_in - 1) * up + taps) / down)`, the length `upfirdn` produces.
-fn convolved_len(n_in: usize, taps: usize, up: usize, down: usize) -> usize {
-    let numerator = (n_in.saturating_sub(1)) as u128 * up as u128 + taps as u128;
-    numerator.div_ceil(down as u128) as usize
+/// A resampling pass whose input arrives in chunks.
+///
+/// Concatenating every `process_chunk` result and then `finish` equals `process` over
+/// the whole input, bit for bit.
+#[derive(Debug)]
+pub struct ChunkedResampler<'a> {
+    resampler: &'a Resampler,
+    /// Input samples not yet dropped, oldest first, ending at the newest pushed sample.
+    window: Vec<f64>,
+    /// Input samples pushed so far.
+    consumed: usize,
+    /// Output samples returned so far.
+    emitted: usize,
+}
+
+impl<'a> ChunkedResampler<'a> {
+    fn new(resampler: &'a Resampler) -> Self {
+        Self {
+            resampler,
+            window: Vec::new(),
+            consumed: 0,
+            emitted: 0,
+        }
+    }
+
+    /// Resamples `chunk`, returning the samples whose values are final at this position.
+    pub fn process_chunk(&mut self, chunk: &[f64]) -> Vec<f64> {
+        if self.resampler.is_passthrough() {
+            self.consumed += chunk.len();
+            self.emitted += chunk.len();
+            return chunk.to_vec();
+        }
+        self.window.extend_from_slice(chunk);
+        self.consumed += chunk.len();
+        let end_output = self
+            .signal_output_count()
+            .saturating_sub(self.resampler.post_roll());
+        let out = self.emit(end_output);
+        self.retain_pre_roll();
+        out
+    }
+
+    /// Resolves the outputs that waited for more input, and returns them.
+    pub fn finish(mut self) -> Vec<f64> {
+        let end_output = self.signal_output_count();
+        self.emit(end_output)
+    }
+
+    /// Input samples the pass still holds; at most `pre_roll()`, and zero for a
+    /// passthrough ratio.
+    pub fn retained_input_len(&self) -> usize {
+        self.window.len()
+    }
+
+    /// Output samples a whole input of the length pushed so far would produce.
+    fn signal_output_count(&self) -> usize {
+        output_count(self.consumed, self.resampler.up, self.resampler.down)
+    }
+
+    /// Computes output samples `[emitted, end_output)` from the window.
+    fn emit(&mut self, end_output: usize) -> Vec<f64> {
+        let first_index = self.consumed - self.window.len();
+        let mut out = Vec::with_capacity(end_output - self.emitted);
+        for i in self.emitted..end_output {
+            // Outputs that wait for input start inside the window, so this cannot wrap.
+            out.push(self.resampler.output_sample(&self.window, first_index, i));
+        }
+        self.emitted = end_output;
+        out
+    }
+
+    /// Drops the input no later output reads, keeping the `pre_roll()` tail.
+    fn retain_pre_roll(&mut self) {
+        let keep = self.resampler.pre_roll();
+        if self.window.len() > keep {
+            let excess = self.window.len() - keep;
+            self.window.drain(..excess);
+        }
+    }
 }
 
 /// `ceil(n_in * up / down)`, the length `resample_poly` returns.
@@ -206,5 +302,116 @@ mod tests {
         let r = Resampler::new(3, 2).unwrap();
         assert_eq!(r.process(&vec![0.0; 1001]).len(), 1502);
         assert_eq!(r.process(&vec![0.0; 1000]).len(), 1500);
+    }
+
+    /// A fixed-seed signal, so a failure reproduces.
+    fn pseudo_random_signal(len: usize) -> Vec<f64> {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as f64 / u64::MAX as f64 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Bit patterns, so `-0.0` against `0.0` counts as the difference it is.
+    fn bits(samples: &[f64]) -> Vec<u64> {
+        samples.iter().map(|sample| sample.to_bits()).collect()
+    }
+
+    #[test]
+    fn given_the_44_1_khz_ratios_when_asked_for_their_rolls_then_the_pre_roll_is_the_reach() {
+        let r = Resampler::new(147, 160).unwrap();
+        assert_eq!((r.pre_roll(), r.post_roll()), (22, 11));
+        let r = Resampler::new(160, 147).unwrap();
+        assert_eq!((r.pre_roll(), r.post_roll()), (20, 11));
+    }
+
+    #[test]
+    fn given_no_input_when_finished_then_nothing_comes_out() {
+        let r = Resampler::new(147, 160).unwrap();
+        let mut chunked = r.chunked();
+        assert!(chunked.process_chunk(&[]).is_empty());
+        assert_eq!(chunked.retained_input_len(), 0);
+        assert!(chunked.finish().is_empty());
+    }
+
+    #[test]
+    fn given_a_long_signal_when_resampled_in_chunks_then_every_sample_matches_process() {
+        let x = pseudo_random_signal(100_000);
+        for (up, down) in [(147, 160), (160, 147)] {
+            let r = Resampler::new(up, down).unwrap();
+            let whole = r.process(&x);
+            for chunk_size in [1, 17, 1024, 4096, 7777, 16_384] {
+                let mut chunked = r.chunked();
+                let mut out = Vec::new();
+                for chunk in x.chunks(chunk_size) {
+                    out.extend(chunked.process_chunk(chunk));
+                    assert!(chunked.retained_input_len() <= r.pre_roll());
+                }
+                out.extend(chunked.finish());
+                let context = format!("{up}/{down} in chunks of {chunk_size}");
+                assert_eq!(out.len(), whole.len(), "{context}");
+                assert_eq!(bits(&out), bits(&whole), "{context}");
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_length_off_the_chunk_and_down_grid_when_chunked_then_the_joins_stay_aligned() {
+        let r = Resampler::new(147, 160).unwrap();
+        let x = pseudo_random_signal(10_001);
+        assert_ne!(x.len() % 300, 0, "the last chunk must be a short one");
+        assert_ne!(
+            x.len() * 147 % 160,
+            0,
+            "the input must not land on the output grid"
+        );
+        let whole = r.process(&x);
+        assert_eq!(whole.len(), (10_001u128 * 147).div_ceil(160) as usize);
+
+        let mut chunked = r.chunked();
+        let mut out = Vec::new();
+        let mut pushed = 0;
+        for chunk in x.chunks(300) {
+            out.extend(chunked.process_chunk(chunk));
+            // A decoder can hand an empty block; it must not shift the joins.
+            out.extend(chunked.process_chunk(&[]));
+            pushed += chunk.len();
+            let ready = output_count(pushed, 147, 160).saturating_sub(r.post_roll());
+            assert_eq!(out.len(), ready, "after {pushed} input samples");
+        }
+        assert_eq!(chunked.retained_input_len(), r.pre_roll());
+        let tail = chunked.finish();
+        assert_eq!(
+            tail.len(),
+            r.post_roll(),
+            "the last chunk's tail is dropped"
+        );
+        out.extend(tail);
+        assert_eq!(out.len(), whole.len());
+        assert_eq!(bits(&out), bits(&whole));
+    }
+
+    #[test]
+    fn given_the_passthrough_ratio_when_chunked_then_it_copies_and_keeps_no_history() {
+        let r = Resampler::new(48_000, 48_000).unwrap();
+        assert_eq!(r.pre_roll(), 0);
+        assert_eq!(r.post_roll(), 0);
+
+        let x = pseudo_random_signal(5_000);
+        let mut chunked = r.chunked();
+        let mut out = Vec::new();
+        for chunk in x.chunks(512) {
+            let samples = chunked.process_chunk(chunk);
+            assert_eq!(samples, chunk);
+            assert_eq!(chunked.retained_input_len(), 0);
+            out.extend(samples);
+        }
+        assert!(chunked.finish().is_empty());
+        assert_eq!(bits(&out), bits(&x));
     }
 }

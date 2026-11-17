@@ -136,7 +136,33 @@ stays off. The numbers are in
 
 Deliberately absent: playlists, library view, EQ, skins, export UI, system sink.
 
-## v0.3 — render cache
+## v0.3 — a real app
+
+Goal: a downloaded app that installs and starts without a terminal.
+
+**Landed 2026-11-16 — first-run setup in the window.** `flacify play` checks `is_ready()`;
+when the model is missing it opens the window on a setup screen instead of stopping with a
+CLI instruction. The screen states the size (the sum of `setup::plan()`), starts
+`setup::ensure` on a thread only after the user presses Download, shows the current step and
+its progress, offers Retry after a failure, and hands the same window to the player once the
+file opens. `--smoke` still requires `flacify setup`, because a headless run cannot click.
+
+Still to do:
+
+- Installer: `.msi` on Windows, `.app` + notarisation on macOS, AppImage/.deb on Linux.
+- Code signing. A `v*` tag already attaches a raw Windows `flacify.exe` from
+  `.github/workflows/release.yml`.
+- Per-step byte progress, and cancellation that stops the running step cleanly.
+- A hardware gate: a clear message and passthrough mode on 8 GB Macs or old GPUs.
+- Choosing the CUDA torch wheel without `FLACIFY_TORCH_INDEX` (a per-platform default or a
+  documented `setup` flag).
+- Worker supervision (gap 10): a wedged model with no output still blocks its caller.
+- Opt-in diagnostics to a local log file only. No network.
+
+Exit: a clean machine installs from the window, plays a file, and a second run uses the
+install without contacting the network.
+
+## v0.4 — streaming and cache polish
 
 This is where the player stops being a demo.
 
@@ -150,34 +176,17 @@ This is where the player stops being a demo.
 Exit: 60-minute track, zero dropouts, seek to 55:00 works, second play has 0 s of
 GPU time.
 
-## v0.4 — real-time mode
-
-What the PoC does today, done with a policy object instead of a separate code path.
-
-- Bounded queue with a target depth derived from the measured RTF, not a guess.
-- Latency presets 0.64 / 1.28 / 2.56 / 5.12 s window, with the quality tradeoff
-  stated in the UI.
-- Underrun policy: emit passthrough for the missed window, log it, show a counter.
-  Never a gap.
-- Optional live capture source (input device), which is the same code the system
-  sink needs.
-
-## v0.5 — first-run
-
-- Model download: 1.7–3.3 GB, resumable, checksum-verified, resumable across
-  restarts, with a mirror and a manual-file escape hatch.
-- Hardware gate: clear message and passthrough mode on 8 GB Macs or old GPUs.
-- Installer: `.dmg`/`.app` on macOS (notarised), `.msi` on Windows (unsigned v1),
-  AppImage/.deb on Linux.
-- Opt-in crash reports to a local log file only. No network.
-
 ## v1.0 — utility
 
+- Real-time mode: what the PoC does today, done with a policy object instead of a separate
+  code path — a bounded queue whose depth comes from the measured RTF, latency presets
+  0.64 / 1.28 / 2.56 / 5.12 s with the quality tradeoff in the UI, and an underrun policy
+  that emits passthrough and never a gap.
+- Optional live capture source (input device), which is the same code the system sink needs.
 - System-wide sink: virtual output device, "enhance everything" mode.
 - Batch: drop a folder, render to cache, progress, resume, skip list.
 - Signed and notarised builds for all three platforms.
 - A blind A/B report you can export and share, which is the marketing asset.
-
 ## Later, explicitly not scheduled
 
 Playlists and library management; Winamp `.wsz` skin support; EQ and DSP chain;
@@ -349,3 +358,33 @@ behaviour. **`CACHE_VERSION` is 6**; every v5 entry misses and is re-rendered on
 **Left over:** the v5 entries are not deleted (eviction is E5-5), so a track that was cached
 before this fix keeps its scrambled copy on disk until eviction lands. The next play of the
 FFVII track has to render again, and the second-file time to first sound is still unmeasured.
+
+## Gaps in the in-window setup (2026-11-16)
+
+The setup screen covers the thing that made a downloaded exe useless without a terminal:
+the size is stated, the download starts on a button press, the step and its fraction are
+shown, a failure can be retried, and the window becomes the player. What it still does
+not do, in the order it would hurt:
+
+1. **No cancellation.** Closing the window kills the process and any `uv`/`pip` child with
+   it. `setup::ensure` has no token, so the next run redoes the step that was running. The
+   screen says this, but the app cannot stop a step cleanly and report it.
+2. **The progress bar jumps, it does not move.** `Progress` reports a step at 0 and at 1,
+   so the bar is empty or full for each step. Byte-level progress already exists inside the
+   runner; it is not threaded out.
+3. **Retry is coarse.** It re-enters `ensure` from the top, skipping steps already marked
+   done. It cannot retry only the failed step, and there is no backoff between attempts.
+4. **A cached or full-band file still triggers setup.** `Session::new` checks `is_ready`,
+   and the window offers setup before opening any file, even one that would never start the
+   model. The app could defer the requirement to the first render that needs it.
+5. **No accelerator choice on the screen.** The plan installs PyPI's CPU torch; a CUDA
+   machine still has to set `FLACIFY_TORCH_INDEX` before the first run. The screen should
+   detect and offer the CUDA wheel (gap 11).
+6. **Verification is size-only.** The plan's bytes label the download; the weights step
+   checks sizes, not a checksum. The CLI has the same limitation (E7-1).
+7. **The window is fixed at 560×560 and does not scroll.** A long failure message can push
+   the Retry and Quit buttons out of the viewport.
+8. **`play` is the only entry point.** `flacify enhance` and `probe` still say "run
+   `flacify setup`", and `--smoke` bails for the same reason: a headless run cannot click.
+9. **Only the state machine is tested.** The screen's transitions are unit-tested; the
+   download path is not exercised end to end without a network and 6.9 GB.

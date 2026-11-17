@@ -184,6 +184,7 @@ for spec in files:
 const STEP_RECEIPT: &str = ".flacify-ready";
 
 /// The one directory the app owns, plus the paths inside it that never move.
+#[derive(Clone)]
 pub struct Paths {
     root: PathBuf,
 }

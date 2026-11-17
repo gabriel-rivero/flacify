@@ -41,7 +41,7 @@ See the platform gap in [`docs/roadmap.md`](docs/roadmap.md).
 
 ```sh
 cargo build --release
-./target/release/flacify setup                 # once, 4-7 GB by platform
+./target/release/flacify setup                 # once, 4-7 GB; the window does it on first play too
 ./target/release/flacify probe song.mp3        # cutoff, verdict, wait
 ./target/release/flacify enhance song.mp3      # -> song.mp3.flacify.wav
 ./target/release/flacify play song.mp3         # window: space toggles, p plays, drag to seek, drop a file
@@ -59,9 +59,10 @@ not level (see
 
 Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
 which builds the Windows binary and attaches `flacify.exe` to the GitHub release. It is the
-app only: run `flacify setup` once on the target machine (about 6.9 GB with the CUDA wheels)
-before `flacify play`. There is no installer or code signing yet; that is the packaging
-release in [`docs/roadmap.md`](docs/roadmap.md).
+app only: the first `flacify play` opens a setup screen and downloads the Python sidecar,
+wheels and weights (about 6.9 GB with the CUDA wheels); `flacify setup` does the same from a
+terminal. There is no installer or code signing yet; that is the rest of v0.3 in
+[`docs/roadmap.md`](docs/roadmap.md).
 
 ## The one-paragraph pitch
 

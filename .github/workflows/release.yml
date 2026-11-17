@@ -30,8 +30,7 @@ jobs:
           files: target/release/flacify.exe
           fail_on_unmatched_files: true
           body: |
-            `flacify.exe` is the app. It still needs `flacify setup` once on the
-            machine (about 6.9 GB: Python sidecar, wheels and weights) before
-            `flacify play` can enhance anything. A machine without a CUDA or Metal
-            accelerator renders slower than realtime; it still plays, and the A/B
-            switch unlocks late.
+            `flacify.exe` is the app. The first `flacify play` opens a setup screen and
+            downloads the Python sidecar, wheels and weights (about 6.9 GB); `flacify setup`
+            does the same from a terminal. A machine without a CUDA or Metal accelerator
+            renders slower than realtime; it still plays, and the A/B switch unlocks late.

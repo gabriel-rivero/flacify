@@ -8,6 +8,7 @@
 mod cache;
 mod decode;
 mod device;
+mod first_run;
 mod frontier;
 mod limit;
 mod loudness;
@@ -223,6 +224,17 @@ fn enhance(file: &Path, out: Option<PathBuf>, splice: bool) -> Result<()> {
 
 fn play(file: &Path, smoke: bool, splice: bool) -> Result<()> {
     let paths = setup::Paths::discover()?;
+
+    // A released binary cannot ask the user to open a terminal. Without the install the
+    // window owns the download; a headless run still needs `flacify setup`.
+    if !paths.is_ready() {
+        if smoke {
+            anyhow::bail!("the model is not installed yet. Run `flacify setup` once (about 6 GB).");
+        }
+        return ui::run(first_run::FirstRun::new(paths, file.to_path_buf(), splice))
+            .map_err(|error| anyhow::anyhow!("{error}"));
+    }
+
     let session = Session::new(&paths, splice)?;
     let started = Instant::now();
     // `open` is the only work between pressing play and hearing the file: decode,

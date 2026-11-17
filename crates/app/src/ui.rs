@@ -704,7 +704,7 @@ impl Drop for PlayerApp {
     }
 }
 
-pub fn run(app: PlayerApp) -> eframe::Result<()> {
+pub fn run(app: impl eframe::App + 'static) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([560.0, 560.0])

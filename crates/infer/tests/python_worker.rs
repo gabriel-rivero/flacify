@@ -134,6 +134,37 @@ fn given_a_worker_session_when_two_renders_use_it_then_the_child_survives_betwee
 }
 
 #[test]
+fn given_a_worker_that_dies_between_windows_when_the_next_window_runs_then_it_restarts_and_retries()
+{
+    // `--fail-after 1` serves one window then exits. Every later call therefore finds a
+    // dead child, and must replace it and retry that window on the fresh one.
+    let session =
+        WorkerSession::with_args(config(), vec!["--fail-after".to_string(), "1".to_string()]);
+    let mut model = session
+        .clone()
+        .model()
+        .expect("the fake worker should start");
+    let input = signal(2 * WINDOW);
+    let noise = noise(NOISE_LEN_STEREO);
+
+    assert_eq!(
+        model.run(&input, &noise, 2, WINDOW).unwrap(),
+        input,
+        "the first worker serves its one window"
+    );
+    assert_eq!(
+        model.run(&input, &noise, 2, WINDOW).unwrap(),
+        input,
+        "a dead worker is replaced and the window retried"
+    );
+    assert_eq!(
+        model.run(&input, &noise, 2, WINDOW).unwrap(),
+        input,
+        "and again on the next one"
+    );
+}
+
+#[test]
 fn given_the_worker_exits_mid_session_when_the_next_window_runs_then_it_is_an_inference_error() {
     let mut worker = spawn_with(&["--fail-after", "1"]);
     let input = signal(2 * WINDOW);

@@ -158,7 +158,8 @@ Still to do:
 - A hardware gate: a clear message and passthrough mode on 8 GB Macs or old GPUs.
 - Choosing the CUDA torch wheel without `FLACIFY_TORCH_INDEX` (a per-platform default or a
   documented `setup` flag).
-- Worker supervision (gap 10): a wedged model with no output still blocks its caller.
+- Worker supervision: a dead child is replaced and the window retried once; a model that
+  wedges with no output and no error still blocks its caller (gap 10).
 - Opt-in diagnostics to a local log file only. No network.
 
 Exit: a clean machine installs from the window, plays a file, and a second run uses the
@@ -263,8 +264,11 @@ release where it should land.
    check that the installed sidecar actually imports before declaring success. Windows is
    now installed end to end (4.2 GiB on a CPU-only machine, 6.9 GiB on W2 with the CUDA
    wheels) and setup is idempotent; that run found the `uv` pre-download bug in gap 11.
-10. **The worker is not supervised.** If it dies mid-render the app errors out; there is no
-   restart, and a wedged model with no output blocks the render thread forever.
+10. ~~The worker is not supervised.~~ **Partly done (2026-11-16):** a worker that dies
+    between windows is dropped and replaced, and that window is retried once on the fresh
+    child, so one death costs a load rather than the track (tested with the fake sidecar).
+    A model that wedges with no output and no error still blocks its caller; catching that
+    needs a timeout on the exchange, not just a restart.
 11. **Platform coverage is one machine plus Linux and Windows runs.** The portable-core work is
     done: uv's Windows `.zip` is handled, the audio callback covers every integer and
     float sample format cpal exposes, a refused `BufferSize::Fixed` falls back to the

@@ -8,8 +8,9 @@
 //! (`Connection::drop`), so there is no daemon and no idle 3 GB.
 //!
 //! A failed exchange leaves the protocol stream in an unknown state. The model is dropped
-//! on the spot so the child is killed, and the next render starts a fresh one rather than
-//! failing every later window against a dead pipe.
+//! on the spot so the child is killed, and the window is retried once on a fresh child, so
+//! one worker death costs a load rather than the track. A worker that wedges with no output
+//! and no error still blocks its caller; only a timeout would catch that.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -21,13 +22,23 @@ use crate::python::{Hello, PythonWorker, WorkerConfig, MODEL_LATENCY_SAMPLES};
 /// A worker that lives as long as the caller holds the `Arc`.
 pub struct WorkerSession {
     config: WorkerConfig,
+    /// Only the fake worker uses these; the real sidecar takes none.
+    extra_args: Vec<String>,
     worker: Mutex<Option<PythonWorker>>,
 }
 
 impl WorkerSession {
     pub fn new(config: WorkerConfig) -> Arc<Self> {
+        Self::with_args(config, Vec::new())
+    }
+
+    /// [`new`](Self::new) with command-line arguments for the child. The real worker
+    /// accepts none; this exists for the fake worker the tests drive.
+    #[doc(hidden)]
+    pub fn with_args(config: WorkerConfig, extra_args: Vec<String>) -> Arc<Self> {
         Arc::new(Self {
             config,
+            extra_args,
             worker: Mutex::new(None),
         })
     }
@@ -69,10 +80,20 @@ impl WorkerSession {
         }
         // The lock is held across the load on purpose: two render threads must not each
         // start their own child and then race to replace it.
-        let started = PythonWorker::spawn(&self.config)?;
+        let started = PythonWorker::spawn_with_args(&self.config, &self.extra_args)?;
         let hello = started.hello().clone();
         *worker = Some(started);
         Ok(hello)
+    }
+
+    /// Drop whatever child is there and start a new one, for a render that outlived its
+    /// worker.
+    fn restart(&self) -> Result<()> {
+        {
+            let mut worker = self.lock()?;
+            *worker = None;
+        }
+        self.ensure().map(|_| ())
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Option<PythonWorker>>> {
@@ -93,11 +114,11 @@ impl ResidentModel {
     pub fn hello(&self) -> &Hello {
         &self.hello
     }
-}
 
-impl Model for ResidentModel {
-    fn run(
-        &mut self,
+    /// One attempt. A failed exchange leaves the pipe in an unknown state, so the child is
+    /// dropped and the next call starts fresh rather than trusting it.
+    fn window(
+        &self,
         input: &[f32],
         noise: &[f32],
         channels: usize,
@@ -111,11 +132,32 @@ impl Model for ResidentModel {
         };
         let result = running.run(input, noise, channels, frames);
         if result.is_err() {
-            // Dropping the worker kills the child. The next render spawns a fresh one
-            // instead of trusting a pipe that may be half a reply behind.
+            // Dropping the worker kills the child.
             *worker = None;
         }
         result
+    }
+}
+
+impl Model for ResidentModel {
+    fn run(
+        &mut self,
+        input: &[f32],
+        noise: &[f32],
+        channels: usize,
+        frames: usize,
+    ) -> Result<Vec<f32>> {
+        match self.window(input, noise, channels, frames) {
+            Ok(output) => Ok(output),
+            Err(_) => {
+                // The child died between windows. The model keeps no state across a
+                // window, so a fresh child and one retry produce the same audio as the
+                // first attempt would have; if the retry fails too, that error is the one
+                // the render sees.
+                self.session.restart()?;
+                self.window(input, noise, channels, frames)
+            }
+        }
     }
 
     fn latency_samples(&self) -> usize {

@@ -1502,26 +1502,29 @@ mod tests {
     /// The fake worker `cargo` builds beside this test binary.
     ///
     /// `CARGO_BIN_EXE_` is only set for the package that declares a binary, and the fake
-    /// lives in `flacify-infer`, so an app test finds it in its own profile directory
-    /// instead. `cargo test --workspace --all-targets` builds it.
+    /// lives in `flacify-infer`, so an app test looks for it above its own executable.
+    /// The depth varies by runner (a plain test binary sits in `deps/`, one built through
+    /// a nested directory sits deeper), so every ancestor is checked rather than one
+    /// assumed parent. `cargo test --workspace --all-targets` builds it.
     fn fake_worker() -> std::path::PathBuf {
         let exe = std::env::current_exe().expect("the test binary's path");
-        let profile = exe
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("the target profile directory");
         let name = if cfg!(windows) {
             "fake-flashsr-worker.exe"
         } else {
             "fake-flashsr-worker"
         };
-        let path = profile.join(name);
-        assert!(
-            path.is_file(),
-            "{} is missing; run `cargo test --workspace --all-targets`",
-            path.display()
+        for dir in exe.ancestors().skip(1) {
+            for candidate in [dir.join(name), dir.join("deps").join(name)] {
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+        panic!(
+            "{} was not found above {}; run `cargo test --workspace --all-targets`",
+            name,
+            exe.display()
         );
-        path
     }
 
     /// A worker session on the fake sidecar, which needs no Python and no weights.

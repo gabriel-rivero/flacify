@@ -1,18 +1,19 @@
 //! Decode an audio file into planar f32, then map it to the pipeline's 48 kHz stereo.
 //!
-//! `decode` handles any container and codec symphonia has registered; `to_stereo_48k` does
-//! the channel mapping and the rational resample to the model rate.
+//! `AudioStream` pulls one decoded packet at a time at the file's native format; `decode`
+//! collects those chunks into one buffer, and `to_stereo_48k` does the channel mapping and
+//! the rational resample to the model rate.
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use flacify_core::dsp::resample::Resampler;
 use flacify_core::SAMPLE_RATE;
-use symphonia::core::audio::{SampleBuffer, SignalSpec};
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::audio::{AudioBufferRef, SampleBuffer, SignalSpec};
+use symphonia::core::codecs::{Decoder, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::{FormatOptions, FormatReader};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
@@ -28,6 +29,180 @@ pub struct Decoded {
     pub frames: usize,
     /// `channels * frames` samples, channel-major.
     pub planar: Vec<f32>,
+}
+
+/// One decoded packet: `channels * frames` samples, channel-major.
+#[derive(Debug)]
+pub struct Chunk {
+    /// Frames per channel carried by this packet.
+    pub frames: usize,
+    /// `channels * frames` samples, channel-major.
+    pub planar: Vec<f32>,
+}
+
+/// A default track pulled one decoded packet at a time, at its native sample rate and
+/// channel count.
+///
+/// Chunks follow the decoder's own packet boundaries, so their size varies; join them
+/// channel by channel to get the same planar buffer `decode` returns.
+pub struct AudioStream {
+    source: PacketSource,
+    sample_rate: u32,
+    channels: usize,
+    pending: Option<Chunk>,
+}
+
+impl AudioStream {
+    /// Open the default track and pull its first chunk, so the format is known up front.
+    pub fn open(path: &Path) -> Result<Self> {
+        let mut source = PacketSource::open(path)?;
+        let (layout, first) = source
+            .pull()?
+            .with_context(|| format!("{} decoded no audio", path.display()))?;
+        let channels = layout.channels.count();
+        anyhow::ensure!(channels > 0, "{} has no channels", path.display());
+
+        Ok(Self {
+            source,
+            sample_rate: layout.rate,
+            channels,
+            pending: Some(first),
+        })
+    }
+
+    /// Sample rate of the stream, in hertz.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Channel count of the stream.
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// Pull the next decoded packet, or `None` at the end of the stream.
+    ///
+    /// The first packet fixes the sample rate and channel count; a later packet whose audio
+    /// layout differs in any way is an error, so every chunk joins into one planar buffer.
+    pub fn next_chunk(&mut self) -> Result<Option<Chunk>> {
+        if let Some(chunk) = self.pending.take() {
+            return Ok(Some(chunk));
+        }
+        Ok(self.source.pull()?.map(|(_, chunk)| chunk))
+    }
+}
+
+/// The demuxer and decoder behind `AudioStream`, plus the layout the first packet fixed.
+struct PacketSource {
+    path: PathBuf,
+    format: Box<dyn FormatReader>,
+    track_id: u32,
+    decoder: Box<dyn Decoder>,
+    layout: Option<SignalSpec>,
+}
+
+impl PacketSource {
+    /// Probe the file, take its default track and build that track's decoder.
+    fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let source = MediaSourceStream::new(Box::new(file), Default::default());
+
+        let mut hint = Hint::new();
+        if let Some(extension) = path.extension().and_then(std::ffi::OsStr::to_str) {
+            hint.with_extension(extension);
+        }
+
+        let probed = symphonia::default::get_probe()
+            .format(
+                &hint,
+                source,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .with_context(|| format!("probing {}", path.display()))?;
+        let format = probed.format;
+
+        let track = format
+            .default_track()
+            .with_context(|| format!("{} has no default track", path.display()))?;
+        let track_id = track.id;
+        let codec_params = track.codec_params.clone();
+
+        let decoder = symphonia::default::get_codecs()
+            .make(&codec_params, &DecoderOptions::default())
+            .with_context(|| format!("{} uses an unsupported codec", path.display()))?;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            format,
+            track_id,
+            decoder,
+            layout: None,
+        })
+    }
+
+    /// Pull packets until one decodes, returning the stream's layout and its samples.
+    fn pull(&mut self) -> Result<Option<(SignalSpec, Chunk)>> {
+        loop {
+            let packet = match self.format.next_packet() {
+                Ok(packet) => packet,
+                Err(SymphoniaError::IoError(error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    return Ok(None)
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("demuxing {}", self.path.display()))
+                }
+            };
+            if packet.track_id() != self.track_id {
+                continue;
+            }
+
+            let decoded = match self.decoder.decode(&packet) {
+                Ok(decoded) => decoded,
+                Err(SymphoniaError::DecodeError(message)) => {
+                    tracing::warn!(
+                        file = %self.path.display(),
+                        message,
+                        "skipping an undecodable packet"
+                    );
+                    continue;
+                }
+                Err(SymphoniaError::IoError(error))
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    continue
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("decoding {}", self.path.display()))
+                }
+            };
+
+            let layout = *decoded.spec();
+            match self.layout {
+                Some(expected) => anyhow::ensure!(
+                    layout == expected,
+                    "{} changes its audio layout mid-stream",
+                    self.path.display()
+                ),
+                None => self.layout = Some(layout),
+            }
+
+            return Ok(Some((layout, chunk_from(decoded))));
+        }
+    }
+}
+
+/// Copy one decoded packet into planar f32.
+fn chunk_from(decoded: AudioBufferRef<'_>) -> Chunk {
+    let frames = decoded.frames();
+    let mut buffer = SampleBuffer::<f32>::new(frames as u64, *decoded.spec());
+    buffer.copy_planar_ref(decoded);
+    Chunk {
+        frames,
+        planar: buffer.samples().to_vec(),
+    }
 }
 
 /// What the file says about itself, if anything. Cosmetic only: a missing tag is not
@@ -58,108 +233,26 @@ pub fn tags(path: &Path) -> Tags {
 }
 
 /// Demux and decode every packet of the default track.
+///
+/// A collector over [`AudioStream`]: accumulate each chunk's plane per channel, then
+/// concatenate the planes.
 pub fn decode(path: &Path) -> Result<Decoded> {
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let source = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut stream = AudioStream::open(path)?;
+    let mut planes: Vec<Vec<f32>> = vec![Vec::new(); stream.channels()];
 
-    let mut hint = Hint::new();
-    if let Some(extension) = path.extension().and_then(std::ffi::OsStr::to_str) {
-        hint.with_extension(extension);
-    }
-
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            source,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .with_context(|| format!("probing {}", path.display()))?;
-    let mut format = probed.format;
-
-    let track = format
-        .default_track()
-        .with_context(|| format!("{} has no default track", path.display()))?;
-    let track_id = track.id;
-    let codec_params = track.codec_params.clone();
-
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&codec_params, &DecoderOptions::default())
-        .with_context(|| format!("{} uses an unsupported codec", path.display()))?;
-
-    // One plane per channel, appended packet by packet; the planar output is their
-    // concatenation, so channel-major order survives any packet size.
-    let mut planes: Vec<Vec<f32>> = Vec::new();
-    let mut layout: Option<SignalSpec> = None;
-
-    loop {
-        let packet = match format.next_packet() {
-            Ok(packet) => packet,
-            Err(SymphoniaError::IoError(error))
-                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("demuxing {}", path.display()))
-            }
-        };
-        if packet.track_id() != track_id {
-            continue;
-        }
-
-        let decoded = match decoder.decode(&packet) {
-            Ok(decoded) => decoded,
-            Err(SymphoniaError::DecodeError(message)) => {
-                tracing::warn!(
-                    file = %path.display(),
-                    message,
-                    "skipping an undecodable packet"
-                );
-                continue;
-            }
-            Err(SymphoniaError::IoError(error))
-                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                continue
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("decoding {}", path.display()))
-            }
-        };
-
-        let packet_spec = *decoded.spec();
-        match layout {
-            Some(expected) => anyhow::ensure!(
-                packet_spec == expected,
-                "{} changes its audio layout mid-stream",
-                path.display()
-            ),
-            None => {
-                layout = Some(packet_spec);
-                planes = vec![Vec::new(); packet_spec.channels.count()];
-            }
-        }
-
-        let packet_frames = decoded.frames();
-        let mut buffer = SampleBuffer::<f32>::new(packet_frames as u64, packet_spec);
-        buffer.copy_planar_ref(decoded);
+    while let Some(chunk) = stream.next_chunk()? {
         for (channel, plane) in planes.iter_mut().enumerate() {
-            let start = channel * packet_frames;
-            plane.extend_from_slice(&buffer.samples()[start..start + packet_frames]);
+            let start = channel * chunk.frames;
+            plane.extend_from_slice(&chunk.planar[start..start + chunk.frames]);
         }
     }
-
-    let layout = layout.with_context(|| format!("{} decoded no audio", path.display()))?;
-    let channels = layout.channels.count();
-    anyhow::ensure!(channels > 0, "{} has no channels", path.display());
 
     let frames = planes.first().map_or(0, Vec::len);
     anyhow::ensure!(frames > 0, "{} decoded zero frames", path.display());
 
     Ok(Decoded {
-        sample_rate: layout.rate,
-        channels,
+        sample_rate: stream.sample_rate(),
+        channels: stream.channels(),
         frames,
         planar: planes.concat(),
     })

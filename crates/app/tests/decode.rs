@@ -1,7 +1,7 @@
-//! Integration tests for the `decode` module, written against real WAV files on disk.
+//! Integration tests for the `decode` module, written against real audio files on disk.
 //!
-//! `decode` lives in the binary, so the module is mounted here by path; this keeps the
-//! tests runnable without changing `main.rs`.
+//! `decode` and `flac` live in the binary, so the modules are mounted here by path; this
+//! keeps the tests runnable without changing `main.rs`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -10,8 +10,63 @@ use hound::{SampleFormat, WavSpec, WavWriter};
 
 #[path = "../src/decode.rs"]
 mod decode;
+#[allow(dead_code)] // only the FLAC writer is used here
+#[path = "../src/flac.rs"]
+mod flac;
 
 static NEXT_FILE: AtomicU32 = AtomicU32::new(0);
+
+/// A temp path that deletes itself when the test ends.
+struct TempPath {
+    path: PathBuf,
+}
+
+impl TempPath {
+    fn new(name: &str, extension: &str) -> Self {
+        let unique = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "flacify-decode-{}-{unique}-{name}.{extension}",
+            std::process::id()
+        ));
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Collect every chunk a stream yields.
+fn stream_chunks(stream: &mut decode::AudioStream) -> Vec<decode::Chunk> {
+    let mut chunks = Vec::new();
+    while let Some(chunk) = stream.next_chunk().expect("streaming a decoded packet") {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+/// Join chunks the way `decode` collects them: one plane per channel, packet by packet.
+fn join_chunks(chunks: &[decode::Chunk], channels: usize) -> Vec<f32> {
+    let mut planes = vec![Vec::new(); channels];
+    for chunk in chunks {
+        for (channel, plane) in planes.iter_mut().enumerate() {
+            let start = channel * chunk.frames;
+            plane.extend_from_slice(&chunk.planar[start..start + chunk.frames]);
+        }
+    }
+    planes.concat()
+}
+
+/// The exact bit pattern of every sample, so the comparison catches one changed LSB.
+fn sample_bits(samples: &[f32]) -> Vec<u32> {
+    samples.iter().map(|sample| sample.to_bits()).collect()
+}
 
 /// A WAV file in the temp directory that deletes itself when the test ends.
 struct TempWav {
@@ -233,4 +288,172 @@ fn given_planar_data_that_does_not_fit_the_shape_when_mapped_then_it_is_an_error
     let message = format!("{error:#}");
 
     assert!(message.contains("4 samples"), "{message}");
+}
+
+#[test]
+fn given_a_48k_stereo_wav_when_streamed_then_the_joined_chunks_equal_the_whole_decode() {
+    let frames = 1_000;
+    let file = TempWav::write("48k-stereo-stream", 48_000, 2, frames, |frame, channel| {
+        0.1 * (frame + channel) as f32
+    });
+
+    let decoded = decode::decode(file.path()).expect("decoding a 48 kHz stereo wav");
+    let mut stream = decode::AudioStream::open(file.path()).expect("opening a 48 kHz stereo wav");
+    assert_eq!(stream.sample_rate(), 48_000);
+    assert_eq!(stream.channels(), 2);
+
+    let chunks = stream_chunks(&mut stream);
+    let streamed_frames: usize = chunks.iter().map(|chunk| chunk.frames).sum();
+
+    assert_eq!(streamed_frames, decoded.frames);
+    assert_eq!(
+        sample_bits(&join_chunks(&chunks, 2)),
+        sample_bits(&decoded.planar),
+        "the streamed samples differ from the whole decode"
+    );
+}
+
+#[test]
+fn given_a_48k_mono_wav_when_streamed_then_the_joined_chunks_equal_the_whole_decode() {
+    let frames = 500;
+    let file = TempWav::write("48k-mono-stream", 48_000, 1, frames, |frame, _| {
+        0.001 * frame as f32
+    });
+
+    let decoded = decode::decode(file.path()).expect("decoding a 48 kHz mono wav");
+    let mut stream = decode::AudioStream::open(file.path()).expect("opening a 48 kHz mono wav");
+    assert_eq!(stream.channels(), 1);
+
+    let chunks = stream_chunks(&mut stream);
+    let streamed_frames: usize = chunks.iter().map(|chunk| chunk.frames).sum();
+
+    assert_eq!(streamed_frames, decoded.frames);
+    assert_eq!(
+        sample_bits(&join_chunks(&chunks, 1)),
+        sample_bits(&decoded.planar),
+        "the streamed samples differ from the whole decode"
+    );
+}
+
+#[test]
+fn given_a_48k_three_channel_wav_when_streamed_then_the_joined_chunks_equal_the_whole_decode() {
+    let frames = 400;
+    let file = TempWav::write(
+        "48k-3ch-stream",
+        48_000,
+        3,
+        frames,
+        |_, channel| match channel {
+            0 => 0.1,
+            1 => 0.2,
+            _ => 0.3,
+        },
+    );
+
+    let decoded = decode::decode(file.path()).expect("decoding a three channel wav");
+    let mut stream = decode::AudioStream::open(file.path()).expect("opening a three channel wav");
+    assert_eq!(stream.channels(), 3);
+
+    let chunks = stream_chunks(&mut stream);
+    let streamed_frames: usize = chunks.iter().map(|chunk| chunk.frames).sum();
+
+    assert_eq!(streamed_frames, decoded.frames);
+    assert_eq!(
+        sample_bits(&join_chunks(&chunks, 3)),
+        sample_bits(&decoded.planar),
+        "the streamed samples differ from the whole decode"
+    );
+}
+
+#[test]
+fn given_a_44k1_stereo_wav_when_streamed_then_it_reports_the_native_rate_and_matches_the_whole_decode(
+) {
+    let frames = 4_410;
+    let file = TempWav::write("44k1-stereo-stream", 44_100, 2, frames, |frame, _| {
+        (frame as f32 * 0.01).sin() * 0.1
+    });
+
+    let decoded = decode::decode(file.path()).expect("decoding a 44.1 kHz stereo wav");
+    let mut stream = decode::AudioStream::open(file.path()).expect("opening a 44.1 kHz stereo wav");
+
+    assert_eq!(stream.sample_rate(), 44_100);
+    assert_eq!(stream.channels(), 2);
+
+    let chunks = stream_chunks(&mut stream);
+    let streamed_frames: usize = chunks.iter().map(|chunk| chunk.frames).sum();
+
+    assert_eq!(streamed_frames, decoded.frames);
+    assert_eq!(
+        sample_bits(&join_chunks(&chunks, 2)),
+        sample_bits(&decoded.planar),
+        "the streamed samples differ from the whole decode"
+    );
+}
+
+/// A stereo signal whose samples are all exact 24-bit values: small integers scaled by a
+/// power of two.
+fn exact_24_bit_signal(frames: usize) -> Vec<f32> {
+    let mut planar = Vec::with_capacity(2 * frames);
+    for frame in 0..frames {
+        planar.push(((frame as i32 * 7_919) % 2_048 - 1_024) as f32 / 8_388_608.0);
+    }
+    for frame in 0..frames {
+        planar.push(((frame as i32 * 104_729) % 4_096 - 2_048) as f32 / 8_388_608.0);
+    }
+    planar
+}
+
+#[test]
+fn given_a_flac_from_the_cache_writer_when_streamed_then_it_reports_48k_stereo_24_bit_and_matches_the_whole_decode(
+) {
+    let frames = 10_003;
+    let planar = exact_24_bit_signal(frames);
+    let file = TempPath::new("cache", "flac");
+    flac::write(file.path(), 48_000, 2, &planar).expect("writing the cache flac");
+
+    let decoded = decode::decode(file.path()).expect("decoding the cache flac");
+    let mut stream = decode::AudioStream::open(file.path()).expect("opening the cache flac");
+
+    assert_eq!(stream.sample_rate(), 48_000);
+    assert_eq!(stream.channels(), 2);
+
+    let chunks = stream_chunks(&mut stream);
+    let streamed_frames: usize = chunks.iter().map(|chunk| chunk.frames).sum();
+    let joined = join_chunks(&chunks, 2);
+
+    assert!(
+        chunks.len() > 1,
+        "one packet would not exercise a packet boundary"
+    );
+    assert_eq!(streamed_frames, decoded.frames);
+    assert_eq!(
+        sample_bits(&joined),
+        sample_bits(&decoded.planar),
+        "the streamed samples differ from the whole decode"
+    );
+    for (index, sample) in joined.iter().enumerate() {
+        let steps = f64::from(*sample) * 8_388_608.0;
+        assert!(
+            steps.fract() == 0.0,
+            "sample {index}: {sample} is not a 24-bit value"
+        );
+    }
+}
+
+#[test]
+fn given_a_file_that_is_not_audio_when_streamed_then_the_error_names_the_path() {
+    let file = TempPath::new("not-audio", "wav");
+    std::fs::write(file.path(), b"this is not a RIFF file").expect("writing junk");
+
+    let error = match decode::AudioStream::open(file.path()) {
+        Ok(_) => panic!("junk is not audio"),
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+
+    assert!(message.contains("probing"), "{message}");
+    assert!(
+        message.contains(&file.path().display().to_string()),
+        "{message}"
+    );
 }

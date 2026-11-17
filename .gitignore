@@ -9,3 +9,4 @@ __pycache__/
 *.flac
 /poc/
 .DS_Store
+.claude/worktrees/

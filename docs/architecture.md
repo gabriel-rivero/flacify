@@ -280,9 +280,10 @@ problem, and it buys seek, instant replay, and a zero-GPU second listen.
 - **Layout**: `cache/<key>/manifest.json` plus `seg-000000.flac` … in 7-step segments
   (1 384 320 frames, 28.84 s at the default window). A segment starts on a multiple of
   `window - overlap`, so its length is derived from the settings and is not a wall-clock
-  30 s. Segments let a partial render be playable and a settings change invalidate only
-  what it must. The manifest is the source of truth: a segment it does not list is not
-  part of the entry.
+  30 s. Segments keep whatever a resumed render already produced, and a settings change
+  invalidates only what it must. The manifest is the source of truth: a segment it does
+  not list is not part of the entry, and its `state` says whether the table is the whole
+  track yet.
 - **Format**: FLAC, 24-bit. This is what FLAC is for: lossless storage of the
   generated signal. Output f32 rounded to 24-bit is transparent (−144 dB quantisation
   floor) and roughly half the size of raw float.
@@ -296,9 +297,12 @@ problem, and it buys seek, instant replay, and a zero-GPU second listen.
   passthrough and are drawn differently on the waveform.
 - **Eviction**: LRU against a user-set cap (default 20 GB), never evict the file
   currently open, always keep the manifest.
-- **Writer**: append to the current segment, flush on segment close, write the
-  manifest last with `fsync`. A crash leaves playable segments and no manifest entry;
-  the next run adopts them.
+- **Writer**: one segment at a time, each written whole and renamed into place; the
+  manifest is rewritten atomically after it, with both `fsync`ed, so a manifest never
+  names bytes that are not on disk. An entry stays `partial` until a writer marks it
+  complete, and a partial entry is a miss: a kill leaves playable segments plus a partial
+  manifest, and the next writer adopts a segment the manifest does not list when it
+  decodes to the length its index requires, and deletes the ones that do not.
 
 ## Loudness
 

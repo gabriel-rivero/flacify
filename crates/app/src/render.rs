@@ -170,7 +170,7 @@ impl Loaded {
         peaks: Vec<crate::source::SecondPeaks>,
         path: &Path,
     ) -> Result<Self> {
-        let analysis = flacify_core::dsp::cutoff::analyse(track.channel(0))
+        let analysis = analysis_of(track.channel(0))
             .with_context(|| format!("analysing {}", path.display()))?;
         Ok(Self {
             track,
@@ -181,6 +181,22 @@ impl Loaded {
             peaks,
         })
     }
+}
+
+/// Frames the analysis reads per push: one second.
+const ANALYSIS_CHUNK: usize = SAMPLE_RATE as usize;
+
+/// The band limit of one channel, pushed a second at a time.
+///
+/// The chunked analyser is the one a range reader can feed without holding the channel, and
+/// its verdict is pinned to [`analyse`](flacify_core::dsp::cutoff::analyse) by the equality
+/// tests.
+fn analysis_of(channel: &[f32]) -> Result<flacify_core::dsp::cutoff::Analysis> {
+    let mut analyser = flacify_core::dsp::cutoff::chunked();
+    for chunk in channel.chunks(ANALYSIS_CHUNK) {
+        analyser.push(chunk)?;
+    }
+    Ok(analyser.finish()?)
 }
 
 /// Decode any supported file to 48 kHz stereo, keep that source on disk, and report what
@@ -221,18 +237,76 @@ pub fn load_in_memory(path: &Path) -> Result<Loaded> {
     Loaded::from_track(track, None, source, source_hash, peaks, path)
 }
 
+/// Frames of source per read when hashing a seed: one second.
+const SEED_RANGE: usize = SAMPLE_RATE as usize;
+
+/// The ADR-006 seed's byte layout, fed in sample order.
+///
+/// The value is a compatibility contract, so the tag and the per-sample encoding live
+/// here and nowhere else.
+struct SeedHasher {
+    hasher: blake3::Hasher,
+}
+
+impl SeedHasher {
+    fn new() -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"flacify-pipeline-1");
+        Self { hasher }
+    }
+
+    fn push(&mut self, samples: &[f32]) {
+        for sample in samples {
+            self.hasher.update(&sample.to_bits().to_le_bytes());
+        }
+    }
+
+    fn finish(self) -> u64 {
+        u64::from_le_bytes(
+            self.hasher.finalize().as_bytes()[..8]
+                .try_into()
+                .expect("8 bytes"),
+        )
+    }
+}
+
 /// A seed that survives re-renders, cache keys and bug reports (ADR-006).
 pub fn seed_for(track: &Track) -> u64 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"flacify-pipeline-1");
-    for sample in &track.planar {
-        hasher.update(&sample.to_bits().to_le_bytes());
+    let mut hasher = SeedHasher::new();
+    hasher.push(&track.planar);
+    hasher.finish()
+}
+
+/// The seed [`seed_for`] returns, hashed from [`Frames`] ranges so no whole track is
+/// held.
+///
+/// A range is planar stereo while the seed is the whole track's left channel followed by
+/// its right, so each channel is hashed in its own pass over the input.
+pub fn seed_streaming(input: &dyn Frames) -> Result<u64> {
+    let mut hasher = SeedHasher::new();
+    for channel in 0..2 {
+        hash_channel(input, channel, &mut hasher)?;
     }
-    u64::from_le_bytes(
-        hasher.finalize().as_bytes()[..8]
-            .try_into()
-            .expect("8 bytes"),
-    )
+    Ok(hasher.finish())
+}
+
+/// Adds one channel of `input` to `hasher`, [`SEED_RANGE`] frames at a time.
+fn hash_channel(input: &dyn Frames, channel: usize, hasher: &mut SeedHasher) -> Result<()> {
+    let frames = input.frames();
+    let mut start = 0;
+    while start < frames {
+        let count = SEED_RANGE.min(frames - start);
+        let planar = input.read_frames(start, count)?;
+        anyhow::ensure!(
+            planar.len() == count * 2,
+            "range {start} + {count} frames came back as {} samples",
+            planar.len()
+        );
+        let offset = channel * count;
+        hasher.push(&planar[offset..offset + count]);
+        start += count;
+    }
+    Ok(())
 }
 
 /// A rendered track plus what the limiter had to do to it.
@@ -1036,7 +1110,7 @@ pub fn enhance_file(
         Job {
             session,
             cutoff_hz: Some(analysis.cutoff_hz),
-            seed: seed_for(&track),
+            seed: seed_streaming(&track)?,
             splice_low_band,
         },
         store,
@@ -1261,6 +1335,12 @@ mod tests {
         assert_eq!(loaded.source.sample_rate, decoded.sample_rate);
         assert_eq!(loaded.source.channels, decoded.channels);
         assert_eq!(loaded.peaks.len(), 1, "100 ms is one waveform second");
+        assert_eq!(
+            loaded.analysis,
+            flacify_core::dsp::cutoff::analyse(loaded.track.channel(0))
+                .expect("analysing the whole channel"),
+            "the load path's verdict is the whole-channel one"
+        );
 
         let entry = root.path.join("source").join(&loaded.source_hash);
         assert!(entry.join("source.json").is_file());
@@ -1327,6 +1407,49 @@ mod tests {
         // ADR-006: the seed is a compatibility contract, so a change here re-renders every
         // track with different noise instead of reusing the same one.
         assert_eq!(seed_for(&fixed_signal()), 8_901_150_270_194_604_865);
+        assert_eq!(
+            seed_streaming(&fixed_signal()).expect("the streamed seed"),
+            8_901_150_270_194_604_865,
+            "the range-read seed must be the same value"
+        );
+    }
+
+    #[test]
+    fn given_a_track_and_its_source_entry_when_the_seed_is_streamed_then_it_is_seed_for() {
+        // 20 000-frame segments and more than one read range, so the hash crosses segment
+        // borders and a range border: the sample order is what the value pins.
+        const SEGMENT: usize = 20_000;
+        let root = TempRoot::new("seed-streaming");
+        let frames = SEED_RANGE + 12_345;
+        let original = synthetic_track(frames);
+        let source = TempOutput::new("seed-streaming.wav");
+        crate::wav::write(&source.path, SAMPLE_RATE, 2, &original.planar).expect("writing the wav");
+        let tier = crate::source::Tier::new(&root.path, SEGMENT).expect("a tier");
+        let entry = tier
+            .build_or_reuse(&source.path, "seed-streaming")
+            .expect("building the source entry");
+
+        // The track `load` holds: the entry's own samples, after the 24-bit round trip.
+        let planar = entry.read_all().expect("reading the entry");
+        let stored = Track {
+            planar,
+            frames: entry.meta().frames,
+        };
+        assert!(stored.frames > SEED_RANGE, "the hash needs two ranges");
+        assert!(
+            stored.frames > 2 * SEGMENT,
+            "and the ranges must cross more than one segment"
+        );
+
+        assert_eq!(
+            seed_streaming(&entry).expect("streaming the entry"),
+            seed_for(&stored),
+            "a streamed seed is the whole-track seed"
+        );
+        assert_eq!(
+            seed_streaming(&stored).expect("streaming the track"),
+            seed_for(&stored)
+        );
     }
 
     /// What `enhance` and the segmented renderer get from the fake worker: it echoes the

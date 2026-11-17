@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Per-user MSI for Windows. It installs the app binary only: the Python sidecar and the
+  weights are installed by the app on first run, into the same data directory the CLI uses.
+  Paths in File Source are relative to the repository root, where candle runs.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+    Id="*"
+    Name="flacify"
+    Language="1033"
+    Version="0.3.0"
+    Manufacturer="Gabriel Rivero"
+    UpgradeCode="{6F3B6C2E-9C1A-4F1B-9E3D-2A7C5B8D4E10}">
+
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of flacify is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="FlacifyDir" Name="flacify">
+          <Directory Id="BinDir" Name="bin">
+            <Component Id="FlacifyExe" Guid="*">
+              <File Id="FlacifyExeFile" Source="target\release\flacify.exe" KeyPath="yes" />
+              <File Id="LicenseFile" Source="LICENSE" />
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="FlacifyMenu" Name="flacify">
+          <Component Id="StartMenuShortcut" Guid="*">
+            <Shortcut
+              Id="FlacifyShortcut"
+              Name="flacify"
+              Description="It's not a FLAC, but it's close enough."
+              Target="[BinDir]flacify.exe"
+              WorkingDirectory="BinDir" />
+            <RemoveFolder Id="RemoveFlacifyMenu" On="uninstall" />
+            <RegistryValue
+              Root="HKCU"
+              Key="Software\flacify"
+              Name="installed"
+              Type="integer"
+              Value="1"
+              KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Main" Title="flacify" Level="1">
+      <ComponentRef Id="FlacifyExe" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Product>
+</Wix>

@@ -2,13 +2,15 @@
 //!
 //! The child loads FlashSR once and answers binary requests on stdin and stdout
 //! (`docs/decisions.md`, ADR-010). Its log streams into a bounded tail on a background
-//! thread, so a chatty worker cannot block on a full pipe. A pipe has no read timeout,
-//! so a wedged worker blocks its caller, who drops it and spawns another.
+//! thread, so a chatty worker cannot block on a full pipe. A pipe has no read timeout, so
+//! each exchange runs under a watchdog that kills a child which stops answering; the
+//! session then restarts it.
 
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -53,6 +55,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// [`Model::latency_samples`](crate::model::Model::latency_samples) for the measurement.
 pub const MODEL_LATENCY_SAMPLES: usize = 12;
 
+/// How long one request may take before the child is considered wedged. A CPU-only
+/// machine runs a 5.12 s window at about 7x realtime (~36 s), so this is generous.
+pub const DEFAULT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Where the interpreter, the worker script and the weights live.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -66,6 +72,8 @@ pub struct WorkerConfig {
     pub flashsr_dir: Option<PathBuf>,
     /// `"mps"` or `"cpu"`; the worker falls back to CPU when Metal is unavailable.
     pub device: String,
+    /// How long one window may take before the child is killed and the caller told.
+    pub timeout: Duration,
 }
 
 /// What the loaded model reported at startup.
@@ -292,6 +300,8 @@ struct Connection {
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     stderr_thread: Option<JoinHandle<()>>,
     next_id: u64,
+    /// How long one exchange may take before the child is killed.
+    timeout: Duration,
     /// Set once the child has been reaped, so `Drop` does not reap it again.
     has_exited: bool,
 }
@@ -353,6 +363,7 @@ impl Connection {
             stderr_tail,
             stderr_thread: Some(stderr_thread),
             next_id: 0,
+            timeout: config.timeout,
             has_exited: false,
         })
     }
@@ -383,7 +394,34 @@ impl Connection {
     }
 
     /// Send one request and read its reply, checking that the reply belongs to it.
+    ///
+    /// A watchdog kills the child if it does not answer within `timeout`; the retry in
+    /// [`ResidentModel`](crate::session::ResidentModel) then starts a fresh one.
     fn exchange(&mut self, request: &Request, body: &[u8]) -> Result<(Reply, Vec<u8>)> {
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&timed_out);
+        let timeout = self.timeout;
+        let pid = self.child.id();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let watchdog = thread::spawn(move || {
+            if done_rx.recv_timeout(timeout).is_err() {
+                flag.store(true, Ordering::Relaxed);
+                kill(pid);
+            }
+        });
+        let result = self.exchange_inner(request, body);
+        let _ = done_tx.send(());
+        let _ = watchdog.join();
+        if result.is_err() && timed_out.load(Ordering::Relaxed) {
+            return Err(Error::Inference(format!(
+                "the model did not answer within {} ms",
+                timeout.as_millis()
+            )));
+        }
+        result
+    }
+
+    fn exchange_inner(&mut self, request: &Request, body: &[u8]) -> Result<(Reply, Vec<u8>)> {
         self.check_alive()?;
         self.send(request, body)?;
 
@@ -574,8 +612,22 @@ fn drain_stderr(stderr: std::process::ChildStderr, tail: &Mutex<VecDeque<String>
     }
 }
 
-/// Check that a window reply has the shape of the window that was asked for.
-/// `exit code 7` on every platform. `ExitStatus` renders as "exit status: 7" on unix
+/// Kill a child by pid, for the watchdog. Spawning `taskkill`/`kill` is acceptable here:
+/// this only runs when the worker has stopped answering.
+fn kill(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    }
+}
+
+/// Check that a window reply has the shape of the window that was asked for./// `exit code 7` on every platform. `ExitStatus` renders as "exit status: 7" on unix
 /// and "exit code: 7" on Windows, and this string ends up in a user-facing error.
 fn exit_label(status: std::process::ExitStatus) -> String {
     match status.code() {

@@ -9,6 +9,8 @@
 //! worker is ignored):
 //!
 //! * `--fail-after <n>`: exit with status 7 once `n` windows have been served.
+//! * `--hang`: read the first window and never answer, so the client's watchdog can be
+//!   tested without a wedged model.
 //! * `--garbage`: answer every request with the wrong reply magic.
 //! * `--corrupt <field>`: mangle one reply field (`status`, `shape`, `length`, `id`),
 //!   so the client's protocol checks can be tested without a hostile worker.
@@ -60,6 +62,7 @@ fn main() -> ExitCode {
 #[derive(Debug)]
 struct Options {
     fail_after: Option<u32>,
+    hang: bool,
     is_garbage: bool,
     corrupt: Option<Corrupt>,
 }
@@ -91,12 +94,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut args = args;
     let mut options = Options {
         fail_after: None,
+        hang: false,
         is_garbage: false,
         corrupt: None,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--garbage" => options.is_garbage = true,
+            "--hang" => options.hang = true,
             "--fail-after" => {
                 let raw = args
                     .next()
@@ -167,6 +172,13 @@ fn serve(options: &Options) -> io::Result<u8> {
                 let mut noise = vec![0u8; body_len(noise_len, 1)?];
                 reader.read_exact(&mut input)?;
                 reader.read_exact(&mut noise)?;
+                if options.hang {
+                    // Read the window, then never answer. The client's watchdog is what
+                    // ends this, by killing the process.
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                    }
+                }
                 // A copy, i.e. scale by 1.0, so a test can assert exact fidelity.
                 let reply = match options.corrupt {
                     None => Reply {

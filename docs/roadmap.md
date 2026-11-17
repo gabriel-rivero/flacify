@@ -140,35 +140,24 @@ Deliberately absent: playlists, library view, EQ, skins, export UI, system sink.
 
 Goal: a downloaded app that installs and starts without a terminal.
 
-**Landed 2026-11-16 — first-run setup in the window.** `flacify play` checks `is_ready()`;
-when the model is missing it opens the window on a setup screen instead of stopping with a
-CLI instruction. The screen states the size (the sum of `setup::plan()`), starts
-`setup::ensure` on a thread only after the user presses Download, shows the current step and
-its progress, offers Retry after a failure, and hands the same window to the player once the
-file opens. Cancel stops the running child through a token and keeps the finished steps;
-Resume re-enters the state machine and skips them. A full-band file or an already-cached
-render plays with no model installed at all; only a file that has to render opens the setup
-screen. `--smoke` still requires `flacify setup`, because a headless run cannot click.
+**Landed 2026-11-16 — a real app.** First-run setup in the window (size, Download, Cancel,
+Resume, per-step byte progress, a CUDA checkbox), full-band and cached files playing without
+the install, a worker that restarts after a death or a wedge, `flacify setup --cuda`,
+`flacify diagnose`, and packaging: the release workflow builds a per-user Windows `.msi`, an
+unsigned macOS `.dmg` with `Flacify.app`, and a Linux `.deb`.
 
 Still to do:
 
-- Installer: `.msi` on Windows, `.app` + notarisation on macOS, AppImage/.deb on Linux.
-- Code signing. A `v*` tag already attaches a raw Windows `flacify.exe` from
-  `.github/workflows/release.yml`.
-- Per-step byte progress: **done 2026-11-16** — a monitor walks the step's target
-  directory every 400 ms, so the bar moves instead of jumping 0→100.
-- A hardware gate: **partly here (2026-11-16)** — the window names CPU inference and says
-  the switch may never unlock, while the original keeps playing. RAM/VRAM detection and a
-  passthrough choice at launch are still open.
-- Choosing the CUDA torch wheel: **partly here (2026-11-16)** — `flacify setup --cuda`
-  selects the `cu132` index without an environment variable. The in-window setup does not
-  offer it yet, and there is no auto-detection.
-- Worker supervision: a dead child is replaced and the window retried once; a model that
-  wedges with no output and no error still blocks its caller (gap 10).
-- Opt-in diagnostics to a local log file only. No network.
+- Code signing and notarisation. The `.msi`, `.dmg` and `.deb` are unsigned, and macOS
+  Gatekeeper needs right-click → Open (or `xattr -dr com.apple.quarantine`).
+- RAM/VRAM detection for the hardware gate. The CPU warning and passthrough are there.
+- Auto-detecting an NVIDIA GPU; the CUDA wheel is a manual checkbox and `--cuda`.
+- Resume inside a setup step: a dropped connection still restarts that step.
+- An end-to-end setup test (network + 6.9 GB); the state machine and cancellation are
+  tested, the download is not.
 
 Exit: a clean machine installs from the window, plays a file, and a second run uses the
-install without contacting the network.
+install without contacting the network — met, with unsigned artifacts.
 
 ## v0.4 — streaming and cache polish
 
@@ -269,11 +258,11 @@ release where it should land.
    check that the installed sidecar actually imports before declaring success. Windows is
    now installed end to end (4.2 GiB on a CPU-only machine, 6.9 GiB on W2 with the CUDA
    wheels) and setup is idempotent; that run found the `uv` pre-download bug in gap 11.
-10. ~~The worker is not supervised.~~ **Partly done (2026-11-16):** a worker that dies
-    between windows is dropped and replaced, and that window is retried once on the fresh
-    child, so one death costs a load rather than the track (tested with the fake sidecar).
-    A model that wedges with no output and no error still blocks its caller; catching that
-    needs a timeout on the exchange, not just a restart.
+10. ~~The worker is not supervised.~~ **Done (2026-11-16):** a worker that dies between
+    windows is dropped and replaced, and that window is retried once on the fresh child.
+    Each exchange also runs under a 120 s watchdog, so a model that stops answering is
+    killed and handled by the same retry instead of blocking forever (tested with the fake
+    sidecar's `--hang` and `--fail-after`).
 11. **Platform coverage is one machine plus Linux and Windows runs.** The portable-core work is
     done: uv's Windows `.zip` is handled, the audio callback covers every integer and
     float sample format cpal exposes, a refused `BufferSize::Fixed` falls back to the
@@ -393,9 +382,9 @@ not do, in the order it would hurt:
    Full-band files play with no model; cache hits are found by audio and settings when the
    model id cannot be computed, and older entries are annotated on the next ready play.
    `--smoke` reports the requirement instead of opening a window.
-5. **No accelerator choice on the screen.** The plan installs PyPI's CPU torch; a CUDA
-   machine still has to set `FLACIFY_TORCH_INDEX` before the first run. The screen should
-   detect and offer the CUDA wheel (gap 11).
+5. ~~No accelerator choice on the screen.~~ **Done (2026-11-16):** the setup screen offers
+   the CUDA wheel, and `flacify setup --cuda` covers the CLI. Nothing auto-detects an NVIDIA
+   GPU yet, so the box is manual.
 6. **Verification is size-only.** The plan's bytes label the download; the weights step
    checks sizes, not a checksum. The CLI has the same limitation (E7-1).
 7. **The window is fixed at 560×560 and does not scroll.** A long failure message can push

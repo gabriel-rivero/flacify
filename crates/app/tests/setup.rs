@@ -688,3 +688,10 @@ fn given_a_cancelled_token_when_ensuring_cancellably_then_it_returns_before_any_
         ensure_cancellable(&paths, Progress::default(), &token).expect_err("cancelled setup");
     assert!(setup::is_cancelled(&error), "{error:#}");
 }
+
+#[test]
+fn given_a_root_when_paths_are_built_for_a_test_then_they_use_it() {
+    let root = env::temp_dir().join(format!("flacify-paths-{}", std::process::id()));
+    let paths = Paths::at(root.clone());
+    assert_eq!(paths.root(), root.as_path());
+}

@@ -9,8 +9,8 @@
 //!
 //! A failed exchange leaves the protocol stream in an unknown state. The model is dropped
 //! on the spot so the child is killed, and the window is retried once on a fresh child, so
-//! one worker death costs a load rather than the track. A worker that wedges with no output
-//! and no error still blocks its caller; only a timeout would catch that.
+//! one worker death costs a load rather than the track. A worker that stops answering is
+//! killed by the exchange watchdog and handled by the same retry.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -189,6 +189,7 @@ mod tests {
             model_dir: PathBuf::from("/nonexistent/models"),
             flashsr_dir: None,
             device: "cpu".to_string(),
+            timeout: crate::python::DEFAULT_EXCHANGE_TIMEOUT,
         }
     }
 

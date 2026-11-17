@@ -93,9 +93,9 @@ doc line that would have been wrong. No issue closes on "works on my machine".
 | E7-1 | Model download: resume, checksum, mirror, cancel | survives a killed connection at 90% — partial 2026-11-16: cancel stops the running child and finished steps are kept; resume inside a step, checksum and a mirror are still missing |
 | E7-2 | Manual model-file escape hatch | user can point at a local `.onnx` |
 | E7-3 | Licence screen + attribution screen (`cargo-about`) | shown once, stored |
-| E7-4 | macOS `.app` + `.dmg`, signed and notarised | launches on a clean Mac with no dialog |
-| E7-5 | Windows `.msi` (unsigned), Linux AppImage + `.deb` | installs and plays — partial 2026-11-16: a `v*` tag attaches a raw `flacify.exe`; no installer yet |
-| E7-6 | `flacify diagnose` bundle | one file to paste into an issue |
+| E7-4 | macOS `.app` + `.dmg`, signed and notarised | launches on a clean Mac with no dialog — partial 2026-11-16: an unsigned `Flacify.app` in a `.dmg` is built; signing and notarisation need a certificate |
+| E7-5 | Windows `.msi` (unsigned), Linux AppImage + `.deb` | installs and plays — partial 2026-11-16: an unsigned per-user `.msi`, the raw `.exe` and a `.deb` are built; no AppImage |
+| E7-6 | `flacify diagnose` bundle | one file to paste into an issue — **done 2026-11-16**: versions, paths, install state, cache size and model files; nothing uploaded |
 
 ## E8 — Quality harness
 

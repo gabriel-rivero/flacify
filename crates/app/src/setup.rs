@@ -213,6 +213,12 @@ impl Paths {
         Ok(Paths { root })
     }
 
+    /// A root for tests, without touching the environment.
+    #[cfg(test)]
+    pub(crate) fn at(root: impl Into<PathBuf>) -> Paths {
+        Paths { root: root.into() }
+    }
+
     /// The data directory itself.
     pub fn root(&self) -> &Path {
         &self.root
@@ -426,7 +432,7 @@ fn step_root(id: &str, paths: &Paths) -> PathBuf {
 
 /// Total size of the regular files under `path`, ignoring symlinks (which can point
 /// outside the tree and, on a bad day, loop).
-fn dir_size(path: &Path) -> u64 {
+pub(crate) fn dir_size(path: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(path) else {
         return 0;
     };

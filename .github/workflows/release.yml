@@ -9,28 +9,153 @@ permissions:
 
 jobs:
   windows:
-    name: build windows exe
+    name: windows (exe + msi)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
 
-      # The workspace already builds and tests on windows-latest, so a release build
-      # needs nothing beyond the toolchain. The exe is the app alone: `flacify setup`
-      # still has to run once on the target machine for the sidecar and the weights.
       - name: Build the release binary
         run: cargo build --release --bin flacify
 
-      - name: Attach the exe to the release
-        uses: softprops/action-gh-release@v2
+      - name: Install WiX
+        shell: pwsh
+        run: choco install wixtoolset --no-progress -y
+
+      - name: Build the MSI
+        shell: pwsh
+        run: |
+          $candle = Get-ChildItem "${env:ProgramFiles(x86)}\WiX Toolset*\bin\candle.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $candle) { throw "candle.exe not found after installing WiX" }
+          $light = Join-Path $candle.DirectoryName "light.exe"
+          & $candle.FullName packaging\flacify.wxs -out target\release\flacify.wixobj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $light target\release\flacify.wixobj -out target\release\flacify.msi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
         with:
-          files: target/release/flacify.exe
+          name: windows
+          path: |
+            target/release/flacify.exe
+            target/release/flacify.msi
+
+  macos:
+    name: macos (app + dmg)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the release binary
+        run: cargo build --release --bin flacify
+
+      - name: Bundle the app and make the dmg
+        run: |
+          APP=target/release/Flacify.app
+          mkdir -p "$APP/Contents/MacOS"
+          cp target/release/flacify "$APP/Contents/MacOS/flacify"
+          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>flacify</string>
+            <key>CFBundleDisplayName</key><string>flacify</string>
+            <key>CFBundleIdentifier</key><string>com.gabrielrivero.flacify</string>
+            <key>CFBundleVersion</key><string>0.3.0</string>
+            <key>CFBundleShortVersionString</key><string>0.3.0</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleExecutable</key><string>flacify</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          chmod +x "$APP/Contents/MacOS/flacify"
+          hdiutil create -volname flacify -srcfolder "$APP" -ov -format UDZO target/release/flacify.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: target/release/flacify.dmg
+
+  linux:
+    name: linux (deb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install audio and window system headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libgl1-mesa-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libxinerama-dev libxkbcommon-dev libwayland-dev
+
+      - name: Build the release binary
+        run: cargo build --release --bin flacify
+
+      - name: Build the .deb
+        run: |
+          VERSION=0.3.0
+          ROOT=target/deb
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/share/applications"
+          cp target/release/flacify "$ROOT/usr/bin/flacify"
+          cat > "$ROOT/DEBIAN/control" <<EOF
+          Package: flacify
+          Version: $VERSION
+          Section: sound
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Gabriel Rivero <gabriel.rivero.sa@gmail.com>
+          Depends: libasound2 | libasound2t64, libx11-6, libxcursor1, libxrandr2, libxi6, libxinerama1, libxkbcommon0, libwayland-client0
+          Description: A desktop player that reconstructs the high frequencies lossy audio threw away.
+          EOF
+          cat > "$ROOT/usr/share/applications/flacify.desktop" <<'EOF'
+          [Desktop Entry]
+          Name=flacify
+          Exec=flacify play %f
+          Type=Application
+          Categories=AudioVideo;Audio;Player;
+          MimeType=audio/mpeg;audio/flac;audio/x-wav;audio/ogg;audio/mp4;
+          EOF
+          dpkg-deb --build "$ROOT" "target/release/flacify_${VERSION}_amd64.deb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: target/release/flacify_0.3.0_amd64.deb
+
+  publish:
+    name: publish the release
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
           fail_on_unmatched_files: true
           body: |
-            `flacify.exe` is the app. The first `flacify play` opens a setup screen and
-            downloads the Python sidecar, wheels and weights (about 6.9 GB); `flacify setup`
-            does the same from a terminal. A machine without a CUDA or Metal accelerator
-            renders slower than realtime; it still plays, and the A/B switch unlocks late.
+            flacify 0.3.0 — the player, now a real app.
+
+            - **Windows:** `flacify.msi` (per-user install, Start Menu shortcut) or the raw `flacify.exe`.
+            - **macOS:** `flacify.dmg` with `Flacify.app`. Nothing is signed yet; right-click → Open,
+              or `xattr -dr com.apple.quarantine /Applications/Flacify.app`.
+            - **Linux:** `flacify_0.3.0_amd64.deb` (unsigned).
+
+            The first `flacify play` opens a setup screen and downloads the Python sidecar,
+            wheels and weights (about 6.9 GB with CUDA, 4.2 GB without); `flacify setup` does
+            the same from a terminal. A full-band file or an already-cached render plays
+            without the model, and Cancel keeps the finished steps for the next run.

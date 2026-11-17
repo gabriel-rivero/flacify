@@ -23,6 +23,7 @@ fn config() -> WorkerConfig {
         model_dir: PathBuf::from("unused"),
         flashsr_dir: Some(PathBuf::from("unused/flashsr")),
         device: "fake".to_string(),
+        timeout: flacify_infer::python::DEFAULT_EXCHANGE_TIMEOUT,
     }
 }
 
@@ -261,4 +262,26 @@ fn given_a_reply_with_a_bad_magic_when_spawning_then_the_handshake_fails() {
         Error::Inference(message) => assert!(message.contains("bad reply magic"), "{message}"),
         other => panic!("expected an inference error, got {other:?}"),
     }
+}
+
+#[test]
+fn given_a_worker_that_reads_but_never_answers_when_a_window_runs_then_it_times_out() {
+    let mut config = config();
+    config.timeout = std::time::Duration::from_millis(200);
+    let mut worker = PythonWorker::spawn_with_args(&config, &["--hang".to_string()])
+        .expect("the fake worker should start");
+
+    let started = std::time::Instant::now();
+    let error = worker
+        .run(&signal(2 * WINDOW), &noise(NOISE_LEN_STEREO), 2, WINDOW)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("did not answer within"),
+        "{error}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the watchdog took {:?}",
+        started.elapsed()
+    );
 }

@@ -44,10 +44,12 @@ See the platform gap in [`docs/roadmap.md`](docs/roadmap.md).
 ```sh
 cargo build --release
 ./target/release/flacify setup                 # once, 4-7 GB; the window does it on first play too
+./target/release/flacify setup --cuda          # the CUDA torch wheel on an NVIDIA machine
 ./target/release/flacify probe song.mp3        # cutoff, verdict, wait
 ./target/release/flacify enhance song.mp3      # -> song.mp3.flacify.wav
 ./target/release/flacify play song.mp3         # window: space toggles, p plays, drag to seek, drop a file
 ./target/release/flacify play song.mp3 --smoke # headless audio-path check
+./target/release/flacify diagnose              # -> flacify-diagnose.txt
 ```
 
 Measured on an M5 Max: a 30.7 s clip renders in 34.1 s (including the 8 s worker start)
@@ -60,11 +62,17 @@ not level (see
 ## Releases
 
 Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
-which builds the Windows binary and attaches `flacify.exe` to the GitHub release. It is the
-app only: the first `flacify play` opens a setup screen and downloads the Python sidecar,
-wheels and weights (about 6.9 GB with the CUDA wheels); `flacify setup` does the same from a
-terminal. There is no installer or code signing yet; that is the rest of v0.3 in
-[`docs/roadmap.md`](docs/roadmap.md).
+which builds and attaches:
+
+- **Windows:** `flacify.msi` (per-user install, Start Menu shortcut) and the raw `flacify.exe`.
+- **macOS:** `flacify.dmg` containing `Flacify.app`.
+- **Linux:** `flacify_0.3.0_amd64.deb`.
+
+Nothing is signed or notarised yet: on macOS, right-click → Open (or
+`xattr -dr com.apple.quarantine /Applications/Flacify.app`) the first time. The first
+`flacify play` opens a setup screen and downloads the Python sidecar, wheels and weights
+(about 6.9 GB with the CUDA wheels); `flacify setup` does the same from a terminal. A
+full-band file or an already-cached render plays without the model.
 
 ## The one-paragraph pitch
 

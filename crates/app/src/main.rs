@@ -8,6 +8,7 @@
 mod cache;
 mod decode;
 mod device;
+mod diagnose;
 mod first_run;
 mod frontier;
 mod limit;
@@ -82,6 +83,12 @@ enum Command {
         #[arg(long)]
         smoke: bool,
     },
+    /// Write a text file with versions, paths and install state for a bug report.
+    Diagnose {
+        /// Defaults to flacify-diagnose.txt in the current directory.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -99,6 +106,11 @@ fn main() -> Result<()> {
             smoke,
             splice,
         } => play(&file, smoke, splice),
+        Command::Diagnose { out } => {
+            let path = diagnose::run(out)?;
+            println!("wrote {}", path.display());
+            Ok(())
+        }
     }
 }
 

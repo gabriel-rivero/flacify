@@ -71,6 +71,8 @@ pub struct FirstRun {
     state: Arc<SetupState>,
     /// The token for the running install; a fresh one is made on each attempt.
     cancel: setup::Cancel,
+    /// Install the CUDA torch wheel instead of PyPI's CPU one.
+    cuda: bool,
     started: bool,
     /// Set once the install is ready and the file has been opened.
     player: Option<ui::PlayerApp>,
@@ -85,6 +87,7 @@ impl FirstRun {
             splice,
             state: Arc::new(SetupState::default()),
             cancel: setup::Cancel::default(),
+            cuda: false,
             started: false,
             player: None,
             error: None,
@@ -93,6 +96,12 @@ impl FirstRun {
 
     /// Run the download on its own thread; the window stays responsive and can be closed.
     fn start(&mut self) {
+        if self.cuda
+            && std::env::var_os("FLACIFY_TORCH_INDEX").is_none()
+            && !cfg!(target_os = "macos")
+        {
+            std::env::set_var("FLACIFY_TORCH_INDEX", setup::CUDA_TORCH_INDEX);
+        }
         self.state = Arc::new(SetupState::default());
         self.cancel = setup::Cancel::default();
         self.started = true;
@@ -195,6 +204,13 @@ impl eframe::App for FirstRun {
                     self.start();
                 }
             } else if !self.started {
+                if !cfg!(target_os = "macos") {
+                    ui.checkbox(
+                        &mut self.cuda,
+                        "Use the CUDA build of PyTorch (NVIDIA GPU, about 2.5 GB larger)",
+                    );
+                    ui.add_space(6.0);
+                }
                 if ui
                     .add(egui::Button::new("Download and set up").min_size(egui::vec2(220.0, 34.0)))
                     .clicked()

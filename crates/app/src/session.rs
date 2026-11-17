@@ -330,6 +330,7 @@ fn worker_config(paths: &setup::Paths) -> WorkerConfig {
         model_dir: paths.models_dir(),
         flashsr_dir: Some(paths.flashsr_dir()),
         device: "auto".to_string(),
+        timeout: flacify_infer::python::DEFAULT_EXCHANGE_TIMEOUT,
     }
 }
 

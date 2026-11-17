@@ -556,3 +556,36 @@ evidence for the fix.
    working venv. Readiness now ignores the receipt's one environment-dependent line
    (`torch-index …`); `ensure` still compares the whole manifest, so changing the index
    re-runs the step.
+
+## The FLAC cache container (2026-11-17)
+
+The v0.3 cache is float WAV because `flacenc`'s output did not decode. This is the
+measurement that explains it, and the size the segmented cache will actually pay.
+
+**Decoding, on a 3.0 s 48 kHz 24-bit stereo file** (two tones, 441 Hz left and 1.5 kHz
+right, so a channel mix-up is visible):
+
+| reader | `flacenc` 0.5.1 output | after the `STREAMINFO` fix |
+|---|---|---|
+| symphonia 0.5.5 | **cannot probe**: `IoError: end of stream` | 144000/144000 frames, L and R `max_abs = 0.0` |
+| claxon 0.4.3 | exact, both channels | exact, both channels |
+| libFLAC (`flac -t`) | warning: "sample or frame number does not increase correctly" | ok |
+
+`STREAMINFO` says `min_blocksize = 640`, `max_blocksize = 4096`, because the last frame is
+short, while every frame header carries the fixed-blocking-strategy bit. libFLAC writes
+min = max = the block size for the same input, and the file then reads everywhere. Calling
+`stream_info_mut().set_block_sizes(block, block)` after `encode_with_fixed_block_size` and
+before `Stream::write` produces the libFLAC layout through the public API.
+
+**Size and speed, 28.84 s (1 384 320 frames) of 48 kHz stereo**, pink noise, so the
+worst case for a lossless codec (M5 Max, 2026-11-17):
+
+| container | bytes | share of float WAV | encode wall time |
+|---|---|---|---|
+| float WAV (today's cache) | 11 074 560 | 100% | n/a |
+| 24-bit WAV | 8 306 022 | 75% | n/a |
+| `flacenc` 24-bit FLAC | 6 161 396 | 56% | 0.03 s (~960× realtime, multithreaded) |
+| libFLAC 24-bit FLAC | 3 439 904 | 31% | 0.05 s |
+
+Music compresses better than pink noise, so the real cache ratio sits between the two FLAC
+rows. Encoding costs under 0.5% of the model's render time either way.

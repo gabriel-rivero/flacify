@@ -199,12 +199,41 @@ fn analysis_of(channel: &[f32]) -> Result<flacify_core::dsp::cutoff::Analysis> {
     Ok(analyser.finish()?)
 }
 
+/// The band limit of a range source, pushed a second at a time: what a complete cache entry
+/// needs before it can say whether it would render anything, without holding the track.
+///
+/// The chunks are [`ANALYSIS_CHUNK`]-frame slices of the left channel, the same ones
+/// [`analysis_of`] pushes, so a range source gives the verdict a whole track does.
+pub fn analyse_streaming(input: &dyn Frames) -> Result<flacify_core::dsp::cutoff::Analysis> {
+    let frames = input.frames();
+    let mut analyser = flacify_core::dsp::cutoff::chunked();
+    let mut start = 0;
+    while start < frames {
+        let count = ANALYSIS_CHUNK.min(frames - start);
+        let planar = input.read_frames(start, count)?;
+        anyhow::ensure!(
+            planar.len() == count * 2,
+            "range {start} + {count} frames came back as {} samples",
+            planar.len()
+        );
+        analyser.push(&planar[..count])?;
+        start += count;
+    }
+    Ok(analyser.finish()?)
+}
+
 /// Decode any supported file to 48 kHz stereo, keep that source on disk, and report what
 /// the spectrum looks like.
 ///
 /// `cache_root` is the render cache's directory; the source tier lives in its `source/`.
 pub fn load(path: &Path, cache_root: &Path) -> Result<Loaded> {
     let source_hash = crate::cache::source_hash(path)?;
+    load_hashed(path, cache_root, source_hash)
+}
+
+/// [`load`] with the file's hash already computed, so a caller that needed it for a cache
+/// lookup does not read the whole file twice.
+pub fn load_hashed(path: &Path, cache_root: &Path, source_hash: String) -> Result<Loaded> {
     let frames_per_segment = crate::cache::frames_per_segment(WINDOW, OVERLAP)?;
     let tier = crate::source::Tier::new(cache_root, frames_per_segment)?;
     let entry = tier.build_or_reuse(path, &source_hash)?;
@@ -1411,6 +1440,17 @@ mod tests {
             seed_streaming(&fixed_signal()).expect("the streamed seed"),
             8_901_150_270_194_604_865,
             "the range-read seed must be the same value"
+        );
+    }
+
+    #[test]
+    fn given_a_track_when_analysed_a_range_at_a_time_then_the_verdict_is_the_whole_channel() {
+        // Two analysis chunks and a partial third, so the carry crosses a chunk boundary.
+        let track = synthetic_track(ANALYSIS_CHUNK * 2 + 12_345);
+        assert_eq!(
+            analyse_streaming(&track).expect("streamed"),
+            analysis_of(track.channel(0)).expect("whole"),
+            "a range-fed analysis must not decide differently from a whole-channel one"
         );
     }
 

@@ -226,7 +226,8 @@ The app crate is small on purpose, one module per job:
 | `decode.rs` | symphonia → planar f32, channel map, polyphase resample to 48 kHz |
 | `render.rs` | decode + analyse + the pipeline over the shared worker, one track at a time |
 | `session.rs` | one resident worker for the window, the cache, and a file becoming playback |
-| `player.rs` | the mixer: two buffers, one position, an 8 ms ramp, atomics only |
+| `player.rs` | the mixer: two signals, one position, an 8 ms ramp, atomics only |
+| `segments.rs` | segmented playback: a prefetch worker decoding cache and source segments |
 | `device.rs` | `cpal` output: config, one-time resample, channel map, callback |
 | `setup.rs` | first-run provisioning: uv, CPython, wheels, weights, resumable state |
 | `ui.rs` | the egui window: one toggle, one transport, progress |
@@ -292,9 +293,14 @@ problem, and it buys seek, instant replay, and a zero-GPU second listen.
   decode+resample pass writes it; `source.json` records the native rate and channels, the
   segment table, one RMS pair per second for the waveform, and the `frames_per_segment`
   a reader checks on open. A range read decodes only the segments it touches.
-- **Playback from cache**: two readers (original 48 kHz and enhanced) at the same
-  position. Toggle is a crossfade with `D = 0`. Unrendered regions fall back to
-  passthrough and are drawn differently on the waveform.
+- **Playback from cache**: one segment reader answers for both sides (the source tier's
+  original and the entry's enhanced audio) on the same segment grid, so the toggle is a
+  crossfade with `D = 0` and the playhead is an index into a decoded segment. A worker
+  thread decodes the segment at the playhead and the next one and keeps at most three
+  resident, so a complete entry is never decoded whole. A segment that is not decoded yet
+  falls back to passthrough; a seek past the prefetch holds until the worker catches up.
+  The first play of an uncached track still holds the whole source, and is drawn
+  differently on the waveform.
 - **Eviction**: LRU against a user-set cap (default 20 GB), never evict the file
   currently open, always keep the manifest.
 - **Writer**: one segment at a time, each written whole and renamed into place; the

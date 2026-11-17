@@ -6,7 +6,8 @@
 //! and the UI talks to it through atomics only.
 //!
 //! If the device does not run at 48 kHz (many do not), both buffers are resampled once
-//! here, before playback, so the callback never has to.
+//! here, before playback, so the callback never has to. Segment playback has no buffers to
+//! resample, so it is offered only on a 48 kHz stereo device.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use flacify_core::dsp::resample::Resampler;
 
 use crate::frontier::Frontier;
 use crate::player::{Controls, Mixer};
+use crate::segments::Reader;
 
 /// Bigger than any buffer a device asked us for in practice; the callback clamps to it
 /// rather than allocating.
@@ -30,7 +32,8 @@ pub struct AudioEngine {
     pub device_rate: u32,
     pub device_channels: usize,
     /// The signals themselves, shared with the mixer (an `Arc` clone, not a copy), so
-    /// the window can draw a spectrum of what is playing.
+    /// the window can draw a spectrum of what is playing. Empty on the segmented path,
+    /// which holds no whole-track buffer.
     pub display_original: Arc<[f32]>,
     pub display_generated: Option<Arc<[f32]>>,
     pub stream_errors: Arc<AtomicUsize>,
@@ -63,6 +66,21 @@ impl AudioEngine {
         let prepared = prepare(original, output.rate, output.channels)?;
         let (mixer, controls) =
             Mixer::progressive(prepared, frontier, output.channels, output.rate);
+        output.start(mixer, controls)
+    }
+
+    /// Play a complete cache entry from its segments: nothing is resampled here, so the
+    /// device has to be 48 kHz stereo.
+    pub fn start_segmented(reader: Arc<Reader>) -> Result<Self> {
+        let output = Output::open()?;
+        if output.rate != flacify_core::SAMPLE_RATE || output.channels != 2 {
+            anyhow::bail!(
+                "segment playback needs a 48 kHz stereo device; this one is {} Hz with {} channels",
+                output.rate,
+                output.channels
+            );
+        }
+        let (mixer, controls) = Mixer::segmented(reader, output.rate);
         output.start(mixer, controls)
     }
 }
@@ -115,8 +133,8 @@ impl Output {
     }
 
     fn start(mut self, mixer: Mixer, controls: Arc<Controls>) -> Result<AudioEngine> {
-        let display_original = Arc::clone(mixer.original_arc());
-        let display_generated = mixer.generated_arc();
+        let display_original = mixer.display_original().unwrap_or_default();
+        let display_generated = mixer.display_generated();
         let stream_errors = Arc::new(AtomicUsize::new(0));
         // A fixed buffer size is a request, not a guarantee: WASAPI in shared mode and
         // some ALSA configurations refuse it. Ask for the small one, fall back to

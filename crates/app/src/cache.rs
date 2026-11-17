@@ -98,10 +98,11 @@ pub struct Meta {
     pub peak_before: f32,
     pub peak_after: f32,
     pub limited_samples: usize,
-    /// Loudness gain applied to the generated side, in dB. Recorded so a cache hit can
-    /// still report it.
+    /// Loudness gain applied to the generated side, in dB; `None` until a writer records
+    /// it. The renderer fixes it from segment 0 and every later segment needs it, so it is
+    /// written before the first segment rather than only when the entry completes.
     #[serde(default)]
-    pub gain_db: f64,
+    pub gain_db: Option<f64>,
     /// The device the render ran on. Informational: a cache hit on another device is
     /// accepted, which is a deliberate prototype compromise (fp32 devices agree to
     /// within the gate, but they are not bit-identical).
@@ -171,6 +172,19 @@ pub struct Report {
     pub limit: crate::limit::LimitReport,
     pub device: String,
     pub gain_db: f64,
+}
+
+/// What a render has established before its entry is complete.
+///
+/// `finish` records these too, but a resumed render cannot recompute them for the segments
+/// another process wrote: the gain comes from the first block of the track, and the
+/// limiter's report covers samples the resumed pass never sees.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EntryProgress {
+    /// The gain segment 0 fixed, or `None` until its first block has been measured.
+    pub gain_db: Option<f64>,
+    /// What the limiter did to the segments on disk so far.
+    pub limit: crate::limit::LimitReport,
 }
 
 pub struct Cache {
@@ -377,7 +391,6 @@ impl Cache {
     /// Start an entry, or resume the partial one at `key`; a complete entry is never
     /// reopened. Segments a killed writer left are adopted when they fit their index and
     /// removed when they do not, and a recorded segment is never rewritten.
-    #[allow(dead_code)] // The segment scheduler starts entries; no shipping path does yet.
     pub fn begin(&self, key: &str, spec: &EntrySpec) -> Result<EntryWriter> {
         self.begin_at(&self.entry_dir(key), spec)
     }
@@ -433,7 +446,7 @@ impl Cache {
                     peak_before: 0.0,
                     peak_after: 0.0,
                     limited_samples: 0,
-                    gain_db: 0.0,
+                    gain_db: None,
                     device: String::new(),
                     state: State::Partial,
                     rendered_frames: 0,
@@ -515,6 +528,49 @@ impl EntryWriter {
         write_manifest(&self.dir, &self.meta)
     }
 
+    /// Whether the entry already holds segment `index`. A resumed render skips those: a
+    /// recorded segment is never rewritten.
+    pub fn has_segment(&self, index: usize) -> bool {
+        self.meta
+            .segments
+            .iter()
+            .any(|segment| segment.index == index)
+    }
+
+    /// What the entry records about the render so far. A resumed render starts from this
+    /// instead of re-rendering the segments on disk to recover their gain and report.
+    pub fn progress(&self) -> EntryProgress {
+        EntryProgress {
+            gain_db: self.meta.gain_db,
+            limit: crate::limit::LimitReport {
+                peak_before: self.meta.peak_before,
+                peak_after: self.meta.peak_after,
+                limited_samples: self.meta.limited_samples,
+            },
+        }
+    }
+
+    /// Record what the render has established, so a kill does not lose it. The gain is
+    /// written before the first segment because a resumed render cannot compute it, and
+    /// the limiter's report after each segment because it covers only the audio written.
+    pub fn record_progress(&mut self, progress: &EntryProgress) -> Result<()> {
+        anyhow::ensure!(
+            !self.is_finished,
+            "{} is a complete entry, and a finished entry is not reopened",
+            self.dir.display()
+        );
+        anyhow::ensure!(
+            self.meta.gain_db.is_none() || progress.gain_db.is_some(),
+            "{} already records its loudness gain",
+            self.dir.display()
+        );
+        self.meta.gain_db = progress.gain_db;
+        self.meta.peak_before = progress.limit.peak_before;
+        self.meta.peak_after = progress.limit.peak_after;
+        self.meta.limited_samples = progress.limit.limited_samples;
+        write_manifest(&self.dir, &self.meta)
+    }
+
     /// Mark the entry complete, which is what makes it readable. Refuses while the
     /// segment table does not partition the frames, leaving the entry partial.
     pub fn finish(&mut self, report: &Report) -> Result<PathBuf> {
@@ -530,7 +586,7 @@ impl EntryWriter {
         completed.peak_after = report.limit.peak_after;
         completed.limited_samples = report.limit.limited_samples;
         completed.device = report.device.clone();
-        completed.gain_db = report.gain_db;
+        completed.gain_db = Some(report.gain_db);
         // In memory only once it is on disk, so a failed write leaves the writer partial.
         write_manifest(&self.dir, &completed)?;
         self.meta = completed;
@@ -541,7 +597,6 @@ impl EntryWriter {
     /// Stop writing and leave the entry partial for the next `begin` to resume. Segments
     /// are never deleted: a kill leaves the same state, and a caller that dies never
     /// reaches this call.
-    #[allow(dead_code)] // The segment scheduler abandons a cancelled render.
     pub fn abandon(self) {}
 }
 
@@ -656,7 +711,7 @@ fn validate_partial(manifest: &Path, meta: &Meta) -> Result<()> {
 
 /// How many frames segment `index` of a `frames`-frame track holds, or `None` when the
 /// index is past the last segment.
-fn expected_segment_frames(
+pub(crate) fn expected_segment_frames(
     frames: usize,
     frames_per_segment: usize,
     index: usize,
@@ -1584,6 +1639,70 @@ mod tests {
     }
 
     #[test]
+    fn given_a_partial_entry_when_its_progress_is_recorded_then_beginning_it_again_reads_that_back()
+    {
+        let root = temp_cache("progress");
+        let cache = Cache::new(root.clone());
+        let (fields, frames, render) = four_segments();
+        let progress = EntryProgress {
+            gain_db: Some(1.25),
+            limit: LimitReport {
+                peak_before: 0.97,
+                peak_after: 0.95,
+                limited_samples: 11,
+            },
+        };
+        let mut writer = cache
+            .begin("key", &spec(frames, &fields))
+            .expect("beginning");
+        writer
+            .record_progress(&progress)
+            .expect("recording the progress");
+        writer
+            .write_segment(0, &segment_planar(&render, frames, 0))
+            .expect("writing a segment");
+        writer.abandon();
+
+        let resumed = cache
+            .begin("key", &spec(frames, &fields))
+            .expect("resuming");
+        assert_eq!(
+            resumed.progress(),
+            progress,
+            "a resume needs the gain and the report it did not render"
+        );
+        assert!(resumed.has_segment(0));
+        assert!(!resumed.has_segment(1));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_recorded_gain_when_progress_without_one_is_recorded_then_the_writer_refuses() {
+        let root = temp_cache("progress-gain");
+        let cache = Cache::new(root.clone());
+        let (fields, frames, _) = four_segments();
+        let mut writer = cache
+            .begin("key", &spec(frames, &fields))
+            .expect("beginning");
+        writer
+            .record_progress(&EntryProgress {
+                gain_db: Some(0.5),
+                ..Default::default()
+            })
+            .expect("recording a gain");
+
+        let error = writer
+            .record_progress(&EntryProgress::default())
+            .expect_err("a recorded gain is not cleared");
+        assert!(
+            format!("{error:#}").contains("already records its loudness gain"),
+            "{error:#}"
+        );
+        assert_eq!(writer.progress().gain_db, Some(0.5));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn given_a_written_entry_when_finished_then_load_returns_every_sample_bit_exactly() {
         let root = temp_cache("writer-roundtrip");
         let cache = Cache::new(root.clone());
@@ -1602,7 +1721,7 @@ mod tests {
         let cached = cache.load("key").expect("loading").expect("an entry");
         assert_eq!(cached.meta.state, State::Complete);
         assert_eq!(cached.meta.rendered_frames, frames);
-        assert_eq!(cached.meta.gain_db, -1.5);
+        assert_eq!(cached.meta.gain_db, Some(-1.5));
         assert_eq!(cached.meta.device, "cpu");
         assert_eq!(cached.meta.peak_before, 0.75);
         assert_eq!(cached.meta.peak_after, 0.5);

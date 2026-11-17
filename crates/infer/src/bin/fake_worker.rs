@@ -8,6 +8,7 @@
 //! Flags, anywhere on the command line (everything `PythonWorker` passes for the real
 //! worker is ignored):
 //!
+//! * `--gain <f32>`: scale every echoed window, so a render measures a nonzero gain.
 //! * `--fail-after <n>`: exit with status 7 once `n` windows have been served.
 //! * `--hang`: read the first window and never answer, so the client's watchdog can be
 //!   tested without a wedged model.
@@ -61,6 +62,7 @@ fn main() -> ExitCode {
 
 #[derive(Debug)]
 struct Options {
+    gain: f32,
     fail_after: Option<u32>,
     hang: bool,
     is_garbage: bool,
@@ -93,6 +95,7 @@ impl Corrupt {
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut args = args;
     let mut options = Options {
+        gain: 1.0,
         fail_after: None,
         hang: false,
         is_garbage: false,
@@ -102,6 +105,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options, String> {
         match arg.as_str() {
             "--garbage" => options.is_garbage = true,
             "--hang" => options.hang = true,
+            "--gain" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--gain needs a factor".to_string())?;
+                options.gain = raw
+                    .parse::<f32>()
+                    .map_err(|_| format!("--gain {raw} is not a number"))?;
+            }
             "--fail-after" => {
                 let raw = args
                     .next()
@@ -180,6 +191,7 @@ fn serve(options: &Options) -> io::Result<u8> {
                     }
                 }
                 // A copy, i.e. scale by 1.0, so a test can assert exact fidelity.
+                let echoed = scaled(&input, options.gain);
                 let reply = match options.corrupt {
                     None => Reply {
                         magic,
@@ -188,7 +200,7 @@ fn serve(options: &Options) -> io::Result<u8> {
                         id,
                         channels,
                         frames,
-                        payload: &input,
+                        payload: echoed.as_ref(),
                     },
                     Some(Corrupt::Status) => Reply {
                         magic,
@@ -206,7 +218,7 @@ fn serve(options: &Options) -> io::Result<u8> {
                         id,
                         channels: channels + 1,
                         frames,
-                        payload: &input,
+                        payload: echoed.as_ref(),
                     },
                     // Four bytes short: the declared length matches what is sent, so the
                     // client reads a whole payload and still has to reject the length.
@@ -217,7 +229,7 @@ fn serve(options: &Options) -> io::Result<u8> {
                         id,
                         channels,
                         frames,
-                        payload: &input[..input.len().saturating_sub(4)],
+                        payload: &echoed[..echoed.len().saturating_sub(4)],
                     },
                     Some(Corrupt::Id) => Reply {
                         magic,
@@ -226,7 +238,7 @@ fn serve(options: &Options) -> io::Result<u8> {
                         id: id.wrapping_add(1),
                         channels,
                         frames,
-                        payload: &input,
+                        payload: echoed.as_ref(),
                     },
                 };
                 reply.write(&mut writer)?;
@@ -305,6 +317,19 @@ impl Reply<'_> {
     }
 }
 
+/// The window body `--gain` asks for: every sample scaled, or borrowed untouched at 1.0
+/// so the echo stays bit-exact.
+fn scaled(payload: &[u8], gain: f32) -> std::borrow::Cow<'_, [u8]> {
+    if gain == 1.0 {
+        return std::borrow::Cow::Borrowed(payload);
+    }
+    let samples = payload.chunks_exact(size_of::<f32>()).flat_map(|chunk| {
+        let sample = f32::from_le_bytes(chunk.try_into().expect("four bytes"));
+        (sample * gain).to_le_bytes()
+    });
+    std::borrow::Cow::Owned(samples.collect())
+}
+
 /// Bytes for a `channels`-by-`frames` window of `f32`, refusing a size that would
 /// allocate the machine away.
 fn body_len(channels: u32, frames: u32) -> io::Result<usize> {
@@ -361,6 +386,13 @@ mod tests {
         assert!(options.fail_after.is_none());
         assert!(options.corrupt.is_none());
         assert!(!options.is_garbage);
+    }
+
+    #[test]
+    fn given_a_gain_when_parsed_then_the_echo_is_scaled_and_a_bad_factor_is_rejected() {
+        assert_eq!(parse(&["--gain", "0.5"]).unwrap().gain, 0.5);
+        assert_eq!(parse(&[]).unwrap().gain, 1.0, "the default echo is exact");
+        assert!(parse(&["--gain", "loud"]).unwrap_err().contains("loud"));
     }
 
     #[test]

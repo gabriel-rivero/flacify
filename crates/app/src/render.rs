@@ -89,6 +89,9 @@ pub struct Loaded {
     pub track: Track,
     pub analysis: flacify_core::dsp::cutoff::Analysis,
     pub source: Source,
+    /// blake3 of the file's bytes, the identity part of a cache key. Computed in [`load`]
+    /// so nothing downstream reopens the file.
+    pub source_hash: String,
 }
 
 impl Loaded {
@@ -107,6 +110,7 @@ impl Loaded {
 
 /// Decode any supported file to 48 kHz stereo, then report what the spectrum looks like.
 pub fn load(path: &Path) -> Result<Loaded> {
+    let source_hash = crate::cache::source_hash(path)?;
     let decoded = decode::decode(path)?;
     let source = Source {
         sample_rate: decoded.sample_rate,
@@ -121,17 +125,8 @@ pub fn load(path: &Path) -> Result<Loaded> {
         track,
         analysis,
         source,
+        source_hash,
     })
-}
-
-/// A hash of the decoded samples, for cache keys. The pipeline version, window, overlap
-/// and model go into the key separately, so this is only about the audio.
-pub fn sample_hash(track: &Track) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for sample in &track.planar {
-        hasher.update(&sample.to_bits().to_le_bytes());
-    }
-    hasher.finalize().to_hex()[..32].to_string()
 }
 
 /// A seed that survives re-renders, cache keys and bug reports (ADR-006).
@@ -429,17 +424,19 @@ pub fn render_into_frontier(
 
 /// Render the track, or take it from the cache when this exact render already exists.
 ///
-/// Returns the audio and whether it came from disk, so the UI can say "cached" instead
-/// of pretending it did 95 s of work.
+/// `source_hash` is [`crate::cache::source_hash`] of the file `track` came from. Returns
+/// the audio and whether it came from disk, so the UI can say "cached" instead of
+/// pretending it did 95 s of work.
 pub fn enhance_or_cached(
     track: &Track,
+    source_hash: &str,
     job: Job,
     store: Store,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize),
 ) -> Result<(Render, bool)> {
     let fields = crate::cache::Fields {
-        sample_hash: sample_hash(track),
+        source_hash: source_hash.to_string(),
         window: WINDOW,
         overlap: OVERLAP,
         model_id: store.model_id.to_string(),
@@ -447,7 +444,7 @@ pub fn enhance_or_cached(
     };
     let key = fields.key();
     if let Some(cached) = store.cache.load(&key)? {
-        if cached.meta.sample_hash.is_empty() {
+        if cached.meta.source_hash.is_empty() {
             let _ = store.cache.annotate(&key, &fields);
         }
         progress(track.frames);
@@ -488,6 +485,7 @@ pub fn enhance_file(
         track,
         analysis,
         source,
+        source_hash,
     } = load(input)?;
     eprintln!(
         "source {} Hz, {} ch -> {} Hz stereo ({} frames)",
@@ -517,6 +515,7 @@ pub fn enhance_file(
     let frames = track.frames;
     let (rendered, from_cache) = enhance_or_cached(
         &track,
+        &source_hash,
         Job {
             session,
             cutoff_hz: Some(analysis.cutoff_hz),
@@ -681,5 +680,52 @@ mod tests {
             interleave_stereo(&planar, 4),
             vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0]
         );
+    }
+
+    /// A 48 kHz stereo WAV with a 100 ms tone on each channel: long enough for the cutoff
+    /// analysis, small enough to write per test.
+    fn write_source(name: &str) -> TempOutput {
+        let output = TempOutput::new(name);
+        let frames = 4_800;
+        let mut planar = Vec::with_capacity(frames * 2);
+        for channel in 0..2 {
+            for frame in 0..frames {
+                planar.push(0.2 * ((frame as f32 * 0.05).sin() + channel as f32 * 0.25));
+            }
+        }
+        crate::wav::write(&output.path, SAMPLE_RATE, 2, &planar).expect("writing the wav");
+        output
+    }
+
+    #[test]
+    fn given_a_file_when_loaded_then_the_source_hash_is_the_cache_hash_of_that_path() {
+        let source = write_source("source-hash.wav");
+        let loaded = load(&source.path).expect("loading the file");
+
+        assert_eq!(loaded.source_hash.len(), 32);
+        assert_eq!(
+            loaded.source_hash,
+            crate::cache::source_hash(&source.path).expect("hashing the file")
+        );
+    }
+
+    /// A fixed signal with no platform-dependent rounding: a 4 096-frame ramp and its
+    /// negation.
+    fn fixed_signal() -> Track {
+        let frames = 4_096;
+        let mut planar = Vec::with_capacity(frames * 2);
+        for frame in 0..frames {
+            let value = (frame as f32 - 2_048.0) / 4_096.0;
+            planar.push(value);
+            planar.push(-value);
+        }
+        Track { planar, frames }
+    }
+
+    #[test]
+    fn given_a_fixed_signal_when_seeded_then_the_seed_is_the_pinned_constant() {
+        // ADR-006: the seed is a compatibility contract, so a change here re-renders every
+        // track with different noise instead of reusing the same one.
+        assert_eq!(seed_for(&fixed_signal()), 8_901_150_270_194_604_865);
     }
 }

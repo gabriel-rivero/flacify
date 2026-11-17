@@ -146,8 +146,9 @@ CLI instruction. The screen states the size (the sum of `setup::plan()`), starts
 `setup::ensure` on a thread only after the user presses Download, shows the current step and
 its progress, offers Retry after a failure, and hands the same window to the player once the
 file opens. Cancel stops the running child through a token and keeps the finished steps;
-Resume re-enters the state machine and skips them. `--smoke` still requires `flacify setup`,
-because a headless run cannot click.
+Resume re-enters the state machine and skips them. A full-band file or an already-cached
+render plays with no model installed at all; only a file that has to render opens the setup
+screen. `--smoke` still requires `flacify setup`, because a headless run cannot click.
 
 Still to do:
 
@@ -387,9 +388,11 @@ not do, in the order it would hurt:
    the step would not otherwise pay.
 3. **Retry is coarse.** It re-enters `ensure` from the top, skipping steps already marked
    done. It cannot retry only the failed step, and there is no backoff between attempts.
-4. **A cached or full-band file still triggers setup.** `Session::new` checks `is_ready`,
-   and the window offers setup before opening any file, even one that would never start the
-   model. The app could defer the requirement to the first render that needs it.
+4. ~~A cached or full-band file still triggers setup.~~ **Done (2026-11-16):** `Session`
+   records whether the model is installed, and only the branches that render require it.
+   Full-band files play with no model; cache hits are found by audio and settings when the
+   model id cannot be computed, and older entries are annotated on the next ready play.
+   `--smoke` reports the requirement instead of opening a window.
 5. **No accelerator choice on the screen.** The plan installs PyPI's CPU torch; a CUDA
    machine still has to set `FLACIFY_TORCH_INDEX` before the first run. The screen should
    detect and offer the CUDA wheel (gap 11).

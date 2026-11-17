@@ -35,6 +35,27 @@ pub struct Session {
     cache: Arc<Cache>,
     model_id: String,
     splice: bool,
+    /// False when the model is not installed. A full-band file or a cache hit still plays;
+    /// anything that has to render asks for setup instead.
+    ready: bool,
+}
+
+/// The file needs a render and the model is not installed. Not a failure: `play` turns
+/// this into the first-run window.
+#[derive(Debug)]
+pub struct NeedsSetup;
+
+impl std::fmt::Display for NeedsSetup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the model is not installed yet; run `flacify setup` once")
+    }
+}
+
+impl std::error::Error for NeedsSetup {}
+
+/// Whether an error means the file needs the model installed rather than something broke.
+pub fn needs_setup(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<NeedsSetup>().is_some()
 }
 
 /// Everything one file owns. Dropping it is not enough to stop the render, because the
@@ -61,12 +82,12 @@ impl Playback {
 
 impl Session {
     pub fn new(paths: &setup::Paths, splice: bool) -> Result<Self> {
-        let config = worker_config(paths)?;
         Ok(Self {
-            worker: WorkerSession::new(config),
+            worker: WorkerSession::new(worker_config(paths)),
             cache: Arc::new(Cache::new(paths.cache_dir())),
             model_id: cache::model_id(&paths.models_dir()),
             splice,
+            ready: paths.is_ready(),
         })
     }
 
@@ -80,6 +101,15 @@ impl Session {
 
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// A render needs the worker; a cache hit or a full-band source does not.
+    fn require_ready(&self) -> Result<()> {
+        if self.ready {
+            Ok(())
+        } else {
+            Err(anyhow::Error::new(NeedsSetup))
+        }
     }
 
     /// Decode a file, decide how to get its enhanced side, and start the device.
@@ -120,16 +150,29 @@ impl Session {
             });
         }
 
-        let key = cache::key(
-            &render::sample_hash(&track),
-            render::WINDOW,
-            render::OVERLAP,
-            &self.model_id,
-            self.splice,
-        );
+        let fields = cache::Fields {
+            sample_hash: render::sample_hash(&track),
+            window: render::WINDOW,
+            overlap: render::OVERLAP,
+            model_id: self.model_id.clone(),
+            splice: self.splice,
+        };
+        let key = fields.key();
+        let cached = match self.cache.load(&key)? {
+            Some(cached) => Some(cached),
+            // Without the model there is no id to put in the key, so match the audio and
+            // settings instead: a kept or portable cache still plays.
+            None if !self.ready => self.cache.find(&fields)?,
+            None => None,
+        };
 
-        match self.cache.load(&key)? {
+        match cached {
             Some(cached) => {
+                if self.ready && cached.meta.sample_hash.is_empty() {
+                    if let Err(error) = self.cache.annotate(&key, &fields) {
+                        tracing::warn!(%error, "could not annotate the cache entry");
+                    }
+                }
                 eprintln!("cache hit: {audio_secs:.0} s of audio, nothing to render");
                 let enhanced = render::interleave_stereo(&cached.planar, track.frames);
                 let engine = device::AudioEngine::start(&original, Some(&enhanced))?;
@@ -152,6 +195,7 @@ impl Session {
                 })
             }
             None if !device::progressive_supported() => {
+                self.require_ready()?;
                 eprintln!(
                     "this output device is not 48 kHz stereo, so the track is rendered \
                      before playback starts"
@@ -198,6 +242,7 @@ impl Session {
                 })
             }
             None => {
+                self.require_ready()?;
                 let frontier = Frontier::new(track.frames);
                 let status = RenderStatus::new();
                 let cancel = Arc::new(AtomicBool::new(false));
@@ -224,7 +269,7 @@ impl Session {
                         match result {
                             Ok(render) => {
                                 status.finish();
-                                if let Err(error) = cache.store(&key, &render, cutoff_hz) {
+                                if let Err(error) = cache.store(&key, &render, cutoff_hz, &fields) {
                                     tracing::warn!(%error, "could not cache the render");
                                 }
                             }
@@ -278,24 +323,33 @@ impl Session {
     }
 }
 
-fn worker_config(paths: &setup::Paths) -> Result<WorkerConfig> {
-    if !paths.is_ready() {
-        anyhow::bail!(
-            "the model is not installed yet. Run `flacify setup` once (about 6 GB), \
-             or set FLACIFY_HOME if it lives somewhere else."
-        );
-    }
-    Ok(WorkerConfig {
+fn worker_config(paths: &setup::Paths) -> WorkerConfig {
+    WorkerConfig {
         program: paths.venv_python(),
         worker_script: paths.worker_script(),
         model_dir: paths.models_dir(),
         flashsr_dir: Some(paths.flashsr_dir()),
         device: "auto".to_string(),
-    })
+    }
 }
 
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_a_needs_setup_error_when_asked_then_it_is_recognized_and_others_are_not() {
+        assert!(needs_setup(&anyhow::Error::new(NeedsSetup)));
+        assert!(!needs_setup(&anyhow::anyhow!("the worker exited")));
+        assert_eq!(
+            NeedsSetup.to_string(),
+            "the model is not installed yet; run `flacify setup` once"
+        );
+    }
 }

@@ -438,14 +438,18 @@ pub fn enhance_or_cached(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize),
 ) -> Result<(Render, bool)> {
-    let key = crate::cache::key(
-        &sample_hash(track),
-        WINDOW,
-        OVERLAP,
-        store.model_id,
-        job.splice_low_band,
-    );
+    let fields = crate::cache::Fields {
+        sample_hash: sample_hash(track),
+        window: WINDOW,
+        overlap: OVERLAP,
+        model_id: store.model_id.to_string(),
+        splice: job.splice_low_band,
+    };
+    let key = fields.key();
     if let Some(cached) = store.cache.load(&key)? {
+        if cached.meta.sample_hash.is_empty() {
+            let _ = store.cache.annotate(&key, &fields);
+        }
         progress(track.frames);
         let render = Render {
             planar: cached.planar,
@@ -465,7 +469,7 @@ pub fn enhance_or_cached(
     let cutoff_hz = job.cutoff_hz;
     let render = enhance(track, job, cancel, progress)?;
     if let Some(cutoff) = cutoff_hz {
-        store.cache.store(&key, &render, cutoff)?;
+        store.cache.store(&key, &render, cutoff, &fields)?;
     }
     Ok((render, false))
 }

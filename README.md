@@ -16,9 +16,11 @@ opens and fills a frontier behind it, 0.17 s from cache and 12.6 s cold on the M
 (model load plus the first window), then hands the A/B switch over once the frontier is
 ahead. The model worker is process-scoped now: it starts lazily on the first uncached file,
 is reused when another file is dropped on the window, and is killed when the window closes,
-so an idle app loads nothing. The window is complete for v0.2: the spectrum and the
-waveform both show the render frontier, and the waveform is the seek surface. What remains
-is the five-minute dropout soak and the second-file timing. The numbers are in
+so an idle app loads nothing. A full-band file or an already-cached render plays with no
+model installed at all; only a file that has to render opens the setup screen. The window is
+complete for v0.2: the spectrum and the waveform both show the render frontier, and the
+waveform is the seek surface. What remains is the five-minute dropout soak and the
+second-file timing. The numbers are in
 [`docs/measurements.md`](docs/measurements.md#progressive-playback-2026-11-13).
 
 Runs end to end on macOS (verified: Metal, 48 kHz out, A/B enabled), on Linux

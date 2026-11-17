@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use flacify_core::{plan, Probe, SAMPLE_RATE};
 
-use crate::session::{Playback, Session};
+use crate::session::{needs_setup, Playback, Session};
 
 #[derive(Parser)]
 #[command(
@@ -194,6 +194,9 @@ fn mode_label(plan: &flacify_core::Plan) -> String {
 
 fn enhance(file: &Path, out: Option<PathBuf>, splice: bool) -> Result<()> {
     let paths = setup::Paths::discover()?;
+    if !paths.is_ready() {
+        anyhow::bail!("the model is not installed yet. Run `flacify setup` once (about 6 GB).");
+    }
     let session = Session::new(&paths, splice)?;
     let out = out.unwrap_or_else(|| {
         let mut name = file.file_name().unwrap_or_default().to_os_string();
@@ -239,22 +242,22 @@ fn enhance(file: &Path, out: Option<PathBuf>, splice: bool) -> Result<()> {
 
 fn play(file: &Path, smoke: bool, splice: bool) -> Result<()> {
     let paths = setup::Paths::discover()?;
-
-    // A released binary cannot ask the user to open a terminal. Without the install the
-    // window owns the download; a headless run still needs `flacify setup`.
-    if !paths.is_ready() {
-        if smoke {
-            anyhow::bail!("the model is not installed yet. Run `flacify setup` once (about 6 GB).");
-        }
-        return ui::run(first_run::FirstRun::new(paths, file.to_path_buf(), splice))
-            .map_err(|error| anyhow::anyhow!("{error}"));
-    }
-
     let session = Session::new(&paths, splice)?;
     let started = Instant::now();
-    // `open` is the only work between pressing play and hearing the file: decode,
-    // analysis and the device. The renderer runs behind the playhead from here on.
-    let mut playback = session.open(file)?;
+
+    // A full-band file and a cache hit never need the model, so they play on a machine
+    // without the 6 GB install. Only a file that has to render asks for setup.
+    let mut playback = match session.open(file) {
+        Ok(playback) => playback,
+        Err(error) if needs_setup(&error) => {
+            if smoke {
+                anyhow::bail!("{error}. A headless run cannot install it.");
+            }
+            return ui::run(first_run::FirstRun::new(paths, file.to_path_buf(), splice))
+                .map_err(|error| anyhow::anyhow!("{error}"));
+        }
+        Err(error) => return Err(error),
+    };
 
     if smoke {
         let result = report(&playback, started);

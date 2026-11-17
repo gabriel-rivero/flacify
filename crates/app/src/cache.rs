@@ -46,6 +46,17 @@ pub struct Meta {
     pub frames: usize,
     pub sample_rate: u32,
     pub cutoff_hz: u32,
+    /// The audio and settings that produced this entry. Stored so `find` can match it
+    /// when the model is not installed and its id cannot be computed. Empty on entries
+    /// written before 2026-11-16; `annotate` fills them on the next ready play.
+    #[serde(default)]
+    pub sample_hash: String,
+    #[serde(default)]
+    pub window: usize,
+    #[serde(default)]
+    pub overlap: usize,
+    #[serde(default)]
+    pub splice: bool,
     /// Peak before and after the limiter ran, so the UI can still say what happened.
     pub peak_before: f32,
     pub peak_after: f32,
@@ -58,6 +69,32 @@ pub struct Meta {
     /// accepted, which is a deliberate prototype compromise (fp32 devices agree to
     /// within the gate, but they are not bit-identical).
     pub device: String,
+}
+
+/// What identifies an entry, in a form that can also be written into `meta.json`.
+///
+/// The directory name is their hash, but a lookup on a machine without the model cannot
+/// recompute that hash: the model id comes from files that are gone. The stored fields let
+/// [`Cache::find`] match the audio and the settings instead.
+#[derive(Clone, Debug)]
+pub struct Fields {
+    pub sample_hash: String,
+    pub window: usize,
+    pub overlap: usize,
+    pub model_id: String,
+    pub splice: bool,
+}
+
+impl Fields {
+    pub fn key(&self) -> String {
+        key(
+            &self.sample_hash,
+            self.window,
+            self.overlap,
+            &self.model_id,
+            self.splice,
+        )
+    }
 }
 
 pub struct Cached {
@@ -81,20 +118,69 @@ impl Cache {
     /// `None` when there is no entry; an error when there is one and it cannot be read,
     /// because silence about a corrupt cache entry is how you end up debugging audio.
     pub fn load(&self, key: &str) -> Result<Option<Cached>> {
-        let dir = self.entry_dir(key);
-        let meta_path = dir.join("meta.json");
-        let audio_path = dir.join("audio.wav");
-        if !meta_path.is_file() || !audio_path.is_file() {
+        self.load_dir(&self.entry_dir(key))
+    }
+
+    /// Find an entry by the audio and settings it was made from, ignoring which model
+    /// rendered it. Used when the model is not installed: the id cannot be computed, and
+    /// an existing render is better than a setup screen. Only entries that recorded their
+    /// fields can match; `annotate` fills them on a ready play.
+    pub fn find(&self, fields: &Fields) -> Result<Option<Cached>> {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
             return Ok(None);
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".tmp") {
+                continue;
+            }
+            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let dir = entry.path();
+            let Ok(Some(meta)) = self.read_meta(&dir) else {
+                continue;
+            };
+            if meta.version != CACHE_VERSION
+                || meta.sample_hash != fields.sample_hash
+                || meta.window != fields.window
+                || meta.overlap != fields.overlap
+                || meta.splice != fields.splice
+                || !dir.join("audio.wav").is_file()
+            {
+                continue;
+            }
+            return self.load_dir(&dir);
         }
+        Ok(None)
+    }
 
-        let meta: Meta = serde_json::from_str(
-            &std::fs::read_to_string(&meta_path)
-                .with_context(|| format!("reading {}", meta_path.display()))?,
-        )
-        .with_context(|| format!("parsing {}", meta_path.display()))?;
+    /// Fill in the audio fields on an entry written before they were recorded. Best
+    /// effort: a cache hit that cannot be annotated still plays.
+    pub fn annotate(&self, key: &str, fields: &Fields) -> Result<()> {
+        let dir = self.entry_dir(key);
+        let Some(mut meta) = self.read_meta(&dir)? else {
+            return Ok(());
+        };
+        if !meta.sample_hash.is_empty() {
+            return Ok(());
+        }
+        meta.sample_hash = fields.sample_hash.clone();
+        meta.window = fields.window;
+        meta.overlap = fields.overlap;
+        meta.splice = fields.splice;
+        let path = dir.join("meta.json");
+        let temp = dir.join("meta.json.tmp");
+        std::fs::write(&temp, serde_json::to_string_pretty(&meta)? + "\n")
+            .with_context(|| format!("writing {}", temp.display()))?;
+        std::fs::rename(&temp, &path).with_context(|| format!("replacing {}", path.display()))
+    }
 
-        if meta.version != CACHE_VERSION {
+    fn load_dir(&self, dir: &Path) -> Result<Option<Cached>> {
+        let Some(meta) = self.read_meta(dir)? else {
+            return Ok(None);
+        };
+        let audio_path = dir.join("audio.wav");
+        if meta.version != CACHE_VERSION || !audio_path.is_file() {
             return Ok(None);
         }
 
@@ -120,9 +206,27 @@ impl Cache {
         Ok(Some(Cached { planar, meta }))
     }
 
+    fn read_meta(&self, dir: &Path) -> Result<Option<Meta>> {
+        let path = dir.join("meta.json");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let meta =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(Some(meta))
+    }
+
     /// Write a finished render. Everything lands in `<key>.tmp` first and is renamed,
     /// so a reader never sees a partial entry.
-    pub fn store(&self, key: &str, render: &Render, cutoff_hz: u32) -> Result<PathBuf> {
+    pub fn store(
+        &self,
+        key: &str,
+        render: &Render,
+        cutoff_hz: u32,
+        fields: &Fields,
+    ) -> Result<PathBuf> {
         let frames = render.planar.len() / 2;
         let final_dir = self.entry_dir(key);
         let temp_dir = self.root.join(format!("{key}.tmp"));
@@ -141,6 +245,10 @@ impl Cache {
             frames,
             sample_rate: flacify_core::SAMPLE_RATE,
             cutoff_hz,
+            sample_hash: fields.sample_hash.clone(),
+            window: fields.window,
+            overlap: fields.overlap,
+            splice: fields.splice,
             peak_before: render.limit.peak_before,
             peak_after: render.limit.peak_after,
             limited_samples: render.limit.limited_samples,
@@ -279,12 +387,24 @@ mod tests {
         }
     }
 
+    fn fields() -> Fields {
+        Fields {
+            sample_hash: "samples".into(),
+            window: 245_760,
+            overlap: 48_000,
+            model_id: "model".into(),
+            splice: false,
+        }
+    }
+
     #[test]
     fn given_a_stored_render_when_loaded_then_the_samples_survive_the_round_trip() {
         let root = temp_cache("roundtrip");
         let cache = Cache::new(root.clone());
         let render = render_of(4_800);
-        cache.store("key", &render, 15_328).expect("storing");
+        cache
+            .store("key", &render, 15_328, &fields())
+            .expect("storing");
 
         let cached = cache.load("key").expect("loading").expect("an entry");
         assert_eq!(cached.meta.frames, 4_800);
@@ -348,7 +468,7 @@ mod tests {
         let root = temp_cache("version");
         let cache = Cache::new(root.clone());
         cache
-            .store("key", &render_of(240), 12_000)
+            .store("key", &render_of(240), 12_000, &fields())
             .expect("storing");
         let meta_path = cache.entry_dir("key").join("meta.json");
         let mut meta: Meta =
@@ -357,6 +477,64 @@ mod tests {
         std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
 
         assert!(cache.load("key").expect("no error").is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_two_models_when_found_by_audio_then_the_settings_match_and_other_audio_does_not() {
+        let root = temp_cache("find");
+        let cache = Cache::new(root.clone());
+        let render = render_of(4_800);
+        let a = Fields {
+            model_id: "model-a".into(),
+            ..fields()
+        };
+        let b = Fields {
+            model_id: "model-b".into(),
+            ..fields()
+        };
+        cache
+            .store(&a.key(), &render, 15_328, &a)
+            .expect("storing a");
+        cache
+            .store(&b.key(), &render, 15_328, &b)
+            .expect("storing b");
+
+        // The model id is ignored: on a machine without the model it cannot be computed,
+        // and either entry is the same audio and settings.
+        let found = cache.find(&fields()).expect("searching").expect("an entry");
+        assert_eq!(found.meta.frames, 4_800);
+        assert_eq!(found.meta.sample_hash, "samples");
+
+        let other = Fields {
+            sample_hash: "different".into(),
+            ..fields()
+        };
+        assert!(cache.find(&other).expect("searching").is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_an_entry_without_audio_fields_when_annotated_then_it_can_be_found() {
+        let root = temp_cache("annotate");
+        let cache = Cache::new(root.clone());
+        let render = render_of(2_400);
+        let key = fields().key();
+        let blank = Fields {
+            sample_hash: String::new(),
+            ..fields()
+        };
+        cache.store(&key, &render, 12_000, &blank).expect("storing");
+
+        assert!(
+            cache.find(&fields()).expect("searching").is_none(),
+            "an entry without its fields cannot match"
+        );
+        cache.annotate(&key, &fields()).expect("annotating");
+        assert!(
+            cache.find(&fields()).expect("searching").is_some(),
+            "the annotation makes it findable"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

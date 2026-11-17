@@ -197,11 +197,9 @@ release where it should land.
 
 **v0.2, before anyone else uses it**
 
-1. **No FLAC out.** `enhance` writes 32-bit float WAV; `flacenc` is not wired up, so the
-   cache container from ADR-003 does not exist yet. WAV is also 3× larger. The encoder
-   question is now answered (2026-11-17): `flacenc`'s output is unreadable by symphonia
-   because it advertises a variable blocksize over fixed-strategy frames, and restoring
-   `STREAMINFO.min_blocksize` after encoding fixes it exactly. Wiring it is V4-3 in
+1. ~~No FLAC out.~~ **Partly done (2026-11-17):** `enhance` writes 24-bit FLAC when the
+   output name ends in `.flac`, and 32-bit float WAV otherwise, which is 3× larger than
+   FLAC. The cache still writes WAV; moving it to FLAC segments is V4-3 in
    [`v0.4-plan.md`](v0.4-plan.md).
 2. ~~No loudness match.~~ **Done (2026-11-13):** the generated side was 1.49 LU louder;
    BS.1770 matching brings the step to −0.10 LU, measured twice (the app's meter and an

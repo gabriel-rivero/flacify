@@ -504,7 +504,7 @@ pub fn enhance_file(
             .chain(track.channel(1))
             .copied()
             .collect();
-        crate::wav::write(output, SAMPLE_RATE, 2, &planar)?;
+        write_output(output, &planar)?;
         progress(track.frames, track.frames);
         return Ok(());
     }
@@ -549,13 +549,90 @@ pub fn enhance_file(
             rendered.limit.limited_samples
         );
     }
-    crate::wav::write(output, SAMPLE_RATE, 2, &rendered.planar)?;
+    write_output(output, &rendered.planar)?;
     Ok(())
+}
+
+/// Write a rendered track, choosing the container from the output name.
+///
+/// `.flac` writes 24-bit FLAC; every other name keeps the float WAV `enhance` has always
+/// produced.
+fn write_output(output: &Path, planar: &[f32]) -> Result<()> {
+    if is_flac_output(output) {
+        crate::flac::write(output, SAMPLE_RATE, 2, planar)
+    } else {
+        crate::wav::write(output, SAMPLE_RATE, 2, planar)
+    }
+}
+
+/// Whether the output name asks for FLAC. The extension is matched case-insensitively.
+fn is_flac_output(output: &Path) -> bool {
+    output
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("flac"))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use super::*;
+
+    static NEXT_OUTPUT: AtomicU32 = AtomicU32::new(0);
+
+    /// A unique output path in the temp directory, deleted when the test ends.
+    struct TempOutput {
+        path: std::path::PathBuf,
+    }
+
+    impl TempOutput {
+        fn new(name: &str) -> Self {
+            let unique = NEXT_OUTPUT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "flacify-render-{}-{unique}-{name}",
+                std::process::id()
+            ));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempOutput {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// One block of a constant signal: enough audio for a well-formed stream, cheap to
+    /// encode.
+    fn one_block() -> Vec<f32> {
+        vec![0.25; 2 * crate::flac::BLOCK]
+    }
+
+    #[test]
+    fn given_output_names_when_classified_then_only_a_flac_extension_selects_flac() {
+        assert!(is_flac_output(Path::new("out.flac")));
+        assert!(is_flac_output(Path::new("OUT.FLAC")));
+        assert!(!is_flac_output(Path::new("out.wav")));
+        assert!(!is_flac_output(Path::new("out.flac.wav")));
+        assert!(!is_flac_output(Path::new("out")));
+    }
+
+    #[test]
+    fn given_a_flac_output_path_when_written_then_the_file_is_a_flac_stream() {
+        let output = TempOutput::new("container.flac");
+        write_output(&output.path, &one_block()).expect("writing a flac");
+        let bytes = std::fs::read(&output.path).expect("reading the flac");
+        assert_eq!(&bytes[..4], b"fLaC");
+    }
+
+    #[test]
+    fn given_a_wav_output_path_when_written_then_the_file_is_a_wave_container() {
+        let output = TempOutput::new("container.wav");
+        write_output(&output.path, &one_block()).expect("writing a wav");
+        let bytes = std::fs::read(&output.path).expect("reading the wav");
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+    }
 
     #[test]
     fn given_a_set_token_when_checked_then_the_render_stops_as_cancelled() {

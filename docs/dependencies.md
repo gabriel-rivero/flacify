@@ -40,7 +40,7 @@ not offer the flag yet; use `flacify setup --cuda` on the CUDA machine.
 | `symphonia` | demux + decode MP3, AAC, FLAC, ALAC, Vorbis, Opus, WAV, MP4, OGG | MPL-2.0: file-level copyleft, fine to link, don't fork silently |
 | `cpal` | one audio output API over CoreAudio / WASAPI / ALSA | device matrix is the real cost, not the crate |
 | `rubato` | high-quality resampling 44.1 → 48 kHz | different filter than scipy's `resample_poly`, see the preprocessing port |
-| `flacenc` | pure-Rust FLAC encoder for the cache | young; verify 24-bit + streaming append |
+| `flacenc` | pure-Rust FLAC encoder for the cache and `enhance --out x.flac` | young; 24-bit round-trip verified 2026-11-17, streaming append still to check |
 | `claxon` | fast FLAC decode for cache replay | redundant with symphonia; add only if 30 s seek latency is too slow |
 | `ort` | ONNX Runtime bindings; the only place GPU code is called | dylib distribution, EP quirks, `coreml` coverage |
 | `ndarray` | tensor shapes across the `ort` boundary | keep it out of `core` |

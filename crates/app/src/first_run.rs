@@ -25,6 +25,7 @@ struct SetupState {
     step: Mutex<Option<String>>,
     fraction: AtomicU32,
     done: AtomicBool,
+    cancelled: AtomicBool,
     failure: Mutex<Option<String>>,
 }
 
@@ -41,6 +42,11 @@ impl SetupState {
         self.done.store(true, Ordering::Release);
     }
 
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.finish();
+    }
+
     fn fail(&self, message: String) {
         if let Ok(mut failure) = self.failure.lock() {
             *failure = Some(message);
@@ -48,12 +54,13 @@ impl SetupState {
         self.finish();
     }
 
-    fn snapshot(&self) -> (Option<String>, f32, bool, Option<String>) {
+    fn snapshot(&self) -> (Option<String>, f32, bool, bool, Option<String>) {
         let step = self.step.lock().ok().and_then(|step| step.clone());
         let fraction = f32::from_bits(self.fraction.load(Ordering::Relaxed));
         let done = self.done.load(Ordering::Acquire);
+        let cancelled = self.cancelled.load(Ordering::Relaxed);
         let failure = self.failure.lock().ok().and_then(|failure| failure.clone());
-        (step, fraction, done, failure)
+        (step, fraction, done, cancelled, failure)
     }
 }
 
@@ -62,6 +69,8 @@ pub struct FirstRun {
     file: PathBuf,
     splice: bool,
     state: Arc<SetupState>,
+    /// The token for the running install; a fresh one is made on each attempt.
+    cancel: setup::Cancel,
     started: bool,
     /// Set once the install is ready and the file has been opened.
     player: Option<ui::PlayerApp>,
@@ -75,6 +84,7 @@ impl FirstRun {
             file,
             splice,
             state: Arc::new(SetupState::default()),
+            cancel: setup::Cancel::default(),
             started: false,
             player: None,
             error: None,
@@ -84,15 +94,18 @@ impl FirstRun {
     /// Run the download on its own thread; the window stays responsive and can be closed.
     fn start(&mut self) {
         self.state = Arc::new(SetupState::default());
+        self.cancel = setup::Cancel::default();
         self.started = true;
         self.error = None;
         let state = Arc::clone(&self.state);
+        let cancel = self.cancel.clone();
         let paths = self.paths.clone();
         std::thread::spawn(move || {
             let reporter = Arc::clone(&state);
             let progress = Progress::new(move |step, fraction| reporter.report(step, fraction));
-            match setup::ensure(&paths, progress) {
+            match setup::ensure_cancellable(&paths, progress, &cancel) {
                 Ok(()) => state.finish(),
+                Err(error) if setup::is_cancelled(&error) => state.cancel(),
                 Err(error) => state.fail(format!("{error:#}")),
             }
         });
@@ -131,8 +144,8 @@ impl eframe::App for FirstRun {
             return;
         }
 
-        let (step, fraction, done, failure) = self.state.snapshot();
-        if done && failure.is_none() {
+        let (step, fraction, done, cancelled, failure) = self.state.snapshot();
+        if done && !cancelled && failure.is_none() {
             self.open_player();
         }
 
@@ -172,6 +185,15 @@ impl eframe::App for FirstRun {
             } else if let Some(error) = &self.error {
                 ui.label("The install finished, but the file could not be opened:");
                 ui.colored_label(egui::Color32::from_rgb(220, 90, 90), error);
+            } else if cancelled {
+                ui.label("Setup cancelled. The steps that finished are kept.");
+                ui.add_space(10.0);
+                if ui
+                    .add(egui::Button::new("Resume setup").min_size(egui::vec2(180.0, 30.0)))
+                    .clicked()
+                {
+                    self.start();
+                }
             } else if !self.started {
                 if ui
                     .add(egui::Button::new("Download and set up").min_size(egui::vec2(220.0, 34.0)))
@@ -200,10 +222,14 @@ impl eframe::App for FirstRun {
                         .text(format!("{:.0}%", fraction * 100.0)),
                 );
                 ui.add_space(8.0);
+                if ui.button("Cancel").clicked() {
+                    self.cancel.cancel();
+                }
+                ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new(
-                        "You can close this window; the next run picks up from the steps \
-                         that finished.",
+                        "Cancelling keeps the steps that already finished. Closing the window \
+                         also stops here; the next run resumes.",
                     )
                     .weak()
                     .size(11.0),
@@ -224,6 +250,13 @@ impl eframe::App for FirstRun {
     }
 }
 
+impl Drop for FirstRun {
+    /// Stop the running step when the window goes away; the process exits with it.
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,10 +265,11 @@ mod tests {
     fn given_a_report_when_snapshotted_then_the_step_and_fraction_survive() {
         let state = SetupState::default();
         state.report("python", 0.25);
-        let (step, fraction, done, failure) = state.snapshot();
+        let (step, fraction, done, cancelled, failure) = state.snapshot();
         assert_eq!(step.as_deref(), Some("python"));
         assert!((fraction - 0.25).abs() < 1e-6);
         assert!(!done);
+        assert!(!cancelled);
         assert!(failure.is_none());
     }
 
@@ -243,9 +277,20 @@ mod tests {
     fn given_a_failure_when_snapshotted_then_it_is_done_and_named() {
         let state = SetupState::default();
         state.fail("no network".to_string());
-        let (_, _, done, failure) = state.snapshot();
+        let (_, _, done, _, failure) = state.snapshot();
         assert!(done);
         assert_eq!(failure.as_deref(), Some("no network"));
+    }
+
+    #[test]
+    fn given_a_cancellation_when_snapshotted_then_it_is_done_without_an_error() {
+        let state = SetupState::default();
+        state.report("wheels", 0.0);
+        state.cancel();
+        let (_, _, done, cancelled, failure) = state.snapshot();
+        assert!(done);
+        assert!(cancelled);
+        assert!(failure.is_none());
     }
 
     #[test]
@@ -253,9 +298,10 @@ mod tests {
         let state = SetupState::default();
         state.report("weights", 1.0);
         state.finish();
-        let (_, fraction, done, failure) = state.snapshot();
+        let (_, fraction, done, cancelled, failure) = state.snapshot();
         assert!((fraction - 1.0).abs() < 1e-6);
         assert!(done);
+        assert!(!cancelled);
         assert!(failure.is_none());
     }
 

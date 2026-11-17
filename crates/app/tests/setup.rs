@@ -17,7 +17,9 @@ use anyhow::Result;
 #[path = "../src/setup.rs"]
 mod setup;
 
-use setup::{ensure, ensure_with, plan, Paths, Progress, Runner, SystemRunner};
+use setup::{
+    ensure, ensure_cancellable, ensure_with, plan, Cancel, Paths, Progress, Runner, SystemRunner,
+};
 
 /// The sizes the three weight files have upstream, pinned here independently of the module.
 const WEIGHT_SIZES: [(&str, u64); 3] = [
@@ -161,7 +163,7 @@ impl Runner for FakeRunner {
             }
         }
         if args.first() == Some(&"venv") && self.is_venv_created {
-            SystemRunner.write(&self.venv_python, b"#!/bin/sh\n")?;
+            SystemRunner::default().write(&self.venv_python, b"#!/bin/sh\n")?;
         }
         // A real `tar -C` fails when its destination is missing; model that, then leave
         // the binary behind so the step's size check sees an install.
@@ -176,7 +178,7 @@ impl Runner for FakeRunner {
                     anyhow::bail!("tar -C {}: No such file or directory", dir.display());
                 }
                 let name = if cfg!(windows) { "uv.exe" } else { "uv" };
-                SystemRunner.write(&dir.join(name), b"uv (fake)\n")?;
+                SystemRunner::default().write(&dir.join(name), b"uv (fake)\n")?;
             }
         }
         // The flashsr step runs the extractor script; its contract is that the marker
@@ -187,18 +189,19 @@ impl Runner for FakeRunner {
                 .position(|arg| *arg == *marker)
                 .and_then(|i| args.get(i - 1))
             {
-                SystemRunner.write(&Path::new(dest).join(marker), b"class FlashSR: ...\n")?;
+                SystemRunner::default()
+                    .write(&Path::new(dest).join(marker), b"class FlashSR: ...\n")?;
             }
         }
         Ok(())
     }
 
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<()> {
-        SystemRunner.write(path, bytes)
+        SystemRunner::default().write(path, bytes)
     }
 
     fn create_dir_all(&self, path: &Path) -> Result<()> {
-        SystemRunner.create_dir_all(path)
+        SystemRunner::default().create_dir_all(path)
     }
 
     fn read(&self, path: &Path) -> Option<Vec<u8>> {
@@ -210,7 +213,7 @@ impl Runner for FakeRunner {
             .borrow()
             .get(path)
             .copied()
-            .or_else(|| SystemRunner.size(path))
+            .or_else(|| SystemRunner::default().size(path))
     }
 }
 
@@ -581,7 +584,7 @@ fn given_a_command_that_fails_when_run_then_the_error_carries_its_output_or_exit
     // `sh` is looked up in `PATH`, and a concurrent `Home::without_uv` empties it.
     let _env = env_lock();
 
-    let with_output = SystemRunner
+    let with_output = SystemRunner::default()
         .run(Path::new("sh"), &["-c", "echo boom >&2; exit 3"])
         .expect_err("a command that exits 3");
     let message = format!("{with_output:#}");
@@ -591,7 +594,7 @@ fn given_a_command_that_fails_when_run_then_the_error_carries_its_output_or_exit
     );
     assert!(message.contains("boom"), "the output is missing: {message}");
 
-    let without_output = SystemRunner
+    let without_output = SystemRunner::default()
         .run(Path::new("sh"), &["-c", "exit 4"])
         .expect_err("a command that exits 4");
     let message = format!("{without_output:#}");
@@ -619,4 +622,62 @@ fn given_a_missing_uv_when_ensure_runs_then_the_error_names_the_step() {
         message.contains("uv-override"),
         "the path is missing: {message}"
     );
+}
+
+/// A runner whose token is already set, and whose steps must never execute.
+struct CancelledRunner {
+    token: Cancel,
+}
+
+impl Runner for CancelledRunner {
+    fn run(&self, _program: &Path, _args: &[&str]) -> Result<()> {
+        panic!("a cancelled setup must not run a step");
+    }
+
+    fn write(&self, _path: &Path, _bytes: &[u8]) -> Result<()> {
+        unreachable!("a cancelled setup must not write")
+    }
+
+    fn create_dir_all(&self, _path: &Path) -> Result<()> {
+        unreachable!("a cancelled setup must not create directories")
+    }
+
+    fn size(&self, _path: &Path) -> Option<u64> {
+        None
+    }
+
+    fn read(&self, _path: &Path) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn cancel(&self) -> Option<&Cancel> {
+        Some(&self.token)
+    }
+}
+
+#[test]
+fn given_a_cancelled_token_when_ensuring_then_no_step_runs() {
+    let home = Home::new("cancel");
+    let paths = home.paths();
+    let token = Cancel::default();
+    token.cancel();
+    let runner = CancelledRunner { token };
+
+    let error = ensure_with(&paths, &runner, Progress::default()).expect_err("cancelled");
+    assert!(setup::is_cancelled(&error), "{error:#}");
+    assert_eq!(error.to_string(), "setup cancelled");
+}
+
+#[test]
+fn given_a_cancelled_token_when_ensuring_cancellably_then_it_returns_before_any_step() {
+    // The real SystemRunner, but the token is set before the first step, so no command
+    // and no network is reached.
+    let home = Home::new("cancel-real");
+    let paths = home.paths();
+    let token = Cancel::default();
+    token.cancel();
+
+    let error =
+        ensure_cancellable(&paths, Progress::default(), &token).expect_err("cancelled setup");
+    assert!(setup::is_cancelled(&error), "{error:#}");
 }

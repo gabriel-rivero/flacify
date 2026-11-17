@@ -9,8 +9,12 @@
 
 use std::env;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
@@ -240,7 +244,13 @@ impl Paths {
         let uv = uv_on_disk(self);
         plan().iter().all(|step| {
             state.is_done(step.id)
-                && step_outputs_exist(step.id, self, &SystemRunner, uv.as_deref(), false)
+                && step_outputs_exist(
+                    step.id,
+                    self,
+                    &SystemRunner::default(),
+                    uv.as_deref(),
+                    false,
+                )
         })
     }
 
@@ -358,6 +368,37 @@ impl Progress {
     }
 }
 
+/// A token a long step can be stopped with. Cloning one shares the same flag.
+#[derive(Clone, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// The setup was cancelled. Not a failure: the unfinished step re-runs next time.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("setup cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// Whether an error means the user cancelled rather than the install failing.
+pub fn is_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Cancelled>().is_some()
+}
+
 /// The IO a step needs. Public only so tests can substitute a fake.
 pub trait Runner {
     /// Runs `program` with `args` and fails on a non-zero exit.
@@ -371,24 +412,73 @@ pub trait Runner {
     fn size(&self, path: &Path) -> Option<u64>;
     /// The contents of a regular file, or `None` when it is unreadable.
     fn read(&self, path: &Path) -> Option<Vec<u8>>;
+    /// The token a long `run` can be stopped with, when the runner has one.
+    fn cancel(&self) -> Option<&Cancel> {
+        None
+    }
 }
 
 /// The real runner: child processes, and files written through a temp file.
-pub(crate) struct SystemRunner;
+#[derive(Default)]
+pub(crate) struct SystemRunner {
+    cancel: Cancel,
+}
+
+impl SystemRunner {
+    fn new(cancel: Cancel) -> Self {
+        Self { cancel }
+    }
+}
 
 impl Runner for SystemRunner {
     fn run(&self, program: &Path, args: &[&str]) -> Result<()> {
         let command = command_line(program, args);
-        let output = std::process::Command::new(program)
+        if self.cancel.is_cancelled() {
+            return Err(anyhow::Error::new(Cancelled));
+        }
+        // Poll instead of `output()` so a cancel can kill the child. Both pipes are
+        // drained on threads: a pip that prints past the pipe buffer would otherwise
+        // deadlock the wait.
+        let mut child = std::process::Command::new(program)
             .args(args)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .with_context(|| format!("running {command}"))?;
-        if output.status.success() {
+        let stdout = child.stdout.take().map(drain);
+        let stderr = child.stderr.take().map(drain);
+        let status = loop {
+            if self.cancel.is_cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(reader) = stdout {
+                    let _ = reader.join();
+                }
+                if let Some(reader) = stderr {
+                    let _ = reader.join();
+                }
+                return Err(anyhow::Error::new(Cancelled));
+            }
+            match child
+                .try_wait()
+                .with_context(|| format!("waiting for {command}"))?
+            {
+                Some(status) => break status,
+                None => std::thread::sleep(Duration::from_millis(100)),
+            }
+        };
+        let stderr = stderr
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        if let Some(reader) = stdout {
+            let _ = reader.join();
+        }
+        if status.success() {
             return Ok(());
         }
-        let detail = last_lines(&String::from_utf8_lossy(&output.stderr), 20);
+        let detail = last_lines(&String::from_utf8_lossy(&stderr), 20);
         if detail.trim().is_empty() {
-            bail!("{command} failed ({})", output.status);
+            bail!("{command} failed ({status})");
         }
         bail!("{command} failed: {detail}")
     }
@@ -420,20 +510,46 @@ impl Runner for SystemRunner {
     fn read(&self, path: &Path) -> Option<Vec<u8>> {
         std::fs::read(path).ok()
     }
+
+    fn cancel(&self) -> Option<&Cancel> {
+        Some(&self.cancel)
+    }
+}
+
+/// Read a child's pipe to the end on its own thread, so the child never blocks on a full
+/// pipe while the parent is polling for cancellation.
+fn drain(mut stream: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stream.read_to_end(&mut buffer);
+        buffer
+    })
 }
 
 /// Runs every step that is not already done, saving progress after each one.
 pub fn ensure(paths: &Paths, progress: Progress) -> Result<()> {
-    ensure_with(paths, &SystemRunner, progress)
+    ensure_with(paths, &SystemRunner::default(), progress)
+}
+
+/// [`ensure`] with a token that stops the running child and the next step.
+pub fn ensure_cancellable(paths: &Paths, progress: Progress, cancel: &Cancel) -> Result<()> {
+    ensure_with(paths, &SystemRunner::new(cancel.clone()), progress)
 }
 
 /// [`ensure`] with the IO injected; `Runner` is public only so tests can fake it.
 #[doc(hidden)]
 pub fn ensure_with(paths: &Paths, runner: &dyn Runner, progress: Progress) -> Result<()> {
+    let cancel = runner.cancel();
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        return Err(anyhow::Error::new(Cancelled));
+    }
     let mut state = State::load(paths);
     let mut uv = uv_program(paths, runner);
 
     for step in plan() {
+        if cancel.is_some_and(Cancel::is_cancelled) {
+            return Err(anyhow::Error::new(Cancelled));
+        }
         if state.is_done(step.id) && step_outputs_exist(step.id, paths, runner, uv.as_deref(), true)
         {
             continue;

@@ -145,14 +145,16 @@ when the model is missing it opens the window on a setup screen instead of stopp
 CLI instruction. The screen states the size (the sum of `setup::plan()`), starts
 `setup::ensure` on a thread only after the user presses Download, shows the current step and
 its progress, offers Retry after a failure, and hands the same window to the player once the
-file opens. `--smoke` still requires `flacify setup`, because a headless run cannot click.
+file opens. Cancel stops the running child through a token and keeps the finished steps;
+Resume re-enters the state machine and skips them. `--smoke` still requires `flacify setup`,
+because a headless run cannot click.
 
 Still to do:
 
 - Installer: `.msi` on Windows, `.app` + notarisation on macOS, AppImage/.deb on Linux.
 - Code signing. A `v*` tag already attaches a raw Windows `flacify.exe` from
   `.github/workflows/release.yml`.
-- Per-step byte progress, and cancellation that stops the running step cleanly.
+- Per-step byte progress (the bar still jumps 0→100 per step).
 - A hardware gate: a clear message and passthrough mode on 8 GB Macs or old GPUs.
 - Choosing the CUDA torch wheel without `FLACIFY_TORCH_INDEX` (a per-platform default or a
   documented `setup` flag).
@@ -366,9 +368,10 @@ the size is stated, the download starts on a button press, the step and its frac
 shown, a failure can be retried, and the window becomes the player. What it still does
 not do, in the order it would hurt:
 
-1. **No cancellation.** Closing the window kills the process and any `uv`/`pip` child with
-   it. `setup::ensure` has no token, so the next run redoes the step that was running. The
-   screen says this, but the app cannot stop a step cleanly and report it.
+1. ~~No cancellation.~~ **Done (2026-11-16):** a `Cancel` token runs through the state
+   machine and the real runner polls it while the child is alive, so Cancel (or closing the
+   window) kills the running `uv`/`curl`/`pip` step and keeps the finished ones. One gap
+   remains: a child that leaves a grandchild holding the pipes can delay the join.
 2. **The progress bar jumps, it does not move.** `Progress` reports a step at 0 and at 1,
    so the bar is empty or full for each step. Byte-level progress already exists inside the
    runner; it is not threaded out.

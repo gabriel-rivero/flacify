@@ -90,7 +90,7 @@ doc line that would have been wrong. No issue closes on "works on my machine".
 
 | # | title | acceptance |
 |---|---|---|
-| E7-1 | Model download: resume, checksum, mirror, cancel | survives a killed connection at 90% |
+| E7-1 | Model download: resume, checksum, mirror, cancel | survives a killed connection at 90% — partial 2026-11-16: cancel stops the running child and finished steps are kept; resume inside a step, checksum and a mirror are still missing |
 | E7-2 | Manual model-file escape hatch | user can point at a local `.onnx` |
 | E7-3 | Licence screen + attribution screen (`cargo-about`) | shown once, stored |
 | E7-4 | macOS `.app` + `.dmg`, signed and notarised | launches on a clean Mac with no dialog |

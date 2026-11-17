@@ -1,11 +1,15 @@
-//! What the A/B switch actually does: one position, two buffers, a short ramp.
+//! How the A/B switch works: one position, two signals, a short ramp.
 //!
 //! The two signals are the same length and the same sample rate, so "sample-locked"
 //! is not an alignment problem, it is a rule: every frame is read at the same index
-//! from both buffers and the choice only changes how much of each is mixed in. A
+//! from both sides and the choice only changes how much of each is mixed in. A
 //! hard switch would click whenever the waveforms differ at the cut, so the mix
 //! ramps over 8 ms, which is short enough to feel instant and long enough to hide the
 //! step.
+//!
+//! Both sides arrive either as whole buffers or from [`Reader`]'s decoded segments, and
+//! the mixing loop is the same one for both, so a cache hit and a whole-track render
+//! produce identical samples.
 //!
 //! Nothing here allocates, locks or logs: `fill` is called from the audio callback.
 
@@ -13,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::frontier::{Frontier, CHUNK_FRAMES};
+use crate::segments::Reader;
 
 /// How long the switch takes, in seconds.
 const RAMP_SECS: f32 = 0.008;
@@ -79,22 +84,30 @@ impl Controls {
     }
 }
 
-/// Cheap to clone: the buffers are shared and only the ramp state is copied, which is
-/// what lets the device open a second stream if the first buffer size is refused.
+/// Cheap to clone: the source is shared and only the ramp state is copied, which is what
+/// lets the device open a second stream if the first buffer size is refused.
 #[derive(Clone)]
-/// Where the generated signal comes from.
-enum Wet {
-    /// A completed track, same layout and length as the original.
-    Full(Arc<[f32]>),
-    /// Chunks published by the renderer as they finish; interleaved stereo at 48 kHz.
-    Frontier(Arc<Frontier>),
-    None,
+/// Where playback reads its two signals.
+enum Source {
+    /// Whole buffers, interleaved at the device's rate: the original and the completed
+    /// render when there is one.
+    Whole {
+        original: Arc<[f32]>,
+        enhanced: Option<Arc<[f32]>>,
+    },
+    /// A whole-track original with the generated side still being rendered.
+    Progressive {
+        original: Arc<[f32]>,
+        frontier: Arc<Frontier>,
+    },
+    /// A complete cache entry: both sides are decoded a segment at a time. The first play
+    /// of an uncached track keeps [`Source::Progressive`]; replacing it is a later change.
+    Segmented(Arc<Reader>),
 }
 
 #[derive(Clone)]
 pub struct Mixer {
-    original: Arc<[f32]>,
-    wet: Wet,
+    source: Source,
     channels: usize,
     ramp: f32,
     ramp_step: f32,
@@ -124,10 +137,9 @@ impl Mixer {
             promoted: AtomicBool::new(has_enhanced),
         });
         let mixer = Self {
-            original: original.into(),
-            wet: match enhanced {
-                Some(buffer) => Wet::Full(buffer.into()),
-                None => Wet::None,
+            source: Source::Whole {
+                original: original.into(),
+                enhanced: enhanced.map(Into::into),
             },
             channels,
             ramp: if has_enhanced { 1.0 } else { 0.0 },
@@ -161,8 +173,10 @@ impl Mixer {
             promoted: AtomicBool::new(false),
         });
         let mixer = Self {
-            original: original.into(),
-            wet: Wet::Frontier(frontier),
+            source: Source::Progressive {
+                original: original.into(),
+                frontier,
+            },
             channels,
             ramp: 0.0,
             ramp_step: 1.0 / (RAMP_SECS * sample_rate.max(1) as f32),
@@ -171,24 +185,55 @@ impl Mixer {
         (mixer, controls)
     }
 
-    /// The buffers themselves, for the window to draw. `Arc` clones: no copy.
-    pub fn original_arc(&self) -> &Arc<[f32]> {
-        &self.original
+    /// Play a complete cache entry from its segments. Stereo only, because a segment is
+    /// never resampled or remapped on the way to the device.
+    pub fn segmented(reader: Arc<Reader>, sample_rate: u32) -> (Self, Arc<Controls>) {
+        let has_enhanced = reader.has_rendered();
+        let controls = Arc::new(Controls {
+            position: AtomicUsize::new(0),
+            playing: AtomicBool::new(false),
+            use_enhanced: AtomicBool::new(has_enhanced),
+            frames: reader.frames(),
+            has_enhanced,
+            auto_promote: AtomicBool::new(false),
+            promoted: AtomicBool::new(has_enhanced),
+        });
+        let mixer = Self {
+            source: Source::Segmented(reader),
+            channels: 2,
+            ramp: if has_enhanced { 1.0 } else { 0.0 },
+            ramp_step: 1.0 / (RAMP_SECS * sample_rate.max(1) as f32),
+            controls: Arc::clone(&controls),
+        };
+        (mixer, controls)
     }
 
-    pub fn generated_arc(&self) -> Option<Arc<[f32]>> {
-        match &self.wet {
-            Wet::Full(buffer) => Some(Arc::clone(buffer)),
+    /// The whole-track original, for the window to draw. `None` on the segmented path,
+    /// which holds no whole-track buffer.
+    pub fn display_original(&self) -> Option<Arc<[f32]>> {
+        match &self.source {
+            Source::Whole { original, .. } | Source::Progressive { original, .. } => {
+                Some(Arc::clone(original))
+            }
+            Source::Segmented(_) => None,
+        }
+    }
+
+    pub fn display_generated(&self) -> Option<Arc<[f32]>> {
+        match &self.source {
+            Source::Whole {
+                enhanced: Some(buffer),
+                ..
+            } => Some(Arc::clone(buffer)),
             _ => None,
         }
     }
 
     /// How many frames of generated audio exist at or beyond the playhead.
     pub fn ready_frames(&self) -> usize {
-        match &self.wet {
-            Wet::Full(_) => self.controls.frames,
-            Wet::Frontier(frontier) => frontier.ready_frames(),
-            Wet::None => 0,
+        match &self.source {
+            Source::Progressive { frontier, .. } => frontier.ready_frames(),
+            Source::Whole { .. } | Source::Segmented(_) => self.controls.frames,
         }
     }
 
@@ -236,27 +281,50 @@ impl Mixer {
             // Never mix past the end of the track; the next iteration writes silence.
             let want = (frames - written).min(self.controls.frames - position);
 
-            match &self.wet {
-                // A finished track: one stretch, no chunk bookkeeping.
-                Wet::Full(buffer) => {
+            match &self.source {
+                // A whole track: one stretch, no segment bookkeeping.
+                Source::Whole {
+                    original,
+                    enhanced: Some(enhanced),
+                } => {
                     mix_stretch(
                         &mut ramp,
                         ramp_step,
-                        &self.original,
                         out,
                         written,
                         position,
                         want,
                         channels,
                         target,
-                        |frame, channel| buffer[frame * channels + channel],
+                        |frame, channel| original[frame * channels + channel],
+                        |frame, channel| enhanced[frame * channels + channel],
+                    );
+                    position += want;
+                    written += want;
+                }
+                // Nothing generated: both sides are the original, so the toggle is a no-op.
+                Source::Whole {
+                    original,
+                    enhanced: None,
+                } => {
+                    mix_stretch(
+                        &mut ramp,
+                        ramp_step,
+                        out,
+                        written,
+                        position,
+                        want,
+                        channels,
+                        target,
+                        |frame, channel| original[frame * channels + channel],
+                        |frame, channel| original[frame * channels + channel],
                     );
                     position += want;
                     written += want;
                 }
                 // Progressive: at most one chunk per iteration, so the slot is loaded
                 // once per second of audio instead of once per sample.
-                Wet::Frontier(frontier) => {
+                Source::Progressive { original, frontier } => {
                     let (_, guard, chunk_end) = frontier.chunk_at(position);
                     let chunk = guard.as_ref();
                     let span = (chunk_end.min(position + want))
@@ -265,40 +333,55 @@ impl Mixer {
                     mix_stretch(
                         &mut ramp,
                         ramp_step,
-                        &self.original,
                         out,
                         written,
                         position,
                         span,
                         channels,
                         target,
+                        |frame, channel| original[frame * channels + channel],
                         |frame, channel| match chunk {
                             // `frame` is absolute; the chunk holds one second from its
                             // own start. Chunks are interleaved stereo, and only stereo
                             // devices take this path (the engine guarantees it).
                             Some(samples) => samples[(frame % CHUNK_FRAMES) * 2 + channel],
-                            None => self.original[frame * channels + channel],
+                            None => original[frame * channels + channel],
                         },
                     );
                     position += span;
                     written += span;
                 }
-                // Nothing generated at all: still ramp, so the toggle is a no-op.
-                Wet::None => {
+                // Segmented: at most one decoded segment per iteration. The worker is
+                // told where the playhead went. Until it catches up, the fill holds the
+                // position and writes silence: it never repeats a stale frame and never
+                // waits for the decode.
+                Source::Segmented(reader) => {
+                    reader.request(position);
+                    let guard = reader.segment_at(position);
+                    let Some(segment) = guard.as_ref() else {
+                        out[written * channels..].fill(0.0);
+                        break;
+                    };
+                    let start = segment.start();
+                    let offset = position - start;
+                    let span = (frames - written)
+                        .min(segment.frames() - offset)
+                        .min(self.controls.frames - position)
+                        .max(1);
                     mix_stretch(
                         &mut ramp,
                         ramp_step,
-                        &self.original,
                         out,
                         written,
                         position,
-                        want,
+                        span,
                         channels,
                         target,
-                        |frame, channel| self.original[frame * channels + channel],
+                        |frame, channel| segment.dry(frame - start, channel),
+                        |frame, channel| segment.wet(frame - start, channel),
                     );
-                    position += want;
-                    written += want;
+                    position += span;
+                    written += span;
                 }
             }
         }
@@ -309,30 +392,30 @@ impl Mixer {
     }
 }
 
-/// Mix `want` frames starting at `position` into `out[written..]`.
+/// Mix `want` frames starting at the playhead into `out[written..]`.
 ///
 /// Free function rather than a method: the caller holds an immutable borrow of the
-/// generated side while mixing, and only the ramp is mutable state.
+/// source while mixing, and only the ramp is mutable state. Both sides are closures so
+/// a whole buffer and a decoded segment fill the loop with the same arithmetic.
 #[allow(clippy::too_many_arguments)]
 fn mix_stretch(
     ramp: &mut f32,
     ramp_step: f32,
-    original: &[f32],
     out: &mut [f32],
     written: usize,
     position: usize,
     want: usize,
     channels: usize,
     target: f32,
+    dry: impl Fn(usize, usize) -> f32,
     wet: impl Fn(usize, usize) -> f32,
 ) {
     for index in 0..want {
         let delta = (target - *ramp).clamp(-ramp_step, ramp_step);
         *ramp += delta;
         let frame = position + index;
-        let base = frame * channels;
         for channel in 0..channels {
-            let dry = original[base + channel];
+            let dry = dry(frame, channel);
             let generated = if *ramp > 0.0 {
                 wet(frame, channel)
             } else {
@@ -345,7 +428,209 @@ fn mix_stretch(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::segments::{self, MemorySource, Resident};
+
+    /// The segment length the segmented tests use: small enough to cross a boundary in a
+    /// few thousand frames, so a seek lands in another segment.
+    const SEGMENT: usize = 10_000;
+
+    /// The two sides of one synthetic track, as whole interleaved buffers.
+    fn whole(frames: usize) -> (Vec<f32>, Vec<f32>) {
+        (
+            segments::memory_interleaved(frames, 0.0, 2),
+            segments::memory_interleaved(frames, 1_000.0, 2),
+        )
+    }
+
+    fn bits(samples: &[f32]) -> Vec<u32> {
+        samples.iter().map(|sample| sample.to_bits()).collect()
+    }
+
+    /// A mixer over segments, plus the reader behind it, at the same track as [`whole`].
+    fn segmented(frames: usize) -> (Mixer, Arc<Controls>, Arc<segments::Reader>) {
+        let reader = segments::Reader::open(
+            Arc::new(MemorySource::new(frames, SEGMENT, 0.0)),
+            Some(Arc::new(MemorySource::new(frames, SEGMENT, 1_000.0))),
+        )
+        .expect("a reader");
+        let (mixer, controls) = Mixer::segmented(Arc::clone(&reader), 48_000);
+        (mixer, controls, reader)
+    }
+
+    /// Fill once before measuring: the first guard load on a thread initialises
+    /// `arc-swap`'s per-thread debt list, which is not part of the callback's steady state.
+    fn warm_up(mixer: &mut Mixer, out: &mut [f32]) {
+        mixer.fill(out);
+    }
+
+    /// Move the playhead and let the worker catch up, so a fill is not comparing a decoded
+    /// segment with a prefetch that is still running.
+    fn seek(frame: usize, controls: &Arc<Controls>, reader: &segments::Reader) {
+        controls.seek_frames(frame);
+        reader.request(frame);
+        assert!(
+            reader.wait_until_ready(frame, Duration::from_secs(5)),
+            "the segment at {frame} must be decoded before the comparison"
+        );
+    }
+
+    #[test]
+    fn given_the_same_audio_as_a_whole_buffer_and_as_segments_when_mixed_then_the_samples_are_identical(
+    ) {
+        let frames = 3 * SEGMENT + 1_234;
+        let (mixer_original, mixer_enhanced) = whole(frames);
+        let (mut whole_mixer, whole_controls) =
+            Mixer::new(mixer_original, Some(mixer_enhanced), 2, 48_000);
+        let (mut segment_mixer, segment_controls, reader) = segmented(frames);
+        whole_controls.set_playing(true);
+        segment_controls.set_playing(true);
+
+        // Two segments' worth from the start: the stretch crosses the boundary at 10 000,
+        // which is the only place a segment-backed mixer could disagree.
+        let mut whole_out = vec![0.0f32; 2 * SEGMENT * 2];
+        let mut segment_out = vec![0.0f32; 2 * SEGMENT * 2];
+        assert_eq!(
+            whole_mixer.fill(&mut whole_out),
+            segment_mixer.fill(&mut segment_out)
+        );
+        assert_eq!(
+            bits(&whole_out),
+            bits(&segment_out),
+            "the first stretch crosses a segment boundary"
+        );
+
+        // The toggle and its 8 ms ramp must behave the same on both.
+        whole_controls.toggle();
+        segment_controls.toggle();
+        seek(2 * SEGMENT, &segment_controls, &reader);
+        whole_controls.seek_frames(2 * SEGMENT);
+        let mut whole_back = vec![0.0f32; 5_000 * 2];
+        let mut segment_back = vec![0.0f32; 5_000 * 2];
+        whole_mixer.fill(&mut whole_back);
+        segment_mixer.fill(&mut segment_back);
+        assert_eq!(bits(&whole_back), bits(&segment_back), "the dry ramp");
+
+        // A seek into the last segment: the next fill must read that segment's samples.
+        seek(2 * SEGMENT + 17, &segment_controls, &reader);
+        whole_controls.seek_frames(2 * SEGMENT + 17);
+        let mut whole_seek = vec![0.0f32; 7_000 * 2];
+        let mut segment_seek = vec![0.0f32; 7_000 * 2];
+        whole_mixer.fill(&mut whole_seek);
+        segment_mixer.fill(&mut segment_seek);
+        assert_eq!(
+            bits(&whole_seek),
+            bits(&segment_seek),
+            "a seeked fill must read the segment it landed in"
+        );
+        assert_eq!(
+            segment_controls.position_frames(),
+            whole_controls.position_frames()
+        );
+    }
+
+    #[test]
+    fn given_a_seek_into_another_segment_when_filled_then_the_previous_segment_is_dropped() {
+        let (mut mixer, controls, reader) = segmented(8 * SEGMENT);
+        controls.set_playing(true);
+        let mut out = vec![0.0f32; 1_000 * 2];
+        mixer.fill(&mut out);
+        assert_eq!(reader.resident_indexes(), [0, 1]);
+
+        seek(5 * SEGMENT, &controls, &reader);
+        mixer.fill(&mut out);
+
+        assert_eq!(reader.resident_indexes(), [5, 6]);
+        assert!(
+            reader.segment_at(0).as_ref().is_none(),
+            "the segment at the old playhead must be gone"
+        );
+    }
+
+    #[test]
+    fn given_a_segment_with_no_rendered_side_when_filled_then_it_emits_the_original_and_allocates_nothing(
+    ) {
+        let frames = SEGMENT;
+        let dry: Vec<f32> = {
+            let mut planar = Vec::with_capacity(frames * 2);
+            for channel in 0..2 {
+                for frame in 0..frames {
+                    planar.push(segments::memory_sample(frame, channel, 0.0));
+                }
+            }
+            planar
+        };
+        let resident = Resident::new(0, 0, frames, Arc::from(dry), None);
+        let reader = segments::Reader::with_residents(
+            Arc::new(MemorySource::new(frames, SEGMENT, 0.0)),
+            Some(Arc::new(MemorySource::new(frames, SEGMENT, 1_000.0))),
+            vec![resident],
+        );
+        let (mut mixer, controls) = Mixer::segmented(Arc::clone(&reader), 48_000);
+        controls.set_playing(true);
+        // The ramp is at 1.0 because the entry has a rendered side, so a missing segment
+        // is the only reason a sample would not be the rendered one.
+        assert!(controls.is_enhanced());
+
+        let mut out = vec![0.0f32; 4_000 * 2];
+        let (written, allocated) = crate::alloc_counter::measure(|| mixer.fill(&mut out));
+        assert_eq!(written, 4_000);
+        assert_eq!(allocated, 0, "the callback must not allocate");
+        for frame in 0..4_000 {
+            for channel in 0..2 {
+                assert_eq!(
+                    out[frame * 2 + channel],
+                    segments::memory_sample(frame, channel, 0.0),
+                    "frame {frame} channel {channel} must be the original"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_resident_segment_when_filled_then_the_callback_allocates_nothing() {
+        let (mut mixer, controls, reader) = segmented(6 * SEGMENT);
+        controls.set_playing(true);
+        let mut out = vec![0.0f32; 4_000 * 2];
+        warm_up(&mut mixer, &mut out);
+        seek(0, &controls, &reader);
+        let (written, allocated) = crate::alloc_counter::measure(|| mixer.fill(&mut out));
+        assert_eq!(written, 4_000);
+        assert_eq!(allocated, 0, "the callback must not allocate");
+    }
+
+    #[test]
+    fn given_a_playhead_further_than_the_prefetch_when_filled_then_it_holds_and_writes_silence() {
+        // No worker at all: nothing is resident, which is what a seek past the prefetch
+        // looks like to the callback before the worker catches up.
+        let reader = segments::Reader::with_residents(
+            Arc::new(MemorySource::new(8 * SEGMENT, SEGMENT, 0.0)),
+            None,
+            Vec::new(),
+        );
+        let (mut mixer, controls) = Mixer::segmented(Arc::clone(&reader), 48_000);
+        controls.set_playing(true);
+        assert!(
+            !controls.has_enhanced,
+            "a reader with no rendered side has nothing to switch to"
+        );
+        controls.seek_frames(7 * SEGMENT);
+
+        let mut out = vec![1.0f32; 1_000 * 2];
+        warm_up(&mut mixer, &mut out);
+        out.fill(1.0);
+        let (written, allocated) = crate::alloc_counter::measure(|| mixer.fill(&mut out));
+        assert_eq!(written, 0, "the fill must hold rather than block");
+        assert_eq!(allocated, 0, "the callback must not allocate");
+        assert!(out.iter().all(|sample| *sample == 0.0));
+        assert_eq!(
+            controls.position_frames(),
+            7 * SEGMENT,
+            "the playhead must not advance over frames it could not read"
+        );
+    }
 
     fn ramp_track(frames: usize, offset: f32) -> Vec<f32> {
         (0..frames)

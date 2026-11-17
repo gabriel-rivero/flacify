@@ -17,8 +17,10 @@
 //! error, not a miss: silence about one is how you end up debugging audio that plays the
 //! wrong thing.
 //!
-//! Seeking needs nothing from the cache beyond what playback already does: the entry is
-//! decoded into memory and the playhead is an index.
+//! Two ways out of an entry: [`Cache::load`] gathers every segment into one buffer, for the
+//! paths that need a whole track, and [`Cache::segments`] opens the entry for reads of one
+//! segment at a time, which is what playback of a complete entry does. Seeking needs
+//! nothing from the cache beyond that: the playhead is an index into a segment.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -107,8 +109,8 @@ pub struct Meta {
     /// accepted, which is a deliberate prototype compromise (fp32 devices agree to
     /// within the gate, but they are not bit-identical).
     pub device: String,
-    /// Whether the segment table is the whole track. A manifest written before
-    /// this field existed reads as partial; only a writer marks an entry complete.
+    /// Whether the segment table is the whole track. A manifest written before this
+    /// field existed reads as partial; only a writer marks an entry complete.
     #[serde(default)]
     pub state: State,
     /// Frames the listed segments cover. On a complete entry this is all of `frames`.
@@ -156,6 +158,43 @@ impl Fields {
 pub struct Cached {
     pub planar: Vec<f32>,
     pub meta: Meta,
+}
+
+/// A complete entry opened for segment reads: the manifest, validated, and nothing decoded.
+#[derive(Debug)]
+pub struct Segments {
+    dir: PathBuf,
+    meta: Meta,
+}
+
+impl Segments {
+    /// What the entry records about itself.
+    pub fn meta(&self) -> &Meta {
+        &self.meta
+    }
+
+    /// Planar 48 kHz stereo for segment `index`, whole, in its own frame range.
+    pub fn read_segment(&self, index: usize) -> Result<Vec<f32>> {
+        let manifest = self.dir.join(MANIFEST);
+        let expected =
+            expected_segment_frames(self.meta.frames, self.meta.frames_per_segment, index)
+                .with_context(|| format!("{} has no segment {index}", manifest.display()))?;
+        Ok(decode_segment(&self.dir, &manifest, index, expected)?.planar)
+    }
+
+    /// The whole entry as one channel-major buffer, for the paths that need a track.
+    pub fn read_all(&self) -> Result<Vec<f32>> {
+        let mut left = Vec::with_capacity(self.meta.frames);
+        let mut right = Vec::with_capacity(self.meta.frames);
+        for segment in &self.meta.segments {
+            let planar = self.read_segment(segment.index)?;
+            left.extend_from_slice(&planar[..segment.frames]);
+            right.extend_from_slice(&planar[segment.frames..]);
+        }
+        let mut planar = left;
+        planar.extend_from_slice(&right);
+        Ok(planar)
+    }
 }
 
 /// What a writer records before its first segment: which render the entry belongs to,
@@ -212,12 +251,27 @@ impl Cache {
         self.load_dir(&self.entry_dir(key))
     }
 
-    /// Find an entry by the source file and settings it was made from, ignoring which model
-    /// rendered it. Used when the model is not installed: the id cannot be computed, and
-    /// an existing render is better than a setup screen. Only entries that recorded their
-    /// fields can match; `annotate` fills them on a ready play. A partial entry is a miss,
-    /// so the search skips it.
-    pub fn find(&self, fields: &Fields) -> Result<Option<Cached>> {
+    /// The complete entry at `key`, opened for segment reads instead of decoded whole.
+    /// `None` on the same terms as [`load`](Self::load).
+    pub fn segments(&self, key: &str) -> Result<Option<Segments>> {
+        self.segments_dir(&self.entry_dir(key))
+    }
+
+    /// The complete entry for the source file and settings it was made from, ignoring
+    /// which model rendered it. Used when the model is not installed: the id cannot be
+    /// computed, and an existing render is better than a setup screen. Only entries that
+    /// recorded their fields can match; `annotate` fills them on a ready play. A partial
+    /// entry is a miss, so the search skips it.
+    pub fn find_segments(&self, fields: &Fields) -> Result<Option<Segments>> {
+        match self.matching_dir(fields)? {
+            Some(dir) => self.segments_dir(&dir),
+            None => Ok(None),
+        }
+    }
+
+    /// The directory of the complete entry whose recorded fields match, in name order so a
+    /// source rendered by more than one model resolves to the same entry on every run.
+    fn matching_dir(&self, fields: &Fields) -> Result<Option<PathBuf>> {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return Ok(None);
         };
@@ -227,14 +281,13 @@ impl Cache {
             .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
             .map(|entry| entry.path())
             .collect();
-        // Sorted, so a source rendered by more than one model resolves to the same entry
-        // on every run instead of whichever the filesystem lists first.
         dirs.sort();
         for dir in dirs {
             let Ok(Some(meta)) = self.read_meta(&dir) else {
                 continue;
             };
             if meta.version != CACHE_VERSION
+                || meta.state != State::Complete
                 || meta.source_hash != fields.source_hash
                 || meta.window != fields.window
                 || meta.overlap != fields.overlap
@@ -242,10 +295,7 @@ impl Cache {
             {
                 continue;
             }
-            // A partial entry loads as nothing, so the search moves on to the next one.
-            if let Some(cached) = self.load_dir(&dir)? {
-                return Ok(Some(cached));
-            }
+            return Ok(Some(dir));
         }
         Ok(None)
     }
@@ -281,10 +331,28 @@ impl Cache {
         let manifest = dir.join(MANIFEST);
         validate_manifest(&manifest, &meta)?;
 
-        // Each segment is channel-major for its own frame range; the entry is channel-major
-        // for the whole track, so the planes are gathered separately and joined once.
-        let mut left = Vec::with_capacity(meta.frames);
-        let mut right = Vec::with_capacity(meta.frames);
+        let planar = Segments {
+            dir: dir.to_path_buf(),
+            meta: meta.clone(),
+        }
+        .read_all()?;
+
+        touch(dir, &mut meta);
+        Ok(Some(Cached { planar, meta }))
+    }
+
+    /// The same checks as [`load_dir`](Self::load_dir), without decoding a sample. Every
+    /// segment the manifest names has to be there; whether it decodes is checked when it
+    /// is read.
+    fn segments_dir(&self, dir: &Path) -> Result<Option<Segments>> {
+        let Some(mut meta) = self.read_meta(dir)? else {
+            return Ok(None);
+        };
+        if meta.version != CACHE_VERSION || meta.state != State::Complete {
+            return Ok(None);
+        }
+        let manifest = dir.join(MANIFEST);
+        validate_manifest(&manifest, &meta)?;
         for segment in &meta.segments {
             let path = dir.join(segment_name(segment.index));
             anyhow::ensure!(
@@ -293,41 +361,12 @@ impl Cache {
                 manifest.display(),
                 path.display()
             );
-            let decoded = crate::decode::decode(&path).with_context(|| {
-                format!("reading segment {} of {}", segment.index, dir.display())
-            })?;
-            anyhow::ensure!(
-                decoded.sample_rate == flacify_core::SAMPLE_RATE && decoded.channels == 2,
-                "{} is {} Hz with {} channels; cache segments are 48 kHz stereo",
-                path.display(),
-                decoded.sample_rate,
-                decoded.channels
-            );
-            anyhow::ensure!(
-                decoded.frames == segment.frames,
-                "{} holds {} frames, {} says {}",
-                path.display(),
-                decoded.frames,
-                manifest.display(),
-                segment.frames
-            );
-            left.extend_from_slice(&decoded.planar[..segment.frames]);
-            right.extend_from_slice(&decoded.planar[segment.frames..]);
         }
-        let mut planar = left;
-        planar.extend_from_slice(&right);
-
-        meta.last_used = now();
-        if let Err(error) = write_manifest(dir, &meta) {
-            // A playable entry matters more than its timestamp: eviction will read the
-            // stale time as an older entry, not as a corrupt one.
-            tracing::warn!(
-                %error,
-                entry = %dir.display(),
-                "could not record when the cache entry was last used"
-            );
-        }
-        Ok(Some(Cached { planar, meta }))
+        touch(dir, &mut meta);
+        Ok(Some(Segments {
+            dir: dir.to_path_buf(),
+            meta,
+        }))
     }
 
     fn read_meta(&self, dir: &Path) -> Result<Option<Meta>> {
@@ -600,6 +639,39 @@ impl EntryWriter {
     pub fn abandon(self) {}
 }
 
+/// Decode one segment of an entry and check it is what the manifest promises.
+fn decode_segment(
+    dir: &Path,
+    manifest: &Path,
+    index: usize,
+    frames: usize,
+) -> Result<crate::decode::Decoded> {
+    let path = dir.join(segment_name(index));
+    anyhow::ensure!(
+        path.is_file(),
+        "{} names a segment that is missing: {}",
+        manifest.display(),
+        path.display()
+    );
+    let decoded = crate::decode::decode(&path)
+        .with_context(|| format!("reading segment {index} of {}", dir.display()))?;
+    anyhow::ensure!(
+        decoded.sample_rate == flacify_core::SAMPLE_RATE && decoded.channels == 2,
+        "{} is {} Hz with {} channels; cache segments are 48 kHz stereo",
+        path.display(),
+        decoded.sample_rate,
+        decoded.channels
+    );
+    anyhow::ensure!(
+        decoded.frames == frames,
+        "{} holds {} frames, {} says {frames}",
+        path.display(),
+        decoded.frames,
+        manifest.display()
+    );
+    Ok(decoded)
+}
+
 /// Frames per segment, derived from the settings so that every segment starts on a
 /// multiple of the render step. The source tier uses the same length.
 pub(crate) fn frames_per_segment(window: usize, overlap: usize) -> Result<usize> {
@@ -811,6 +883,20 @@ fn write_manifest(dir: &Path, meta: &Meta) -> Result<()> {
             .with_context(|| format!("flushing {}", temp.display()))?;
     }
     std::fs::rename(&temp, &path).with_context(|| format!("replacing {}", path.display()))
+}
+
+/// Record that an entry was read, so eviction sees it as used. Best effort: a playable
+/// entry matters more than its timestamp, and a stale time reads as an older entry rather
+/// than a corrupt one.
+fn touch(dir: &Path, meta: &mut Meta) {
+    meta.last_used = now();
+    if let Err(error) = write_manifest(dir, meta) {
+        tracing::warn!(
+            %error,
+            entry = %dir.display(),
+            "could not record when the cache entry was last used"
+        );
+    }
 }
 
 /// Flush one file's bytes to disk.
@@ -1060,6 +1146,87 @@ mod tests {
         for (index, (&expected, &actual)) in render.planar.iter().zip(&cached.planar).enumerate() {
             assert_eq!(actual, expected, "sample {index}: {actual} != {expected}");
         }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_stored_entry_when_read_a_segment_at_a_time_then_each_segment_is_that_slice_of_the_whole(
+    ) {
+        let root = temp_cache("segment-reads");
+        let cache = Cache::new(root.clone());
+        let fields = fields_with_short_segments();
+        let frames = SEGMENT_FRAMES * 3 + 500;
+        let render = render_of(frames);
+        cache
+            .store("key", &render, 12_000, &fields)
+            .expect("storing");
+
+        let segments = cache
+            .segments("key")
+            .expect("opening")
+            .expect("a complete entry");
+        assert_eq!(segments.meta().frames, frames);
+        assert_eq!(segments.meta().gain_db, Some(0.0));
+        for index in 0..4 {
+            assert_eq!(
+                segments.read_segment(index).expect("reading a segment"),
+                segment_planar(&render, frames, index),
+                "segment {index} must be the slice the whole-track read gives"
+            );
+        }
+        let error = segments
+            .read_segment(4)
+            .expect_err("there is no fifth segment");
+        assert!(format!("{error:#}").contains("no segment 4"), "{error:#}");
+        assert_eq!(
+            segments.read_all().expect("the whole entry"),
+            render.planar,
+            "the segments assemble into the whole track"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_complete_entry_with_a_missing_segment_when_opened_for_segments_then_it_is_an_error()
+    {
+        let root = temp_cache("segment-missing");
+        let cache = Cache::new(root.clone());
+        let (fields, _frames, render) = four_segments();
+        cache
+            .store("key", &render, 12_000, &fields)
+            .expect("storing");
+        std::fs::remove_file(cache.entry_dir("key").join("seg-000002.flac"))
+            .expect("removing a segment");
+
+        let error = cache
+            .segments("key")
+            .expect_err("a missing segment is an error, not a miss");
+        let text = format!("{error:#}");
+        assert!(text.contains("seg-000002.flac"), "{text}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_stored_entry_when_searched_by_its_fields_then_the_same_entry_opens() {
+        let root = temp_cache("find-segments");
+        let cache = Cache::new(root.clone());
+        let (fields, frames, render) = four_segments();
+        cache
+            .store("key", &render, 12_000, &fields)
+            .expect("storing");
+
+        let found = cache
+            .find_segments(&fields)
+            .expect("searching")
+            .expect("the complete entry");
+        assert_eq!(found.meta().frames, frames);
+        assert!(cache
+            .find_segments(&Fields {
+                source_hash: "another source".into(),
+                ..fields
+            })
+            .expect("searching")
+            .is_none());
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1432,7 +1599,11 @@ mod tests {
             "a partial entry is a miss"
         );
         assert!(
-            cache.find(&fields).expect("searching").is_none(),
+            cache.segments("key").expect("no error").is_none(),
+            "a partial entry cannot back segmented playback"
+        );
+        assert!(
+            cache.find_segments(&fields).expect("searching").is_none(),
             "a search never returns a partial entry"
         );
         let dir = cache.entry_dir("key");
@@ -1928,11 +2099,11 @@ mod tests {
             .expect("storing");
 
         let found = cache
-            .find(&fields)
+            .find_segments(&fields)
             .expect("searching")
             .expect("the complete entry");
-        assert_eq!(found.meta.state, State::Complete);
-        assert_eq!(found.meta.frames, SEGMENT_FRAMES);
+        assert_eq!(found.meta().state, State::Complete);
+        assert_eq!(found.meta().frames, SEGMENT_FRAMES);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1978,15 +2149,18 @@ mod tests {
 
         // The model id is ignored: on a machine without the model it cannot be computed,
         // and either entry is the same source file and settings.
-        let found = cache.find(&fields()).expect("searching").expect("an entry");
-        assert_eq!(found.meta.frames, 4_800);
-        assert_eq!(found.meta.source_hash, "source");
+        let found = cache
+            .find_segments(&fields())
+            .expect("searching")
+            .expect("an entry");
+        assert_eq!(found.meta().frames, 4_800);
+        assert_eq!(found.meta().source_hash, "source");
 
         let other = Fields {
             source_hash: "different".into(),
             ..fields()
         };
-        assert!(cache.find(&other).expect("searching").is_none());
+        assert!(cache.find_segments(&other).expect("searching").is_none());
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -2003,12 +2177,12 @@ mod tests {
         cache.store(&key, &render, 12_000, &blank).expect("storing");
 
         assert!(
-            cache.find(&fields()).expect("searching").is_none(),
+            cache.find_segments(&fields()).expect("searching").is_none(),
             "an entry without its fields cannot match"
         );
         cache.annotate(&key, &fields()).expect("annotating");
         assert!(
-            cache.find(&fields()).expect("searching").is_some(),
+            cache.find_segments(&fields()).expect("searching").is_some(),
             "the annotation makes it findable"
         );
         let meta = stored_meta(&cache, &key);

@@ -17,6 +17,7 @@ mod loudness;
 mod player;
 mod render;
 mod render_status;
+mod segments;
 mod session;
 mod setup;
 mod source;
@@ -383,3 +384,59 @@ fn report(playback: &Playback, started: Instant) -> Result<()> {
     }
     Ok(())
 }
+
+/// Counts allocations on the calling thread. Exists so a test can pin the audio
+/// callback's no-allocation guarantee instead of restating it in a comment.
+#[cfg(test)]
+mod alloc_counter {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// `Some(bytes)` while a measurement is armed on this thread.
+        static ALLOCATED: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub struct Counting;
+
+    // SAFETY: every method forwards to `System`, which is the allocator these tests would
+    // otherwise use; the counter is bookkeeping that never touches the returned pointer.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            add(layout.size());
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            // A realloc moves the allocation, so count the new bytes rather than the
+            // difference: only "did it allocate anything" is asked of this number.
+            add(new_size);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    fn add(bytes: usize) {
+        // `try_with`: an allocation during thread teardown must not panic in the allocator.
+        let _ = ALLOCATED.try_with(|count| {
+            if let Some(total) = count.get() {
+                count.set(Some(total + bytes));
+            }
+        });
+    }
+
+    /// The bytes `body` allocated on this thread, with its result.
+    pub fn measure<T>(body: impl FnOnce() -> T) -> (T, usize) {
+        ALLOCATED.with(|total| total.set(Some(0)));
+        let value = body();
+        let bytes = ALLOCATED.with(|total| total.replace(None)).unwrap_or(0);
+        (value, bytes)
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: alloc_counter::Counting = alloc_counter::Counting;

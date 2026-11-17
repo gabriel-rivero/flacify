@@ -10,6 +10,7 @@ mod decode;
 mod device;
 mod diagnose;
 mod first_run;
+mod flac;
 mod frontier;
 mod limit;
 mod loudness;
@@ -62,7 +63,8 @@ enum Command {
         #[arg(long, default_value_t = 0.3)]
         rtf: f64,
     },
-    /// Render the generated high band and write a 32-bit float WAV.
+    /// Render the generated high band and write a 32-bit float WAV, or a 24-bit FLAC
+    /// when the output name ends in `.flac`.
     Enhance {
         file: PathBuf,
         /// Defaults to <name>.flacify.wav next to the input.

@@ -16,6 +16,7 @@ flacify-core.workspace = true
 flacify-infer.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+flacenc.workspace = true
 hound.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

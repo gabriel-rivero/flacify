@@ -18,6 +18,7 @@ flacify-infer = { path = "crates/infer" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+flacenc = { version = "0.5.1", default-features = false }
 hound = "3.5"
 realfft = "3.4"
 serde = { version = "1", features = ["derive"] }

@@ -14,7 +14,7 @@ pub mod upscaler;
 
 pub use block::Block;
 pub use error::{Error, Result};
-pub use pipeline::Pipeline;
+pub use pipeline::{Pipeline, Tail};
 pub use policy::{plan, Mode, Plan, Probe, Warning};
 pub use preprocess::Preprocessor;
 pub use upscaler::Upscaler;

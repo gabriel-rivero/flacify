@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=flacify
+Comment=Reconstruct the high frequencies lossy audio threw away
+Exec=flacify play %f
+Type=Application
+Categories=AudioVideo;Audio;Player;
+MimeType=audio/mpeg;audio/flac;audio/x-wav;audio/ogg;audio/mp4;

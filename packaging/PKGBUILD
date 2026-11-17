@@ -1,0 +1,42 @@
+# Maintainer: Gabriel Rivero <gabriel.rivero.sa@gmail.com>
+#
+# A binary package of the released Linux build. It installs the same binary the .deb
+# carries, so there is no toolchain and no build on the user's machine.
+#
+# The release workflow fills PKGVER and the checksum in from the artifact it just built;
+# when building by hand, compute the hash of flacify-$pkgver-x86_64.tar.gz and set both.
+
+pkgname=flacify-bin
+pkgver=0.4.0
+pkgrel=1
+pkgdesc="Desktop player that reconstructs the high frequencies lossy audio threw away"
+arch=('x86_64')
+url="https://github.com/gabriel-rivero/flacify"
+license=('MIT')
+# The binary links only alsa, libc and libgcc; GL, X11 and Wayland are opened at runtime
+# when the window and the audio device start, so they are dependencies all the same.
+depends=(
+  'glibc'
+  'gcc-libs'
+  'alsa-lib'
+  'libglvnd'
+  'libx11'
+  'libxcursor'
+  'libxrandr'
+  'libxi'
+  'libxinerama'
+  'libxkbcommon'
+  'wayland'
+  'fontconfig'
+)
+provides=('flacify')
+conflicts=('flacify')
+options=('!strip' '!debug')
+source=("$url/releases/download/v$pkgver/flacify-$pkgver-x86_64.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  install -Dm755 "$srcdir/flacify" "$pkgdir/usr/bin/flacify"
+  install -Dm644 "$srcdir/flacify.desktop" "$pkgdir/usr/share/applications/flacify.desktop"
+  install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

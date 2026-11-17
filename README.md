@@ -66,7 +66,10 @@ which builds and attaches:
 
 - **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) and the raw `flacify.exe`.
 - **macOS:** `flacify.dmg` containing `Flacify.app`.
-- **Linux:** `flacify_0.4.0_amd64.deb`.
+- **Debian and Ubuntu:** `flacify_0.4.0_amd64.deb` (`sudo apt install ./flacify_0.4.0_amd64.deb`).
+- **Arch and CachyOS:** `flacify-bin-0.4.0-1-x86_64.pkg.tar.zst`
+  (`sudo pacman -U flacify-bin-0.4.0-1-x86_64.pkg.tar.zst`). The binary needs only alsa,
+  libc and libgcc to link; GL, X11 and Wayland are opened when the window starts.
 
 Nothing is signed or notarised yet: on macOS, right-click → Open (or
 `xattr -dr com.apple.quarantine /Applications/Flacify.app`) the first time. The first

@@ -115,7 +115,10 @@ impl Session {
     /// Decode a file, decide how to get its enhanced side, and start the device.
     pub fn open(&self, file: &Path) -> Result<Playback> {
         let render::Loaded {
-            track, analysis, ..
+            track,
+            analysis,
+            source_hash,
+            ..
         } = render::load(file)?;
         let original = track.interleaved();
         let tags = decode::tags(file);
@@ -151,7 +154,7 @@ impl Session {
         }
 
         let fields = cache::Fields {
-            sample_hash: render::sample_hash(&track),
+            source_hash,
             window: render::WINDOW,
             overlap: render::OVERLAP,
             model_id: self.model_id.clone(),
@@ -168,7 +171,7 @@ impl Session {
 
         match cached {
             Some(cached) => {
-                if self.ready && cached.meta.sample_hash.is_empty() {
+                if self.ready && cached.meta.source_hash.is_empty() {
                     if let Err(error) = self.cache.annotate(&key, &fields) {
                         tracing::warn!(%error, "could not annotate the cache entry");
                     }
@@ -204,6 +207,7 @@ impl Session {
                 let cancel = AtomicBool::new(false);
                 let (rendered, from_cache) = render::enhance_or_cached(
                     &track,
+                    &fields.source_hash,
                     render::Job {
                         session: self.worker(),
                         cutoff_hz: Some(cutoff_hz),

@@ -2,9 +2,9 @@
 //!
 //! Rendering a three-minute track costs about 95 s at RTF 0.54, and without a cache
 //! every play pays it again. The cache is keyed by everything that can change the
-//! output — the decoded samples, the window and overlap, the pipeline version and the
-//! model weights — so a hit is exactly the audio a fresh render would have produced,
-//! and a change to any of those misses instead of serving the wrong file.
+//! output: the source file's bytes, the window and overlap, the pipeline version and the
+//! model weights. A hit is exactly the audio a fresh render would have produced, and a
+//! change to any of those misses instead of serving the wrong file.
 //!
 //! One entry is one track: `manifest.json` plus 24-bit FLAC segments of
 //! `7 * (window - overlap)` frames each. The manifest is the source of truth for what
@@ -20,6 +20,7 @@
 //! Seeking needs nothing from the cache beyond what playback already does: the entry is
 //! decoded into memory and the playhead is an index.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -36,7 +37,10 @@ use crate::render::Render;
 ///
 /// 7 (2026-11-17): an entry is a manifest plus FLAC segments. Every v6 entry misses; its
 /// directory is left for eviction rather than deleted here.
-pub const CACHE_VERSION: &str = "flacify-cache-7";
+///
+/// 8 (2026-11-17): the manifest's identity field is the source file's hash, not the
+/// decoded samples' hash. Every v7 entry misses; its directory is left for eviction.
+pub const CACHE_VERSION: &str = "flacify-cache-8";
 
 /// Steps per segment. A segment has to start on a multiple of `window - overlap`, so its
 /// length is derived from the settings and is not a wall-clock 30 s.
@@ -64,11 +68,12 @@ pub struct Meta {
     #[serde(default)]
     pub frames_per_segment: usize,
     pub cutoff_hz: u32,
-    /// The audio and settings that produced this entry. Stored so `find` can match it
-    /// when the model is not installed and its id cannot be computed. Empty on entries
-    /// written before 2026-11-16; `annotate` fills them on the next ready play.
+    /// What produced this entry: the source file's hash and the render settings. Stored
+    /// so `find` can match them when the model is not installed and its id cannot be
+    /// computed. Empty on entries written before these fields were recorded; `annotate`
+    /// fills them on the next ready play.
     #[serde(default)]
-    pub sample_hash: String,
+    pub source_hash: String,
     #[serde(default)]
     pub window: usize,
     #[serde(default)]
@@ -101,10 +106,11 @@ pub struct Meta {
 ///
 /// The directory name is their hash, but a lookup on a machine without the model cannot
 /// recompute that hash: the model id comes from files that are gone. The stored fields let
-/// [`Cache::find`] match the audio and the settings instead.
+/// [`Cache::find`] match the source file and the settings instead.
 #[derive(Clone, Debug)]
 pub struct Fields {
-    pub sample_hash: String,
+    /// blake3 of the source file's bytes, first 32 hex characters.
+    pub source_hash: String,
     pub window: usize,
     pub overlap: usize,
     pub model_id: String,
@@ -114,7 +120,7 @@ pub struct Fields {
 impl Fields {
     pub fn key(&self) -> String {
         key(
-            &self.sample_hash,
+            &self.source_hash,
             self.window,
             self.overlap,
             &self.model_id,
@@ -149,7 +155,7 @@ impl Cache {
         self.load_dir(&self.entry_dir(key))
     }
 
-    /// Find an entry by the audio and settings it was made from, ignoring which model
+    /// Find an entry by the source file and settings it was made from, ignoring which model
     /// rendered it. Used when the model is not installed: the id cannot be computed, and
     /// an existing render is better than a setup screen. Only entries that recorded their
     /// fields can match; `annotate` fills them on a ready play.
@@ -169,7 +175,7 @@ impl Cache {
                 continue;
             };
             if meta.version != CACHE_VERSION
-                || meta.sample_hash != fields.sample_hash
+                || meta.source_hash != fields.source_hash
                 || meta.window != fields.window
                 || meta.overlap != fields.overlap
                 || meta.splice != fields.splice
@@ -182,17 +188,17 @@ impl Cache {
         Ok(None)
     }
 
-    /// Fill in the audio fields on an entry written before they were recorded. Best
+    /// Fill in the identity fields on an entry written before they were recorded. Best
     /// effort: a cache hit that cannot be annotated still plays.
     pub fn annotate(&self, key: &str, fields: &Fields) -> Result<()> {
         let dir = self.entry_dir(key);
         let Some(mut meta) = self.read_meta(&dir)? else {
             return Ok(());
         };
-        if !meta.sample_hash.is_empty() {
+        if !meta.source_hash.is_empty() {
             return Ok(());
         }
-        meta.sample_hash = fields.sample_hash.clone();
+        meta.source_hash = fields.source_hash.clone();
         meta.window = fields.window;
         meta.overlap = fields.overlap;
         meta.splice = fields.splice;
@@ -321,7 +327,7 @@ impl Cache {
             sample_rate: flacify_core::SAMPLE_RATE,
             frames_per_segment: segment_frames,
             cutoff_hz,
-            sample_hash: fields.sample_hash.clone(),
+            source_hash: fields.source_hash.clone(),
             window: fields.window,
             overlap: fields.overlap,
             splice: fields.splice,
@@ -428,13 +434,33 @@ fn now() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-/// Everything that can change the rendered samples, hashed into a directory name.
+/// One read while hashing a source file, so the file is never held in memory whole.
+const HASH_CHUNK: usize = 1 << 20;
+
+/// blake3 of a file's bytes, first 32 hex characters: the identity part of a cache key.
 ///
-/// The sample hash comes from the decoded track, not the file, so the same audio in a
-/// different container or bitrate shares nothing and the same file repackaged is still a
-/// miss. That is deliberate: the cache is cheap to rebuild and a wrong hit is not.
+/// Keyed by the container, so the same audio re-encoded is a miss and a retag is a miss;
+/// keying on the decoded samples instead costs a full decode before every lookup.
+pub fn source_hash(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening {} to hash it", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = vec![0u8; HASH_CHUNK];
+    loop {
+        let read = file
+            .read(&mut chunk)
+            .with_context(|| format!("hashing {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
+    Ok(hasher.finalize().to_hex()[..32].to_string())
+}
+
+/// Everything that can change the rendered samples, hashed into a directory name.
 pub fn key(
-    sample_hash: &str,
+    source_hash: &str,
     window: usize,
     overlap: usize,
     model_id: &str,
@@ -443,7 +469,7 @@ pub fn key(
     let mut hasher = blake3::Hasher::new();
     for part in [
         CACHE_VERSION,
-        sample_hash,
+        source_hash,
         model_id,
         &window.to_string(),
         &overlap.to_string(),
@@ -528,7 +554,7 @@ mod tests {
     /// The shipped settings: a 245 760-frame window with a 48 000-frame overlap.
     fn fields() -> Fields {
         Fields {
-            sample_hash: "samples".into(),
+            source_hash: "source".into(),
             window: 245_760,
             overlap: 48_000,
             model_id: "model".into(),
@@ -920,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn given_two_models_when_found_by_audio_then_the_settings_match_and_other_audio_does_not() {
+    fn given_two_models_when_found_by_source_then_the_settings_match_and_other_source_does_not() {
         let root = temp_cache("find");
         let cache = Cache::new(root.clone());
         let render = render_of(4_800);
@@ -940,13 +966,13 @@ mod tests {
             .expect("storing b");
 
         // The model id is ignored: on a machine without the model it cannot be computed,
-        // and either entry is the same audio and settings.
+        // and either entry is the same source file and settings.
         let found = cache.find(&fields()).expect("searching").expect("an entry");
         assert_eq!(found.meta.frames, 4_800);
-        assert_eq!(found.meta.sample_hash, "samples");
+        assert_eq!(found.meta.source_hash, "source");
 
         let other = Fields {
-            sample_hash: "different".into(),
+            source_hash: "different".into(),
             ..fields()
         };
         assert!(cache.find(&other).expect("searching").is_none());
@@ -960,7 +986,7 @@ mod tests {
         let render = render_of(2_400);
         let key = fields().key();
         let blank = Fields {
-            sample_hash: String::new(),
+            source_hash: String::new(),
             ..fields()
         };
         cache.store(&key, &render, 12_000, &blank).expect("storing");
@@ -975,7 +1001,7 @@ mod tests {
             "the annotation makes it findable"
         );
         let meta = stored_meta(&cache, &key);
-        assert_eq!(meta.sample_hash, "samples");
+        assert_eq!(meta.source_hash, "source");
         assert_eq!(meta.segments.len(), 1, "annotating keeps the segment table");
         std::fs::remove_dir_all(root).ok();
     }
@@ -999,16 +1025,16 @@ mod tests {
 
     #[test]
     fn given_the_same_inputs_when_keyed_twice_then_the_key_matches_and_a_setting_change_moves_it() {
-        let a = key("samples", 245_760, 48_000, "model", false);
-        assert_eq!(a, key("samples", 245_760, 48_000, "model", false));
+        let a = key("source", 245_760, 48_000, "model", false);
+        assert_eq!(a, key("source", 245_760, 48_000, "model", false));
         assert_eq!(a, fields().key());
         // Pinned so a change to the hash inputs shows up as a changed key, not as a silent
-        // reuse of every v7 entry. The value is run-independent: blake3 over the six parts.
-        assert_eq!(a, "5c4cfc1370d5569fb0be85ade77632f3");
-        assert_ne!(a, key("samples", 122_880, 48_000, "model", false));
-        assert_ne!(a, key("samples", 245_760, 24_000, "model", false));
-        assert_ne!(a, key("samples", 245_760, 48_000, "other-model", false));
-        assert_ne!(a, key("samples", 245_760, 48_000, "model", true));
+        // reuse of every v8 entry. The value is run-independent: blake3 over the six parts.
+        assert_eq!(a, "17d39a88a4d96d9cb4d1c723672e442c");
+        assert_ne!(a, key("source", 122_880, 48_000, "model", false));
+        assert_ne!(a, key("source", 245_760, 24_000, "model", false));
+        assert_ne!(a, key("source", 245_760, 48_000, "other-model", false));
+        assert_ne!(a, key("source", 245_760, 48_000, "model", true));
         assert_eq!(a.len(), 32);
     }
 
@@ -1017,5 +1043,60 @@ mod tests {
         let id = model_id(Path::new("/nonexistent/flacify/models"));
         assert_eq!(id.len(), 16);
         assert_eq!(id, model_id(Path::new("/nonexistent/flacify/models")));
+    }
+
+    /// PCM that both containers carry unchanged: these samples already sit on the 24-bit
+    /// grid, so a WAV and a FLAC of them hold the same audio.
+    fn pcm_for_containers() -> Vec<f32> {
+        let mut planar = Vec::with_capacity(4_800 * 2);
+        for channel in 0..2 {
+            for frame in 0..4_800 {
+                planar.push(((frame * 31 + channel * 7) % 512 - 256) as f32 * QUANTUM);
+            }
+        }
+        planar
+    }
+
+    #[test]
+    fn given_the_same_pcm_as_wav_and_as_flac_when_hashed_then_the_hashes_differ_and_a_byte_copy_matches(
+    ) {
+        let root = temp_cache("source-hash-containers");
+        std::fs::create_dir_all(&root).expect("creating the test directory");
+        let wav = root.join("same-pcm.wav");
+        let flac = root.join("same-pcm.flac");
+        crate::wav::write(&wav, 48_000, 2, &pcm_for_containers()).expect("writing a wav");
+        crate::flac::write(&flac, 48_000, 2, &pcm_for_containers()).expect("writing a flac");
+
+        let wav_hash = source_hash(&wav).expect("hashing the wav");
+        let flac_hash = source_hash(&flac).expect("hashing the flac");
+        assert_ne!(
+            wav_hash, flac_hash,
+            "the key is the container, not the audio"
+        );
+
+        let copy = root.join("copy.wav");
+        std::fs::copy(&wav, &copy).expect("copying the wav");
+        assert_eq!(
+            source_hash(&copy).expect("hashing the copy"),
+            wav_hash,
+            "the same bytes hash the same"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_file_of_several_chunks_when_hashed_then_it_is_blake3_of_all_its_bytes_in_32_characters(
+    ) {
+        let root = temp_cache("source-hash-bytes");
+        std::fs::create_dir_all(&root).expect("creating the test directory");
+        let path = root.join("bytes.bin");
+        let bytes: Vec<u8> = (0..HASH_CHUNK * 2 + 3).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).expect("writing the file");
+
+        let expected = blake3::hash(&bytes).to_hex().to_string();
+        let actual = source_hash(&path).expect("hashing the file");
+        assert_eq!(actual, expected[..32]);
+        assert_eq!(actual.len(), 32);
+        std::fs::remove_dir_all(root).ok();
     }
 }

@@ -18,6 +18,11 @@ use crate::upscaler::Upscaler;
 /// - output total == input total, for every length and every overlap;
 /// - an identity upscaler reproduces the input within one ULP;
 /// - the same input and seed produce the same output.
+///
+/// A range renders part of a track on its own: `start_at` places it on the window
+/// lattice, `end_range` hands its crossfade tail to the next range, and only `finish`
+/// ends the track. A track rendered in ranges that begin on `step` equals a single
+/// render, sample for sample.
 pub struct Pipeline<U: Upscaler> {
     upscaler: U,
     channels: usize,
@@ -26,9 +31,31 @@ pub struct Pipeline<U: Upscaler> {
     step: usize,
     seed: u64,
     input: Vec<Vec<f32>>,
-    tail: Option<Vec<Vec<f32>>>,
+    tail: Option<Tail>,
     windows: u64,
     finished: bool,
+}
+
+/// The generated tail a window holds back for the next window's crossfade.
+///
+/// A range that stops mid-track hands one to the range that follows, so that range's
+/// first window blends into the samples a whole-track render would have produced.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tail {
+    next_window: u64,
+    samples: Block,
+}
+
+impl Tail {
+    /// The window index this tail crossfades into, which `start_at` has to be given.
+    pub fn next_window(&self) -> u64 {
+        self.next_window
+    }
+
+    /// The held frames; there are `overlap` of them per channel.
+    pub fn samples(&self) -> &Block {
+        &self.samples
+    }
 }
 
 impl<U: Upscaler> Pipeline<U> {
@@ -81,8 +108,52 @@ impl<U: Upscaler> Pipeline<U> {
         self.step
     }
 
+    /// The absolute index of the next window, which is its whole-track index once
+    /// `start_at` has run.
     pub fn windows_rendered(&self) -> u64 {
         self.windows
+    }
+
+    /// Position the pipeline at `windows`, the absolute index of its next window, and
+    /// start from `tail` when the previous range ended with one. Seeds then follow the
+    /// whole-track schedule. Call it before the first push of each range.
+    pub fn start_at(&mut self, windows: u64, tail: Option<Tail>) -> Result<()> {
+        let is_mid_range =
+            self.tail.is_some() || self.input.iter().any(|channel| !channel.is_empty());
+        if is_mid_range {
+            return Err(Error::MidRange);
+        }
+        if let Some(tail) = tail {
+            self.check_tail(windows, &tail)?;
+            self.tail = Some(tail);
+        }
+        self.windows = windows;
+        self.finished = false;
+        Ok(())
+    }
+
+    /// End a range at a window boundary, mid-track: emit nothing more and hand back the
+    /// tail the next range starts from. The end of the track goes through `finish`.
+    ///
+    /// A mid-track range of `n` steps is fed `n * step + overlap` frames, because its last
+    /// window reads the `overlap` frames that also open the window after the range.
+    pub fn end_range(&mut self) -> Result<Tail> {
+        if self.finished {
+            return Err(Error::Finished);
+        }
+        let buffered = self.input[0].len();
+        if buffered != self.overlap {
+            return Err(Error::RangeNotAligned {
+                buffered,
+                expected: self.overlap,
+            });
+        }
+        let tail = self.tail.take().ok_or(Error::EmptyRange)?;
+        for channel in &mut self.input {
+            channel.clear();
+        }
+        self.finished = true;
+        Ok(tail)
     }
 
     pub fn upscaler(&self) -> &U {
@@ -110,7 +181,7 @@ impl<U: Upscaler> Pipeline<U> {
         }
         let mut out = Vec::new();
         while self.input[0].len() >= self.window {
-            out.push(self.render(false)?);
+            out.push(self.render_holding()?);
         }
         Ok(out)
     }
@@ -123,16 +194,38 @@ impl<U: Upscaler> Pipeline<U> {
         self.finished = true;
         if self.input[0].is_empty() {
             // Nothing buffered, so the only thing still owed is the held tail.
-            return match self.tail.take() {
-                Some(tail) => Ok(vec![Block::from_planar(self.channels, flatten(&tail))?]),
-                None => Ok(Vec::new()),
-            };
+            return Ok(self
+                .tail
+                .take()
+                .map(|tail| vec![tail.samples])
+                .unwrap_or_default());
         }
-        Ok(vec![self.render(true)?])
+        Ok(vec![self.render_final()?])
     }
 
-    /// Render one window from the head of the buffer and take it out of the buffer.
-    fn render(&mut self, is_last: bool) -> Result<Block> {
+    /// Render one window that another window follows: hold its last `overlap` frames as
+    /// the next window's crossfade and emit the rest.
+    fn render_holding(&mut self) -> Result<Block> {
+        let (out, valid) = self.process_window()?;
+        debug_assert_eq!(valid, self.window, "push renders only full windows");
+        let keep = valid - self.overlap;
+        self.tail = Some(Tail {
+            next_window: self.windows,
+            samples: out.slice(keep, valid),
+        });
+        Ok(out.slice(0, keep))
+    }
+
+    /// Render the last window of the track, which may be short: emit every frame of real
+    /// input and hold nothing back.
+    fn render_final(&mut self) -> Result<Block> {
+        let (out, valid) = self.process_window()?;
+        Ok(out.slice(0, valid))
+    }
+
+    /// Render the head window of the buffer and take the step's input out of it. Returns
+    /// the window's output and how many of its frames came from real input.
+    fn process_window(&mut self) -> Result<(Block, usize)> {
         let valid = self.input[0].len().min(self.window);
 
         let mut data = Vec::with_capacity(self.channels * self.window);
@@ -160,40 +253,43 @@ impl<U: Upscaler> Pipeline<U> {
         }
 
         if let Some(tail) = self.tail.take() {
-            let blend = self.overlap.min(valid).min(tail[0].len());
+            let blend = self.overlap.min(valid).min(tail.samples.frames());
             let fall = curve_fall(blend);
             let rise = curve_rise(blend);
-            let frames = out.frames();
-            for (samples, previous) in out.data_mut().chunks_mut(frames).zip(&tail) {
+            for channel in 0..self.channels {
+                let previous = tail.samples.channel(channel);
+                let samples = out.channel_mut(channel);
                 for i in 0..blend {
                     samples[i] = previous[i] * fall[i] + samples[i] * rise[i];
                 }
             }
         }
+        Ok((out, valid))
+    }
 
-        if is_last {
-            return Ok(out.slice(0, valid));
+    /// A tail is only usable by a range at the window it crossfades into, and only by a
+    /// pipeline with the window and overlap that produced it.
+    fn check_tail(&self, windows: u64, tail: &Tail) -> Result<()> {
+        if tail.samples.frames() != self.overlap || tail.samples.channels() != self.channels {
+            return Err(Error::TailShape {
+                expected_channels: self.channels,
+                expected_frames: self.overlap,
+                got_channels: tail.samples.channels(),
+                got_frames: tail.samples.frames(),
+            });
         }
-        let keep = valid - self.overlap;
-        self.tail = Some(
-            (0..self.channels)
-                .map(|channel| out.channel(channel)[keep..valid].to_vec())
-                .collect(),
-        );
-        Ok(out.slice(0, keep))
+        if tail.next_window != windows {
+            return Err(Error::TailFromWindow {
+                start_window: windows,
+                tail_window: tail.next_window,
+            });
+        }
+        Ok(())
     }
 
     fn window_seed(&self) -> u64 {
         splitmix64(self.seed ^ self.windows.wrapping_mul(0x9E37_79B9_7F4A_7C15))
     }
-}
-
-fn flatten(tail: &[Vec<f32>]) -> Vec<f32> {
-    let mut data = Vec::with_capacity(tail.iter().map(Vec::len).sum());
-    for channel in tail {
-        data.extend_from_slice(channel);
-    }
-    data
 }
 
 /// Rising raised-cosine ramp: 0 -> 1.

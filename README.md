@@ -105,7 +105,7 @@ See [`docs/vision.md`](docs/vision.md).
 ## Start here
 
 ```sh
-cargo test --workspace   # 134 tests, no GPU, no audio device, no model, no Python
+cargo test --workspace   # 264 tests, no GPU, no audio device, no model, no Python
 ```
 
 `core` and `infer` are testable without a model, which is what makes the DSP and the

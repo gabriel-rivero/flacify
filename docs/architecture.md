@@ -302,7 +302,10 @@ problem, and it buys seek, instant replay, and a zero-GPU second listen.
   names bytes that are not on disk. An entry stays `partial` until a writer marks it
   complete, and a partial entry is a miss: a kill leaves playable segments plus a partial
   manifest, and the next writer adopts a segment the manifest does not list when it
-  decodes to the length its index requires, and deletes the ones that do not.
+  decodes to the length its index requires, and deletes the ones that do not. The loudness
+  gain is written before segment 0 because a later process cannot recompute it; a resumed
+  render recovers the crossfade tail the previous segment handed on by rendering that
+  segment's last window, which one model call reproduces exactly.
 
 ## Loudness
 

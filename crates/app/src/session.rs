@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use flacify_core::SAMPLE_RATE;
 use flacify_infer::python::WorkerConfig;
 use flacify_infer::WorkerSession;
@@ -117,6 +117,7 @@ impl Session {
         let render::Loaded {
             track,
             analysis,
+            source_entry,
             source_hash,
             ..
         } = render::load(file, self.cache.root())?;
@@ -191,7 +192,7 @@ impl Session {
                         audio_secs,
                         device: cached.meta.device,
                         from_cache: true,
-                        gain_db: cached.meta.gain_db,
+                        gain_db: cached.meta.gain_db.unwrap_or(0.0),
                     },
                     path,
                     cancel: None,
@@ -199,29 +200,42 @@ impl Session {
             }
             None if !device::progressive_supported() => {
                 self.require_ready()?;
+                let entry = source_entry.context("the source tier a render reads")?;
                 eprintln!(
                     "this output device is not 48 kHz stereo, so the track is rendered \
                      before playback starts"
                 );
                 let started = Instant::now();
                 let cancel = AtomicBool::new(false);
-                let (rendered, from_cache) = render::enhance_or_cached(
-                    &track,
-                    &fields.source_hash,
+                let fields = fields.clone();
+                let mut writer = self.cache.begin(
+                    &key,
+                    &cache::EntrySpec {
+                        frames: track.frames,
+                        cutoff_hz,
+                        fields,
+                    },
+                )?;
+                let streamed = render::render_segments(
+                    &entry,
                     render::Job {
                         session: self.worker(),
                         cutoff_hz: Some(cutoff_hz),
                         seed: render::seed_for(&track),
                         splice_low_band: self.splice,
                     },
-                    render::Store {
-                        cache: &self.cache,
-                        model_id: &self.model_id,
-                    },
+                    &mut writer,
                     &cancel,
                     &mut |_| {},
+                    |_, _| Ok(()),
                 )?;
-                let enhanced = render::interleave_stereo(&rendered.planar, track.frames);
+                // The render completed the entry on disk; playback reads exactly the
+                // audio a later cache hit would.
+                let cached = self
+                    .cache
+                    .load(&key)?
+                    .context("the cache entry the render just completed")?;
+                let enhanced = render::interleave_stereo(&cached.planar, track.frames);
                 let engine = device::AudioEngine::start(&original, Some(&enhanced))?;
                 eprintln!(
                     "rendered {audio_secs:.0} s of audio in {:.0} s",
@@ -237,9 +251,9 @@ impl Session {
                         artist: tags.artist,
                         cutoff_hz,
                         audio_secs,
-                        device: rendered.device,
-                        from_cache,
-                        gain_db: rendered.gain_db,
+                        device: streamed.device,
+                        from_cache: false,
+                        gain_db: streamed.gain_db,
                     },
                     path,
                     cancel: None,
@@ -247,9 +261,11 @@ impl Session {
             }
             None => {
                 self.require_ready()?;
+                let entry = source_entry.context("the source tier a render reads")?;
                 let frontier = Frontier::new(track.frames);
                 let status = RenderStatus::new();
                 let cancel = Arc::new(AtomicBool::new(false));
+                let frames = track.frames;
                 {
                     let frontier = Arc::clone(&frontier);
                     let cache = Arc::clone(&self.cache);
@@ -257,26 +273,42 @@ impl Session {
                     let status = Arc::clone(&status);
                     let token = Arc::clone(&cancel);
                     let splice = self.splice;
+                    let key = key.clone();
+                    let fields = fields.clone();
                     std::thread::spawn(move || {
-                        let result = render::render_into_frontier(
-                            &track,
-                            render::Job {
-                                session: worker,
-                                cutoff_hz: Some(cutoff_hz),
-                                seed: render::seed_for(&track),
-                                splice_low_band: splice,
-                            },
-                            &frontier,
-                            &token,
-                            &mut |_| {},
-                        );
-                        match result {
-                            Ok(render) => {
-                                status.finish();
-                                if let Err(error) = cache.store(&key, &render, cutoff_hz, &fields) {
-                                    tracing::warn!(%error, "could not cache the render");
-                                }
+                        // The seed is a whole-track hash by contract (ADR-006); the track
+                        // is dropped as soon as it is computed so the render holds a
+                        // segment rather than a track.
+                        let seed = render::seed_for(&track);
+                        drop(track);
+                        let spec = cache::EntrySpec {
+                            frames,
+                            cutoff_hz,
+                            fields,
+                        };
+                        let result = cache.begin(&key, &spec).and_then(|mut writer| {
+                            let rendered = render::render_segments_into_frontier(
+                                &entry,
+                                render::Job {
+                                    session: worker,
+                                    cutoff_hz: Some(cutoff_hz),
+                                    seed,
+                                    splice_low_band: splice,
+                                },
+                                &mut writer,
+                                &frontier,
+                                &token,
+                                &mut |_| {},
+                            );
+                            // A killed or cancelled render leaves the segments it wrote
+                            // for the next attempt to resume.
+                            if rendered.is_err() {
+                                writer.abandon();
                             }
+                            rendered
+                        });
+                        match result {
+                            Ok(_) => status.finish(),
                             // Another file took over; the window is not watching this one.
                             Err(error) if render::is_cancelled(&error) => {}
                             Err(error) => {

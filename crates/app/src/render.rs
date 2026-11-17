@@ -3,16 +3,22 @@
 //! This is the only place the pipeline meets the Python sidecar, and the only place
 //! that knows about the model's window. Everything it produces is planar stereo at
 //! 48 kHz, exactly as long as the input: the pipeline's job is that invariant, and the
-//! `debug_assert` at the end is the cheap way to notice if it ever stops holding.
+//! length check at the end is the cheap way to notice if it ever stops holding.
+//!
+//! Two ways to drive it: [`enhance_streaming`] keeps the whole track and writes every
+//! emitted block to its caller, and [`render_segments`] reads the track one source segment
+//! at a time and writes finished cache segments, so a render holds a segment rather than a
+//! track and a kill leaves a resumable entry.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use flacify_core::{Block, Pipeline, Preprocessor, SAMPLE_RATE};
-use flacify_infer::{Engine, WorkerSession};
+use flacify_core::{Block, Pipeline, Preprocessor, Tail, SAMPLE_RATE};
+use flacify_infer::{Engine, ResidentModel, WorkerSession};
 
+use crate::cache;
 use crate::decode;
 
 /// The render was superseded by another file. Not a failure: the window moved on.
@@ -44,12 +50,13 @@ fn check_cancel(cancel: &AtomicBool) -> Result<()> {
 pub const WINDOW: usize = 245_760;
 /// One second, the reference implementation's default overlap.
 pub const OVERLAP: usize = 48_000;
-/// Frames handed to the pipeline per push.
+/// Frames handed to the pipeline per push: one step, `window - overlap`.
 ///
-/// One `step` per push: that is the amount of input that produces exactly one emitted
-/// window, so the frontier gains a second of audio every time the model finishes one.
-/// Pushing the whole track at once (which is what this used to do) means the frontier
-/// stays empty until the render is over, and progressive playback cannot work at all.
+/// That is the amount of input that produces exactly one emitted window, so the frontier
+/// gains a second of audio every time the model finishes one, and it is the step
+/// `Pipeline::start_at` positions a range on. Pushing the whole track at once (which is
+/// what this used to do) means the frontier stays empty until the render is over, and
+/// progressive playback cannot work at all.
 const CHUNK: usize = WINDOW - OVERLAP;
 
 /// A decoded track: planar stereo at 48 kHz.
@@ -79,6 +86,47 @@ impl Track {
     }
 }
 
+/// Where a render reads its input, a range at a time: a whole track in memory, or the
+/// source tier's segments on disk.
+pub trait Frames {
+    /// Frames in the whole track.
+    fn frames(&self) -> usize;
+
+    /// Planar 48 kHz stereo for `[start, start + frames)`.
+    fn read_frames(&self, start: usize, frames: usize) -> Result<Vec<f32>>;
+}
+
+impl Frames for Track {
+    fn frames(&self) -> usize {
+        self.frames
+    }
+
+    fn read_frames(&self, start: usize, frames: usize) -> Result<Vec<f32>> {
+        anyhow::ensure!(
+            start
+                .checked_add(frames)
+                .is_some_and(|end| end <= self.frames),
+            "range {start} + {frames} frames is past the {} of the track",
+            self.frames
+        );
+        let mut planar = Vec::with_capacity(frames * 2);
+        planar.extend_from_slice(&self.planar[start..start + frames]);
+        let right = self.frames + start;
+        planar.extend_from_slice(&self.planar[right..right + frames]);
+        Ok(planar)
+    }
+}
+
+impl Frames for crate::source::Entry {
+    fn frames(&self) -> usize {
+        self.meta().frames
+    }
+
+    fn read_frames(&self, start: usize, frames: usize) -> Result<Vec<f32>> {
+        self.read_range(start, frames)
+    }
+}
+
 /// What the file was, before it became 48 kHz stereo.
 pub struct Source {
     pub sample_rate: u32,
@@ -89,6 +137,9 @@ pub struct Loaded {
     pub track: Track,
     pub analysis: flacify_core::dsp::cutoff::Analysis,
     pub source: Source,
+    /// The source tier entry a segmented render reads its ranges from. Only [`load`] has
+    /// one: [`load_in_memory`] writes nothing and never renders.
+    pub source_entry: Option<crate::source::Entry>,
     /// blake3 of the file's bytes, the identity part of a cache key. Computed in [`load`]
     /// so nothing downstream reopens the file.
     pub source_hash: String,
@@ -113,6 +164,7 @@ impl Loaded {
     /// The one place a track becomes a [`Loaded`], wherever the audio came from.
     fn from_track(
         track: Track,
+        source_entry: Option<crate::source::Entry>,
         source: Source,
         source_hash: String,
         peaks: Vec<crate::source::SecondPeaks>,
@@ -124,6 +176,7 @@ impl Loaded {
             track,
             analysis,
             source,
+            source_entry,
             source_hash,
             peaks,
         })
@@ -145,8 +198,9 @@ pub fn load(path: &Path, cache_root: &Path) -> Result<Loaded> {
     };
     let planar = entry.read_all()?;
     let frames = planar.len() / 2;
+    let peaks = entry.meta().peaks.clone();
     let track = Track { planar, frames };
-    Loaded::from_track(track, source, source_hash, entry.meta().peaks.clone(), path)
+    Loaded::from_track(track, Some(entry), source, source_hash, peaks, path)
 }
 
 /// Decode any supported file to 48 kHz stereo in memory and write nothing.
@@ -164,7 +218,7 @@ pub fn load_in_memory(path: &Path) -> Result<Loaded> {
     let frames = planar.len() / 2;
     let peaks = crate::source::second_peaks(&planar, frames);
     let track = Track { planar, frames };
-    Loaded::from_track(track, source, source_hash, peaks, path)
+    Loaded::from_track(track, None, source, source_hash, peaks, path)
 }
 
 /// A seed that survives re-renders, cache keys and bug reports (ADR-006).
@@ -251,7 +305,7 @@ pub fn enhance(
     progress: &mut dyn FnMut(usize),
 ) -> Result<Render> {
     let mut buffer = ChannelMajor::with_capacity(track.frames);
-    let streamed = enhance_streaming(track, job, cancel, progress, |chunk| {
+    let streamed = enhance_streaming(track, job, cancel, progress, |_, chunk| {
         buffer.push(chunk);
         Ok(())
     })?;
@@ -265,17 +319,17 @@ pub fn enhance(
     })
 }
 
-/// The pipeline, emitting audio as it arrives instead of at the end.
-///
-/// `on_audio` receives planar stereo (the limiter has already run, so what it gets is
-/// final) and may be called many times. The limiter is a per-sample function, so
-/// limiting each block gives exactly the same samples as limiting the whole track
-/// afterwards — which is what lets the frontier publish before the render finishes.
-/// What `enhance_streaming` produced besides the audio.
+/// What a render produced besides the audio.
+#[derive(Debug)]
 pub struct Streamed {
     pub limit: crate::limit::LimitReport,
     pub device: String,
+    /// Loudness gain applied to the generated side, in dB, as the block processing fixed
+    /// it: the value the samples were scaled by, so a resume reproduces the same factor.
     pub gain_db: f64,
+    /// Integrated loudness of the input's first window and of the first generated block
+    /// before the gain. `NEG_INFINITY` when this process did not measure them, which is a
+    /// resumed render taking its gain from the entry.
     pub lufs_input: f64,
     pub lufs_output: f64,
 }
@@ -284,180 +338,603 @@ pub struct Streamed {
 /// with the measurement and a big gain would sound worse than the step it fixes.
 const MAX_GAIN_DB: f64 = 6.0;
 
+/// The pipeline, emitting audio as it arrives instead of at the end.
+///
+/// `on_audio` receives the block's absolute start frame and its planar stereo (the limiter
+/// has already run, so what it gets is final) and may be called many times. The limiter is
+/// a per-sample function, so limiting each block gives exactly the same samples as
+/// limiting the whole track afterwards, which is what lets the frontier publish before
+/// the render finishes.
 pub fn enhance_streaming(
     track: &Track,
     job: Job,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize),
-    mut on_audio: impl FnMut(&[f32]) -> Result<()>,
+    mut on_audio: impl FnMut(usize, &[f32]) -> Result<()>,
 ) -> Result<Streamed> {
-    let model = job.session.model().context("starting the model worker")?;
-    let hello = model.hello();
-    // The worker's own "ready on cuda" line goes to its stderr, which is captured and
-    // only surfaced when an inference call fails; say it out loud here instead, where
-    // RUST_LOG can reach it. On a resident worker this repeats per file, which is the
-    // price of not threading a "did it just start" flag through the session.
-    tracing::info!(
-        device = %hello.device,
-        torch = %hello.torch,
-        load_secs = hello.load_secs,
-        "model ready"
+    let model = RenderModel::start(&job)?;
+    let mut processor = BlockProcessor::new(track, &job, cache::EntryProgress::default())?;
+    let mut pipeline = model.pipeline()?;
+
+    let mut fed = 0;
+    let mut at = 0;
+    while fed < track.frames {
+        check_cancel(cancel)?;
+        let end = (fed + CHUNK).min(track.frames);
+        let block = read_block(track, fed, end)?;
+        for out in pipeline.push(&block)? {
+            check_cancel(cancel)?;
+            let chunk = processor.process(&out, at)?;
+            on_audio(at, &chunk)?;
+            at += out.frames();
+        }
+        progress(end);
+        fed = end;
+    }
+    check_cancel(cancel)?;
+    for out in pipeline.finish()? {
+        check_cancel(cancel)?;
+        let chunk = processor.process(&out, at)?;
+        on_audio(at, &chunk)?;
+        at += out.frames();
+    }
+    anyhow::ensure!(
+        at == track.frames,
+        "the pipeline returned {at} frames for {} in",
+        track.frames
     );
-    let device = hello.device.clone();
-    let engine = Engine::new(model, 2, WINDOW, job.cutoff_hz)?;
-    let mut pipeline = Pipeline::new(engine, 2, WINDOW, OVERLAP, job.seed)?;
+    Ok(processor.into_streamed(model.device))
+}
 
-    let mut report = crate::limit::LimitReport::default();
-    let mut emitted = 0usize;
-    let mut carry_left: Vec<f32> = Vec::new();
-    let mut carry_right: Vec<f32> = Vec::new();
+/// The model one render drives, and how to build a pipeline range from it.
+struct RenderModel {
+    model: ResidentModel,
+    device: String,
+    cutoff_hz: Option<u32>,
+    seed: u64,
+}
 
-    // Loudness is matched from the first window, then held for the whole track: a
-    // per-window gain would pump, and the whole point is that the switch does not move
-    // the level. The first window is the only stretch where input and output are the
-    // same length and both available before anything is published.
-    let head = track.frames.min(WINDOW);
-    let lufs_input =
-        crate::loudness::integrated(&[&track.channel(0)[..head], &track.channel(1)[..head]]);
-    let mut gain: Option<f64> = None;
-    let mut lufs_output = f64::NEG_INFINITY;
+impl RenderModel {
+    fn start(job: &Job) -> Result<Self> {
+        let model = Arc::clone(&job.session)
+            .model()
+            .context("starting the model worker")?;
+        let hello = model.hello();
+        // The worker's own "ready on cuda" line goes to its stderr, which is captured and
+        // only surfaced when an inference call fails; say it out loud here instead, where
+        // RUST_LOG can reach it. On a resident worker this repeats per file, which is the
+        // price of not threading a "did it just start" flag through the session.
+        tracing::info!(
+            device = %hello.device,
+            torch = %hello.torch,
+            load_secs = hello.load_secs,
+            "model ready"
+        );
+        Ok(Self {
+            device: hello.device.clone(),
+            model,
+            cutoff_hz: job.cutoff_hz,
+            seed: job.seed,
+        })
+    }
 
-    // The splice needs the input that produced this window, which is the same frame range
-    // of the track: the pipeline keeps output aligned with input, sample for sample.
-    let splicer = match (job.splice_low_band, job.cutoff_hz) {
-        (true, Some(cutoff)) => Some(Preprocessor::new(cutoff)?),
-        _ => None,
-    };
+    /// A pipeline for one range: a pipeline owns its upscaler, so every range builds one.
+    fn pipeline(&self) -> Result<Pipeline<Engine<ResidentModel>>> {
+        let engine = Engine::new(self.model.clone(), 2, WINDOW, self.cutoff_hz)?;
+        Ok(Pipeline::new(engine, 2, WINDOW, OVERLAP, self.seed)?)
+    }
+}
 
-    let mut emit = |out: &Block, report: &mut crate::limit::LimitReport| -> Result<()> {
-        carry_left.clear();
-        carry_right.clear();
-        carry_left.extend_from_slice(out.channel(0));
-        carry_right.extend_from_slice(out.channel(1));
+/// The per-block work both render paths share: splice, the track's loudness gain, the
+/// limiter and what they report. `at` is the block's absolute frame in the track, which
+/// the splice reads and which only the track's first block may be 0.
+struct BlockProcessor<'a> {
+    input: &'a dyn Frames,
+    splicer: Option<Preprocessor>,
+    gain_db: Option<f64>,
+    report: crate::limit::LimitReport,
+    lufs_input: f64,
+    lufs_output: f64,
+}
+
+impl<'a> BlockProcessor<'a> {
+    fn new(input: &'a dyn Frames, job: &Job, recorded: cache::EntryProgress) -> Result<Self> {
+        // The splice needs the input that produced this window, which is the same frame
+        // range of the track: the pipeline keeps output aligned with input, sample for
+        // sample.
+        let splicer = match (job.splice_low_band, job.cutoff_hz) {
+            (true, Some(cutoff)) => Some(Preprocessor::new(cutoff)?),
+            _ => None,
+        };
+        // Loudness is matched from the first window, then held for the whole track: a
+        // per-window gain would pump, and the whole point is that the switch does not move
+        // the level. A resumed render already has the gain, so it does not re-measure.
+        let (lufs_input, lufs_output) = match recorded.gain_db {
+            Some(_) => (f64::NEG_INFINITY, f64::NEG_INFINITY),
+            None => (first_window_lufs(input)?, f64::NEG_INFINITY),
+        };
+        Ok(Self {
+            input,
+            splicer,
+            gain_db: recorded.gain_db,
+            report: recorded.limit,
+            lufs_input,
+            lufs_output,
+        })
+    }
+
+    /// Finished planar stereo for one emitted block, limited. The first block of the track
+    /// also fixes the gain, which every later block reuses.
+    fn process(&mut self, out: &Block, at: usize) -> Result<Vec<f32>> {
         let frames = out.frames();
-
         let mut planar = Vec::with_capacity(frames * 2);
-        if let Some(preprocessor) = &splicer {
-            let offset = emitted;
-            for channel in 0..2 {
-                let generated = if channel == 0 {
-                    &carry_left
-                } else {
-                    &carry_right
-                };
-                let input = &track.channel(channel)[offset..offset + frames];
-                planar.extend(crate::splice::channel(generated, input, preprocessor)?);
+        match &self.splicer {
+            Some(preprocessor) => {
+                let input = self.input.read_frames(at, frames)?;
+                anyhow::ensure!(
+                    input.len() == frames * 2,
+                    "the splice input for {at}..{} came back as {} samples",
+                    at + frames,
+                    input.len()
+                );
+                let (left, right) = input.split_at(frames);
+                planar.extend(crate::splice::channel(out.channel(0), left, preprocessor)?);
+                planar.extend(crate::splice::channel(out.channel(1), right, preprocessor)?);
             }
-        } else {
-            planar.extend_from_slice(&carry_left);
-            planar.extend_from_slice(&carry_right);
+            None => {
+                planar.extend_from_slice(out.channel(0));
+                planar.extend_from_slice(out.channel(1));
+            }
         }
 
-        // First block: measure it against the input it came from, then fix the gain for
-        // the rest of the track.
-        let applied = match gain {
-            Some(value) => value,
+        let db = match self.gain_db {
+            Some(db) => db,
             None => {
+                anyhow::ensure!(
+                    at == 0,
+                    "the loudness gain is fixed by the first block of the track"
+                );
                 let (left, right) = planar.split_at(frames);
-                lufs_output = crate::loudness::integrated(&[left, right]);
-                let db = crate::loudness::gain_db(lufs_input, lufs_output)
+                self.lufs_output = crate::loudness::integrated(&[left, right]);
+                let db = crate::loudness::gain_db(self.lufs_input, self.lufs_output)
                     .clamp(-MAX_GAIN_DB, MAX_GAIN_DB);
-                let factor = 10f64.powf(db / 20.0);
-                gain = Some(factor);
-                factor
+                self.gain_db = Some(db);
+                db
             }
         };
-        if applied != 1.0 {
-            let factor = applied as f32;
-            for sample in planar.iter_mut() {
+        let factor = gain_factor(db);
+        if factor != 1.0 {
+            for sample in &mut planar {
                 *sample *= factor;
             }
         }
 
-        let chunk = crate::limit::limit_in_place(&mut planar);
-        report.peak_before = report.peak_before.max(chunk.peak_before);
-        report.peak_after = report.peak_after.max(chunk.peak_after);
-        report.limited_samples += chunk.limited_samples;
-        on_audio(&planar)?;
-        emitted += frames;
-        Ok(())
-    };
+        let limited = crate::limit::limit_in_place(&mut planar);
+        self.report.peak_before = self.report.peak_before.max(limited.peak_before);
+        self.report.peak_after = self.report.peak_after.max(limited.peak_after);
+        self.report.limited_samples += limited.limited_samples;
+        Ok(planar)
+    }
 
-    let mut start = 0;
-    while start < track.frames {
-        check_cancel(cancel)?;
-        let end = (start + CHUNK).min(track.frames);
-        let mut interleaved = Vec::with_capacity((end - start) * 2);
-        interleaved.extend_from_slice(&track.channel(0)[start..end]);
-        interleaved.extend_from_slice(&track.channel(1)[start..end]);
-        let block = Block::from_planar(2, interleaved)?;
-        for out in pipeline.push(&block)? {
-            emit(&out, &mut report)?;
+    fn progress(&self) -> cache::EntryProgress {
+        cache::EntryProgress {
+            gain_db: self.gain_db,
+            limit: self.report,
         }
-        progress(end);
-        start = end;
-    }
-    check_cancel(cancel)?;
-    for out in pipeline.finish()? {
-        emit(&out, &mut report)?;
     }
 
-    if emitted != track.frames {
-        anyhow::bail!("pipeline returned {emitted} frames for {} in", track.frames);
+    fn into_streamed(self, device: String) -> Streamed {
+        Streamed {
+            limit: self.report,
+            device,
+            gain_db: self.gain_db.unwrap_or(0.0),
+            lufs_input: self.lufs_input,
+            lufs_output: self.lufs_output,
+        }
     }
-    let gain_db = gain.map_or(0.0, |factor| 20.0 * f64::from(factor as f32).log10());
-    Ok(Streamed {
-        limit: report,
-        device,
-        gain_db,
-        lufs_input,
-        lufs_output,
-    })
 }
 
-/// Render into the playback frontier, publishing each finished second.
+/// The f32 the samples are scaled by for a gain in dB.
 ///
-/// Returns the full render as well, because the cache wants the whole track; the caller
-/// decides when to store it.
-pub fn render_into_frontier(
-    track: &Track,
+/// The dB is what the entry records; `powf` is deterministic, so replaying it gives back
+/// the same f32 and a resumed render applies exactly the gain the first one did.
+fn gain_factor(db: f64) -> f32 {
+    10f64.powf(db / 20.0) as f32
+}
+
+/// Integrated loudness of the input's first window: the level the generated side is
+/// matched to for the whole track.
+fn first_window_lufs(input: &dyn Frames) -> Result<f64> {
+    let head = input.frames().min(WINDOW);
+    let planar = input.read_frames(0, head)?;
+    anyhow::ensure!(
+        planar.len() == head * 2,
+        "the first window came back as {} samples for {head} frames",
+        planar.len()
+    );
+    let (left, right) = planar.split_at(head);
+    Ok(crate::loudness::integrated(&[left, right]))
+}
+
+/// One push of the pipeline: planar stereo `[start, end)` as a [`Block`].
+fn read_block(input: &dyn Frames, start: usize, end: usize) -> Result<Block> {
+    let frames = end - start;
+    let planar = input.read_frames(start, frames)?;
+    anyhow::ensure!(
+        planar.len() == frames * 2,
+        "range {start}..{end} came back as {} samples",
+        planar.len()
+    );
+    Ok(Block::from_planar(2, planar)?)
+}
+
+/// One pipeline push out of a planar range already read from the tier.
+fn planar_block(planar: &[f32], offset: usize, frames: usize) -> Result<Block> {
+    let total = planar.len() / 2;
+    let mut data = Vec::with_capacity(frames * 2);
+    data.extend_from_slice(&planar[offset..offset + frames]);
+    data.extend_from_slice(&planar[total + offset..total + offset + frames]);
+    Ok(Block::from_planar(2, data)?)
+}
+
+/// Render the track into `writer` as cache segments, one source segment in memory at a
+/// time, and complete the entry.
+///
+/// Segments the entry already records are skipped and never rewritten. A render that is
+/// cancelled returns [`Cancelled`] and leaves the segments it wrote, which a later call
+/// resumes.
+pub fn render_segments(
+    input: &dyn Frames,
     job: Job,
+    writer: &mut cache::EntryWriter,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(usize),
+    mut on_audio: impl FnMut(usize, &[f32]) -> Result<()>,
+) -> Result<Streamed> {
+    let frames = input.frames();
+    anyhow::ensure!(frames > 0, "a cache entry needs at least one frame");
+    let frames_per_segment = cache::frames_per_segment(WINDOW, OVERLAP)?;
+    let segment_count = frames.div_ceil(frames_per_segment);
+    let recorded = writer.progress();
+    anyhow::ensure!(
+        recorded.gain_db.is_some() || !writer.has_segment(0),
+        "the cache entry records segment 0 without the loudness gain it fixed"
+    );
+    let model = RenderModel::start(&job)?;
+    let mut processor = BlockProcessor::new(input, &job, recorded)?;
+
+    let mut index = 0;
+    let mut tail: Option<Tail> = None;
+    while index < segment_count {
+        check_cancel(cancel)?;
+        if writer.has_segment(index) {
+            // Its audio and its outgoing tail are both on disk or recoverable; a render
+            // that has to continue after it reconstructs the tail then.
+            tail = None;
+            index += 1;
+            continue;
+        }
+        let range_start = index * frames_per_segment;
+
+        // One segment per range, so the output crosses a range boundary at every segment
+        // and a resumed render can pick up at any of them. The exception is the track's
+        // last segment when it is shorter than the lookahead a range needs: its final
+        // window is short in a whole-track render, so it has to be rendered with the
+        // range before it.
+        let mut range_end = index + 1;
+        let mut is_last_range = range_end == segment_count;
+        if !is_last_range && range_end * frames_per_segment + OVERLAP > frames {
+            anyhow::ensure!(
+                !writer.has_segment(range_end),
+                "the cache entry records segment {range_end}, which the track cannot hold"
+            );
+            range_end += 1;
+            anyhow::ensure!(
+                range_end == segment_count,
+                "segment {index} needs a lookahead past the track before its last segment"
+            );
+            is_last_range = true;
+        }
+
+        if index > 0 && tail.is_none() {
+            tail = Some(crossfade_tail(&model, input, (range_start / CHUNK) as u64)?);
+        }
+        let feed_end = if is_last_range {
+            frames
+        } else {
+            range_end * frames_per_segment + OVERLAP
+        };
+        let mut pipeline = model.pipeline()?;
+        pipeline.start_at((range_start / CHUNK) as u64, tail.take())?;
+        let mut emission = Emission::new(&mut processor, index, frames_per_segment, frames);
+
+        let mut fed = range_start;
+        let mut at = range_start;
+        while fed < feed_end {
+            check_cancel(cancel)?;
+            // One source segment per read, so the tier decodes each of its segments once,
+            // and the pipeline is fed a step at a time so cancellation stays per window.
+            let read_end = (fed + frames_per_segment).min(feed_end);
+            let planar = input.read_frames(fed, read_end - fed)?;
+            anyhow::ensure!(
+                planar.len() == (read_end - fed) * 2,
+                "range {fed}..{read_end} came back as {} samples",
+                planar.len()
+            );
+            let read_frames = read_end - fed;
+            let mut offset = 0;
+            while offset < read_frames {
+                check_cancel(cancel)?;
+                let take = CHUNK.min(read_frames - offset);
+                let block = planar_block(&planar, offset, take)?;
+                for out in pipeline.push(&block)? {
+                    check_cancel(cancel)?;
+                    emission.emit(writer, &out, at, &mut on_audio)?;
+                    at += out.frames();
+                }
+                offset += take;
+                progress(fed + offset);
+            }
+            fed = read_end;
+        }
+
+        check_cancel(cancel)?;
+        if is_last_range {
+            for out in pipeline.finish()? {
+                check_cancel(cancel)?;
+                emission.emit(writer, &out, at, &mut on_audio)?;
+                at += out.frames();
+            }
+        } else {
+            tail = Some(pipeline.end_range()?);
+        }
+        emission.finish()?;
+        index = range_end;
+    }
+
+    let progress = processor.progress();
+    writer.finish(&cache::Report {
+        limit: progress.limit,
+        device: model.device.clone(),
+        gain_db: progress.gain_db.unwrap_or(0.0),
+    })?;
+    Ok(processor.into_streamed(model.device))
+}
+
+/// The crossfade tail a segment on disk handed to the segment after it, recovered by
+/// rendering that segment's last window.
+///
+/// The tail is the part of a window's output that no crossfade touches, so one model call
+/// reproduces it exactly without re-rendering the recorded segment.
+fn crossfade_tail(model: &RenderModel, input: &dyn Frames, window: u64) -> Result<Tail> {
+    let before = window
+        .checked_sub(1)
+        .context("a range at window 0 has no tail to recover")?;
+    let start = usize::try_from(before).context("a window index past the frame count")? * CHUNK;
+    let mut pipeline = model.pipeline()?;
+    pipeline.start_at(before, None)?;
+    let block = read_block(input, start, start + WINDOW)?;
+    // What this emits belongs to the recorded segment; only the held tail crosses.
+    let _ = pipeline.push(&block)?;
+    Ok(pipeline.end_range()?)
+}
+
+/// Collects the blocks of a segmented render into cache segments, which are written as
+/// soon as they fill.
+struct SegmentBuffer {
+    /// The segment being filled, which is also the next one to write.
+    index: usize,
+    frames_per_segment: usize,
+    /// Frames in the whole track, so the last segment can be short.
+    frames: usize,
+    left: Vec<f32>,
+    right: Vec<f32>,
+}
+
+impl SegmentBuffer {
+    fn new(first_index: usize, frames_per_segment: usize, frames: usize) -> Self {
+        Self {
+            index: first_index,
+            frames_per_segment,
+            frames,
+            left: Vec::with_capacity(frames_per_segment),
+            right: Vec::with_capacity(frames_per_segment),
+        }
+    }
+
+    /// Append one planar block `[left, right]`, returning the segments it completes. The
+    /// last window of a track emits more than one step, so a block can cross a segment
+    /// boundary and even finish the short last segment as well.
+    fn push(&mut self, chunk: &[f32]) -> Result<Vec<(usize, Vec<f32>)>> {
+        anyhow::ensure!(
+            chunk.len() % 2 == 0,
+            "a stereo block of {} samples is not whole frames",
+            chunk.len()
+        );
+        let frames = chunk.len() / 2;
+        let mut finished = Vec::new();
+        let mut offset = 0;
+        while offset < frames {
+            let expected =
+                cache::expected_segment_frames(self.frames, self.frames_per_segment, self.index)
+                    .with_context(|| format!("the entry has no segment {}", self.index))?;
+            let take = (expected - self.left.len()).min(frames - offset);
+            self.left.extend_from_slice(&chunk[offset..offset + take]);
+            self.right
+                .extend_from_slice(&chunk[frames + offset..frames + offset + take]);
+            offset += take;
+            if self.left.len() == expected {
+                finished.push(self.take());
+            }
+        }
+        Ok(finished)
+    }
+
+    fn take(&mut self) -> (usize, Vec<f32>) {
+        let mut planar = Vec::with_capacity(self.left.len() * 2);
+        planar.extend_from_slice(&self.left);
+        planar.extend_from_slice(&self.right);
+        let index = self.index;
+        self.index += 1;
+        self.left.clear();
+        self.right.clear();
+        (index, planar)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.left.is_empty()
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+}
+
+/// One range of a segmented render: the segment being filled and the per-block work it
+/// shares with the whole-track path.
+struct Emission<'a, 'b> {
+    processor: &'a mut BlockProcessor<'b>,
+    buffer: SegmentBuffer,
+}
+
+impl<'a, 'b> Emission<'a, 'b> {
+    fn new(
+        processor: &'a mut BlockProcessor<'b>,
+        first_index: usize,
+        frames_per_segment: usize,
+        frames: usize,
+    ) -> Self {
+        Self {
+            processor,
+            buffer: SegmentBuffer::new(first_index, frames_per_segment, frames),
+        }
+    }
+
+    /// Process one emitted block, publish it, and write the segment it completes.
+    fn emit(
+        &mut self,
+        writer: &mut cache::EntryWriter,
+        out: &Block,
+        at: usize,
+        on_audio: &mut dyn FnMut(usize, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        let chunk = self.processor.process(out, at)?;
+        if writer.progress().gain_db.is_none() {
+            // As soon as the first block fixes the gain, before any segment can land: a
+            // resumed render cannot recover it from the audio, so a kill at any later
+            // point has to find it in the manifest.
+            writer.record_progress(&self.processor.progress())?;
+        }
+        on_audio(at, &chunk)?;
+        let finished = self.buffer.push(&chunk)?;
+        if finished.is_empty() {
+            return Ok(());
+        }
+        for (index, planar) in &finished {
+            writer.write_segment(*index, planar)?;
+        }
+        writer.record_progress(&self.processor.progress())?;
+        Ok(())
+    }
+
+    /// A range ends on a segment boundary, so nothing may still be buffered.
+    fn finish(self) -> Result<()> {
+        anyhow::ensure!(
+            self.buffer.is_empty(),
+            "the range stopped inside segment {}",
+            self.buffer.index()
+        );
+        Ok(())
+    }
+}
+
+/// Publishes a render into the frontier one second at a time.
+///
+/// The frontier's slots are fixed one-second windows, so audio that does not start on a
+/// second boundary is trimmed to the next one and the player reads the original where no
+/// chunk exists. That is what lets a resumed render, which starts mid-track and skips the
+/// segments already on disk, publish at the absolute index.
+struct FrontierPublisher<'a> {
+    frontier: &'a crate::frontier::Frontier,
+    /// Absolute frame where `buffer` starts.
+    at: usize,
+    buffer: Vec<f32>,
+}
+
+impl<'a> FrontierPublisher<'a> {
+    fn new(frontier: &'a crate::frontier::Frontier) -> Self {
+        Self {
+            frontier,
+            at: 0,
+            buffer: Vec::with_capacity(crate::frontier::CHUNK_FRAMES * 2),
+        }
+    }
+
+    fn frames(&self) -> usize {
+        self.buffer.len() / 2
+    }
+
+    fn push(&mut self, at: usize, chunk: &[f32]) -> Result<()> {
+        anyhow::ensure!(
+            chunk.len() % 2 == 0,
+            "a stereo chunk of {} samples is not whole frames",
+            chunk.len()
+        );
+        if at != self.at + self.frames() {
+            // The stream jumped, because a segment already on disk was skipped: what is
+            // buffered belongs to a stretch that ended and this one starts afresh.
+            self.buffer.clear();
+            self.at = at;
+        }
+        let frames = chunk.len() / 2;
+        for frame in 0..frames {
+            self.buffer.push(chunk[frame]);
+            self.buffer.push(chunk[frames + frame]);
+        }
+        let pad = self.at % crate::frontier::CHUNK_FRAMES;
+        if pad > 0 {
+            let drop = (crate::frontier::CHUNK_FRAMES - pad).min(self.frames());
+            self.buffer.drain(..drop * 2);
+            self.at += drop;
+        }
+        while self.frames() >= crate::frontier::CHUNK_FRAMES {
+            let chunk: Vec<f32> = self
+                .buffer
+                .drain(..crate::frontier::CHUNK_FRAMES * 2)
+                .collect();
+            self.frontier
+                .publish(self.at / crate::frontier::CHUNK_FRAMES, chunk);
+            self.at += crate::frontier::CHUNK_FRAMES;
+        }
+        Ok(())
+    }
+
+    /// Publish the last, short chunk when it ends the track; anywhere else a short chunk
+    /// would move the frontier's read pointer past frames it does not hold.
+    fn finish(self) {
+        if !self.buffer.is_empty() && self.at + self.frames() == self.frontier.frames() {
+            self.frontier
+                .publish(self.at / crate::frontier::CHUNK_FRAMES, self.buffer);
+        }
+    }
+}
+
+/// Render the track into `writer` as segments, publishing each finished second to the
+/// frontier as it lands.
+pub fn render_segments_into_frontier(
+    input: &dyn Frames,
+    job: Job,
+    writer: &mut cache::EntryWriter,
     frontier: &crate::frontier::Frontier,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize),
-) -> Result<Render> {
-    let mut buffer = ChannelMajor::with_capacity(track.frames);
-    let mut interleaved = Vec::with_capacity(crate::frontier::CHUNK_FRAMES * 2);
-    let mut published = 0usize;
-
-    let streamed = enhance_streaming(track, job, cancel, progress, |chunk| {
-        buffer.push(chunk);
-        let frames = chunk.len() / 2;
-        for frame in 0..frames {
-            interleaved.push(chunk[frame]);
-            interleaved.push(chunk[frames + frame]);
-        }
-        while interleaved.len() >= crate::frontier::CHUNK_FRAMES * 2 {
-            let chunk: Vec<f32> = interleaved
-                .drain(..crate::frontier::CHUNK_FRAMES * 2)
-                .collect();
-            frontier.publish(published, chunk);
-            published += 1;
-        }
-        Ok(())
+) -> Result<Streamed> {
+    let mut publisher = FrontierPublisher::new(frontier);
+    let streamed = render_segments(input, job, writer, cancel, progress, |at, chunk| {
+        publisher.push(at, chunk)
     })?;
-
-    if !interleaved.is_empty() {
-        frontier.publish(published, interleaved);
-    }
-    Ok(Render {
-        planar: buffer.finish(),
-        limit: streamed.limit,
-        device: streamed.device,
-        gain_db: streamed.gain_db,
-        lufs_input: streamed.lufs_input,
-        lufs_output: streamed.lufs_output,
-    })
+    publisher.finish();
+    Ok(streamed)
 }
 
 /// Render the track, or take it from the cache when this exact render already exists.
@@ -494,7 +971,7 @@ pub fn enhance_or_cached(
                 limited_samples: cached.meta.limited_samples,
             },
             device: cached.meta.device,
-            gain_db: cached.meta.gain_db,
+            gain_db: cached.meta.gain_db.unwrap_or(0.0),
             lufs_input: 0.0,
             lufs_output: 0.0,
         };
@@ -525,6 +1002,7 @@ pub fn enhance_file(
         source,
         source_hash,
         peaks: _,
+        source_entry: _,
     } = load(input, store.cache.root())?;
     eprintln!(
         "source {} Hz, {} ch -> {} Hz stereo ({} frames)",
@@ -849,5 +1327,585 @@ mod tests {
         // ADR-006: the seed is a compatibility contract, so a change here re-renders every
         // track with different noise instead of reusing the same one.
         assert_eq!(seed_for(&fixed_signal()), 8_901_150_270_194_604_865);
+    }
+
+    /// What `enhance` and the segmented renderer get from the fake worker: it echoes the
+    /// window halved, so the loudness match has a real, nonzero gain to carry.
+    const FAKE_GAIN: f32 = 0.5;
+
+    /// The cutoff the drift tests render with, recorded in the entry either way.
+    const CUTOFF: u32 = 12_000;
+
+    /// The fake worker `cargo` builds beside this test binary.
+    ///
+    /// `CARGO_BIN_EXE_` is only set for the package that declares a binary, and the fake
+    /// lives in `flacify-infer`, so an app test finds it in its own profile directory
+    /// instead. `cargo test --workspace --all-targets` builds it.
+    fn fake_worker() -> std::path::PathBuf {
+        let exe = std::env::current_exe().expect("the test binary's path");
+        let profile = exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("the target profile directory");
+        let name = if cfg!(windows) {
+            "fake-flashsr-worker.exe"
+        } else {
+            "fake-flashsr-worker"
+        };
+        let path = profile.join(name);
+        assert!(
+            path.is_file(),
+            "{} is missing; run `cargo test --workspace --all-targets`",
+            path.display()
+        );
+        path
+    }
+
+    /// A worker session on the fake sidecar, which needs no Python and no weights.
+    fn fake_session() -> Arc<WorkerSession> {
+        use flacify_infer::python::{
+            WorkerConfig, DEFAULT_EXCHANGE_TIMEOUT, DEFAULT_HANDSHAKE_TIMEOUT,
+        };
+
+        let config = WorkerConfig {
+            program: fake_worker(),
+            // The fake ignores the script and the paths `spawn` passes.
+            worker_script: std::path::PathBuf::from("tools/worker.py"),
+            model_dir: std::path::PathBuf::from("unused"),
+            flashsr_dir: None,
+            device: "fake".to_string(),
+            timeout: DEFAULT_EXCHANGE_TIMEOUT,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+        };
+        WorkerSession::with_args(config, vec!["--gain".to_string(), FAKE_GAIN.to_string()])
+    }
+
+    fn fake_job(session: Arc<WorkerSession>) -> Job {
+        Job {
+            session,
+            cutoff_hz: Some(CUTOFF),
+            seed: 0x51ED_2701,
+            splice_low_band: false,
+        }
+    }
+
+    /// A deterministic stereo track with peaks near full scale, so the gain and the
+    /// limiter both do something and no two windows are alike.
+    fn synthetic_track(frames: usize) -> Track {
+        let mut planar = vec![0.0; frames * 2];
+        for frame in 0..frames {
+            let t = frame as f32 / SAMPLE_RATE as f32;
+            planar[frame] = 0.78 * (std::f32::consts::TAU * 220.0 * t).sin()
+                + 0.16 * (std::f32::consts::TAU * 3_100.0 * t).sin();
+            planar[frames + frame] = 0.78 * (std::f32::consts::TAU * 223.0 * t).sin()
+                - 0.16 * (std::f32::consts::TAU * 4_700.0 * t).sin();
+        }
+        Track { planar, frames }
+    }
+
+    fn entry_fields() -> cache::Fields {
+        cache::Fields {
+            source_hash: "synthetic".to_string(),
+            window: WINDOW,
+            overlap: OVERLAP,
+            model_id: "fake".to_string(),
+            splice: false,
+        }
+    }
+
+    fn entry_spec(frames: usize, fields: &cache::Fields) -> cache::EntrySpec {
+        cache::EntrySpec {
+            frames,
+            cutoff_hz: CUTOFF,
+            fields: fields.clone(),
+        }
+    }
+
+    fn segment_frames() -> usize {
+        cache::frames_per_segment(WINDOW, OVERLAP).expect("a segment length")
+    }
+
+    /// A render collected channel-major, the way the whole-track path returns one.
+    fn collected(
+        mut render: impl FnMut(&mut dyn FnMut(usize, &[f32]) -> Result<()>) -> Result<Streamed>,
+        frames: usize,
+    ) -> (Streamed, Vec<f32>) {
+        let mut buffer = ChannelMajor::with_capacity(frames);
+        let streamed = render(&mut |_, chunk| {
+            buffer.push(chunk);
+            Ok(())
+        })
+        .expect("rendering");
+        (streamed, buffer.finish())
+    }
+
+    fn modified(path: &Path) -> std::time::SystemTime {
+        std::fs::metadata(path)
+            .expect("measuring a file")
+            .modified()
+            .expect("a modification time")
+    }
+
+    #[test]
+    fn given_a_track_rendered_both_ways_when_compared_then_every_sample_the_report_and_the_gain_match(
+    ) {
+        // Two whole segments: the exact multiple is the end-of-track case with no tail
+        // left, and the boundary between them is what the tail carry crosses.
+        let frames = 2 * segment_frames();
+        let track = synthetic_track(frames);
+        let session = fake_session();
+        let cancel = AtomicBool::new(false);
+
+        let (whole, expected) = collected(
+            |on_audio| {
+                enhance_streaming(
+                    &track,
+                    fake_job(Arc::clone(&session)),
+                    &cancel,
+                    &mut |_| {},
+                    on_audio,
+                )
+            },
+            frames,
+        );
+        assert!(
+            whole.limit.limited_samples > 0,
+            "the test signal must reach the limiter, or the report proves nothing"
+        );
+        assert!(
+            whole.gain_db.abs() > 1.0,
+            "the fake worker's halved echo must need a real gain, got {}",
+            whole.gain_db
+        );
+
+        let root = TempRoot::new("segmented-drift");
+        let cache = crate::cache::Cache::new(root.path.clone());
+        let fields = entry_fields();
+        let key = fields.key();
+        let mut writer = cache
+            .begin(&key, &entry_spec(frames, &fields))
+            .expect("beginning the entry");
+        let (segmented, actual) = collected(
+            |on_audio| {
+                render_segments(
+                    &track,
+                    fake_job(Arc::clone(&session)),
+                    &mut writer,
+                    &cancel,
+                    &mut |_| {},
+                    on_audio,
+                )
+            },
+            frames,
+        );
+
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "sample {index}: {got} != {want}"
+            );
+        }
+        assert_eq!(segmented.gain_db, whole.gain_db, "the gain carried");
+        assert_eq!(segmented.limit, whole.limit, "the limiter's report carried");
+
+        // The entry is complete and `load` is exactly the segments joined back together.
+        let cached = cache
+            .load(&key)
+            .expect("loading")
+            .expect("a complete entry");
+        assert_eq!(cached.meta.state, cache::State::Complete);
+        assert_eq!(cached.meta.frames, frames);
+        assert_eq!(cached.meta.segments.len(), 2);
+        assert_eq!(cached.meta.gain_db, Some(whole.gain_db));
+        let dir = cache.entry_dir(&key);
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for segment in &cached.meta.segments {
+            let path = dir.join(format!("seg-{:06}.flac", segment.index));
+            let decoded = decode::decode(&path).expect("decoding a segment");
+            assert_eq!(decoded.frames, segment.frames);
+            left.extend_from_slice(&decoded.planar[..decoded.frames]);
+            right.extend_from_slice(&decoded.planar[decoded.frames..]);
+        }
+        let mut concatenated = left;
+        concatenated.extend_from_slice(&right);
+        assert_eq!(concatenated.len(), cached.planar.len());
+        for (index, (&joined, &loaded)) in concatenated.iter().zip(&cached.planar).enumerate() {
+            assert_eq!(
+                joined.to_bits(),
+                loaded.to_bits(),
+                "sample {index}: load is not the concatenation of its segments"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_render_cancelled_in_its_first_segment_when_the_entry_is_inspected_then_the_gain_is_recorded_and_no_segment_is(
+    ) {
+        let frames = segment_frames();
+        let track = synthetic_track(frames);
+        let root = TempRoot::new("cancel-first");
+        let cache = crate::cache::Cache::new(root.path.clone());
+        let fields = entry_fields();
+        let key = fields.key();
+        let mut writer = cache
+            .begin(&key, &entry_spec(frames, &fields))
+            .expect("beginning the entry");
+        let cancel = AtomicBool::new(false);
+
+        let error = render_segments(
+            &track,
+            fake_job(fake_session()),
+            &mut writer,
+            &cancel,
+            &mut |_| {},
+            |at, _| {
+                if at == 0 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            },
+        )
+        .expect_err("the render was cancelled in its first segment");
+        assert!(is_cancelled(&error), "{error:#}");
+        assert!(
+            writer.progress().gain_db.is_some(),
+            "the gain has to be on disk before a segment can be resumed"
+        );
+        assert!(!writer.has_segment(0), "a cancelled block is not a segment");
+        assert!(cache.load(&key).expect("no error").is_none());
+    }
+
+    #[test]
+    fn given_a_partial_entry_with_segment_zero_when_resumed_then_segment_zero_is_kept_and_the_audio_is_the_fresh_render(
+    ) {
+        let frames = 2 * segment_frames();
+        let track = synthetic_track(frames);
+        let session = fake_session();
+        let fields = entry_fields();
+        let key = fields.key();
+
+        // A fresh render is the oracle the resumed one has to reproduce.
+        let fresh_root = TempRoot::new("resume-fresh");
+        let fresh_cache = crate::cache::Cache::new(fresh_root.path.clone());
+        let mut writer = fresh_cache
+            .begin(&key, &entry_spec(frames, &fields))
+            .expect("beginning the fresh entry");
+        render_segments(
+            &track,
+            fake_job(Arc::clone(&session)),
+            &mut writer,
+            &AtomicBool::new(false),
+            &mut |_| {},
+            |_, _| Ok(()),
+        )
+        .expect("the fresh render");
+        let fresh = fresh_cache
+            .load(&key)
+            .expect("loading")
+            .expect("a complete entry");
+
+        // Kill the render on the block that completes segment 0, so the cancel lands
+        // between ranges: the segment is written, the segment after it is not started.
+        let root = TempRoot::new("resume-partial");
+        let cache = crate::cache::Cache::new(root.path.clone());
+        let mut writer = cache
+            .begin(&key, &entry_spec(frames, &fields))
+            .expect("beginning the interrupted entry");
+        let cancel = AtomicBool::new(false);
+        let error = render_segments(
+            &track,
+            fake_job(Arc::clone(&session)),
+            &mut writer,
+            &cancel,
+            &mut |_| {},
+            |at, _| {
+                if at + CHUNK >= segment_frames() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            },
+        )
+        .expect_err("the render was cancelled after its first segment");
+        assert!(is_cancelled(&error), "{error:#}");
+
+        let dir = cache.entry_dir(&key);
+        assert!(
+            cache.load(&key).expect("no error").is_none(),
+            "a partial entry is a miss"
+        );
+        assert!(
+            !dir.join("seg-000001.flac").exists(),
+            "the cancelled render wrote a segment it had not finished"
+        );
+        let recorded = dir.join("seg-000000.flac");
+        assert_eq!(
+            decode::decode(&recorded)
+                .expect("decoding the kept segment")
+                .frames,
+            segment_frames(),
+            "the segment the kill left behind loads on its own"
+        );
+        let was_modified = modified(&recorded);
+
+        let mut writer = cache
+            .begin(&key, &entry_spec(frames, &fields))
+            .expect("resuming the entry");
+        render_segments(
+            &track,
+            fake_job(session),
+            &mut writer,
+            &AtomicBool::new(false),
+            &mut |_| {},
+            |_, _| Ok(()),
+        )
+        .expect("the resumed render");
+
+        assert_eq!(
+            modified(&recorded),
+            was_modified,
+            "a resumed render rewrote the segment already on disk"
+        );
+        let resumed = cache
+            .load(&key)
+            .expect("loading")
+            .expect("a complete entry");
+        assert_eq!(resumed.meta.state, cache::State::Complete);
+        assert_eq!(resumed.meta.segments.len(), 2);
+        assert_eq!(
+            std::fs::read(&recorded).expect("reading the kept segment"),
+            std::fs::read(fresh_cache.entry_dir(&key).join("seg-000000.flac"))
+                .expect("reading the fresh segment"),
+            "segment 0 must be the one the first render wrote"
+        );
+        assert_eq!(resumed.planar.len(), fresh.planar.len());
+        for (index, (&got, &want)) in resumed.planar.iter().zip(&fresh.planar).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "sample {index}: a resumed render is not the fresh one"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_track_shorter_than_a_segment_when_rendered_as_segments_then_it_finishes_and_matches_the_whole_render(
+    ) {
+        // Three steps and a bit: one short segment, and the end-of-track window is almost
+        // a whole window long.
+        let frames = 3 * CHUNK + 100;
+        assert!(frames < segment_frames());
+        let track = synthetic_track(frames);
+        let session = fake_session();
+        let cancel = AtomicBool::new(false);
+
+        let (whole, expected) = collected(
+            |on_audio| {
+                enhance_streaming(
+                    &track,
+                    fake_job(Arc::clone(&session)),
+                    &cancel,
+                    &mut |_| {},
+                    on_audio,
+                )
+            },
+            frames,
+        );
+
+        let root = TempRoot::new("one-segment");
+        let cache = crate::cache::Cache::new(root.path.clone());
+        let fields = entry_fields();
+        let key = fields.key();
+        let mut writer = cache
+            .begin(&key, &entry_spec(frames, &fields))
+            .expect("beginning the entry");
+        let (segmented, actual) = collected(
+            |on_audio| {
+                render_segments(
+                    &track,
+                    fake_job(Arc::clone(&session)),
+                    &mut writer,
+                    &cancel,
+                    &mut |_| {},
+                    on_audio,
+                )
+            },
+            frames,
+        );
+
+        assert_eq!(segmented.gain_db, whole.gain_db);
+        assert_eq!(segmented.limit, whole.limit);
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "sample {index}: {got} != {want}"
+            );
+        }
+        let cached = cache
+            .load(&key)
+            .expect("loading")
+            .expect("a complete entry");
+        assert_eq!(cached.meta.segments.len(), 1);
+        assert_eq!(cached.meta.segments[0].frames, frames);
+        assert_eq!(cached.meta.state, cache::State::Complete);
+    }
+
+    #[test]
+    fn given_a_track_that_ends_inside_a_segment_when_rendered_as_segments_then_both_segments_match_the_whole_render(
+    ) {
+        // Seven steps and a sliver: the last segment is shorter than the lookahead a
+        // mid-track range needs, so the range before it cannot be ended early and the two
+        // segments render as the track's end, its last window short.
+        let frames = segment_frames() + 100;
+        let track = synthetic_track(frames);
+        let session = fake_session();
+        let cancel = AtomicBool::new(false);
+
+        let (whole, expected) = collected(
+            |on_audio| {
+                enhance_streaming(
+                    &track,
+                    fake_job(Arc::clone(&session)),
+                    &cancel,
+                    &mut |_| {},
+                    on_audio,
+                )
+            },
+            frames,
+        );
+
+        let root = TempRoot::new("short-tail");
+        let cache = crate::cache::Cache::new(root.path.clone());
+        let fields = entry_fields();
+        let key = fields.key();
+        let mut writer = cache
+            .begin(&key, &entry_spec(frames, &fields))
+            .expect("beginning the entry");
+        let (segmented, actual) = collected(
+            |on_audio| {
+                render_segments(
+                    &track,
+                    fake_job(Arc::clone(&session)),
+                    &mut writer,
+                    &cancel,
+                    &mut |_| {},
+                    on_audio,
+                )
+            },
+            frames,
+        );
+
+        assert_eq!(segmented.gain_db, whole.gain_db);
+        assert_eq!(segmented.limit, whole.limit);
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "sample {index}: {got} != {want}"
+            );
+        }
+
+        let cached = cache
+            .load(&key)
+            .expect("loading")
+            .expect("a complete entry");
+        assert_eq!(cached.meta.segments.len(), 2);
+        assert_eq!(cached.meta.segments[0].frames, segment_frames());
+        assert_eq!(cached.meta.segments[1].frames, 100);
+    }
+
+    #[test]
+    fn given_an_entry_that_records_segment_zero_without_the_gain_when_rendered_then_it_is_refused()
+    {
+        let frames = segment_frames();
+        let track = synthetic_track(frames);
+        let root = TempRoot::new("no-gain");
+        let cache = crate::cache::Cache::new(root.path.clone());
+        let fields = entry_fields();
+        let key = fields.key();
+        let mut writer = cache
+            .begin(&key, &entry_spec(frames, &fields))
+            .expect("beginning the entry");
+        // What a build from before the gain was persisted would leave behind.
+        let planar = track.read_frames(0, frames).expect("the segment's samples");
+        writer.write_segment(0, &planar).expect("writing segment 0");
+        writer.abandon();
+
+        let mut writer = cache
+            .begin(&key, &entry_spec(frames, &fields))
+            .expect("resuming the entry");
+        let error = render_segments(
+            &track,
+            fake_job(fake_session()),
+            &mut writer,
+            &AtomicBool::new(false),
+            &mut |_| {},
+            |_, _| Ok(()),
+        )
+        .expect_err("an entry with a segment and no gain cannot be resumed");
+        assert!(
+            format!("{error:#}").contains("without the loudness gain"),
+            "{error:#}"
+        );
+    }
+
+    /// Planar stereo whose samples are their own absolute frame index, so a frontier test
+    /// can say exactly which frames it reads.
+    fn ramped_planar(start: usize, frames: usize) -> Vec<f32> {
+        let mut planar = Vec::with_capacity(frames * 2);
+        for frame in start..start + frames {
+            planar.push(frame as f32);
+        }
+        for frame in start..start + frames {
+            planar.push(frame as f32);
+        }
+        planar
+    }
+
+    #[test]
+    fn given_a_stream_that_starts_inside_a_second_when_published_then_it_lands_on_the_frontier_grid(
+    ) {
+        use crate::frontier::{Frontier, CHUNK_FRAMES};
+
+        let frontier = Frontier::new(64 * CHUNK_FRAMES);
+        let mut from_zero = FrontierPublisher::new(&frontier);
+        from_zero
+            .push(0, &ramped_planar(0, CHUNK_FRAMES))
+            .expect("publishing the first second");
+        assert_eq!(frontier.frame(0), Some((0.0, 0.0)));
+
+        // A resumed render starts 8 000 frames into a second: the partial second has no
+        // slot, so it is dropped and the next whole second is the first to land.
+        let start = 1_400_000;
+        let mut resumed = FrontierPublisher::new(&frontier);
+        resumed
+            .push(start, &ramped_planar(start, CHUNK_FRAMES))
+            .expect("publishing the partial second");
+        assert!(
+            frontier.frame(29 * CHUNK_FRAMES).is_none(),
+            "a partial second must not move the read pointer"
+        );
+        let second = start + CHUNK_FRAMES;
+        resumed
+            .push(second, &ramped_planar(second, CHUNK_FRAMES))
+            .expect("publishing the next second");
+        assert_eq!(
+            frontier.frame(30 * CHUNK_FRAMES),
+            Some((1_440_000.0, 1_440_000.0)),
+            "the first whole second after the jump goes to its own index"
+        );
+        assert!(
+            frontier.frame(28 * CHUNK_FRAMES).is_none(),
+            "no second before the jump was filled in"
+        );
+
+        // What is left is not a whole second and does not end the track.
+        resumed.finish();
+        assert!(frontier.frame(31 * CHUNK_FRAMES).is_none());
     }
 }

@@ -315,14 +315,21 @@ fn given_an_empty_home_when_ensure_runs_then_every_step_executes_in_order() {
     );
 
     let events = events.lock().expect("the progress sink");
-    assert_eq!(events.len(), 2 * ids.len(), "{events:?}");
     for id in ids {
         let reported: Vec<f32> = events
             .iter()
             .filter(|(step, _)| step == id)
             .map(|(_, fraction)| *fraction)
             .collect();
-        assert_eq!(reported, vec![0.0, 1.0], "{id} reported {reported:?}");
+        assert!(!reported.is_empty(), "{id} reported nothing");
+        assert_eq!(reported.first(), Some(&0.0), "{id} did not start at zero");
+        assert_eq!(reported.last(), Some(&1.0), "{id} did not finish at one");
+        assert!(
+            reported
+                .iter()
+                .all(|fraction| (0.0..=1.0).contains(fraction)),
+            "{id} reported out of range: {reported:?}"
+        );
     }
 }
 

@@ -154,7 +154,8 @@ Still to do:
 - Installer: `.msi` on Windows, `.app` + notarisation on macOS, AppImage/.deb on Linux.
 - Code signing. A `v*` tag already attaches a raw Windows `flacify.exe` from
   `.github/workflows/release.yml`.
-- Per-step byte progress (the bar still jumps 0→100 per step).
+- Per-step byte progress: **done 2026-11-16** — a monitor walks the step's target
+  directory every 400 ms, so the bar moves instead of jumping 0→100.
 - A hardware gate: **partly here (2026-11-16)** — the window names CPU inference and says
   the switch may never unlock, while the original keeps playing. RAM/VRAM detection and a
   passthrough choice at launch are still open.
@@ -378,9 +379,11 @@ not do, in the order it would hurt:
    machine and the real runner polls it while the child is alive, so Cancel (or closing the
    window) kills the running `uv`/`curl`/`pip` step and keeps the finished ones. One gap
    remains: a child that leaves a grandchild holding the pipes can delay the join.
-2. **The progress bar jumps, it does not move.** `Progress` reports a step at 0 and at 1,
-   so the bar is empty or full for each step. Byte-level progress already exists inside the
-   runner; it is not threaded out.
+2. ~~The progress bar jumps, it does not move.~~ **Done (2026-11-16):** a monitor walks the
+   step's target directory every 400 ms and reports `used / planned` bytes, so the bar moves
+   through `uv`, the venv and the weights. It is an estimate: the plan's byte counts are
+   approximate, so a step can read 100% before it finishes (clamped), and the walk is I/O
+   the step would not otherwise pay.
 3. **Retry is coarse.** It re-enters `ensure` from the top, skipping steps already marked
    done. It cannot retry only the failed step, and there is no backoff between attempts.
 4. **A cached or full-band file still triggers setup.** `Session::new` checks `is_ready`,

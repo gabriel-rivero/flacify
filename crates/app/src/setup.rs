@@ -346,18 +346,21 @@ pub fn plan() -> Vec<Step> {
     ]
 }
 
-type ProgressSink = Box<dyn Fn(&str, f32) + Send>;
+type ProgressSink = Arc<dyn Fn(&str, f32) + Send + Sync>;
 
 /// Reports a step id and that step's progress in `0.0..=1.0`.
-#[derive(Default)]
+///
+/// Cheap to clone: the sink is shared, which is what lets a size monitor report while a
+/// blocking child runs.
+#[derive(Clone, Default)]
 pub struct Progress {
     report: Option<ProgressSink>,
 }
 
 impl Progress {
-    pub fn new(report: impl Fn(&str, f32) + Send + 'static) -> Progress {
+    pub fn new(report: impl Fn(&str, f32) + Send + Sync + 'static) -> Progress {
         Progress {
-            report: Some(Box::new(report)),
+            report: Some(Arc::new(report)),
         }
     }
 
@@ -366,6 +369,69 @@ impl Progress {
             report(step, fraction);
         }
     }
+}
+
+/// While a step's child runs, report how much of that step's target directory exists.
+///
+/// Parsing `uv`/`pip`/curl output would be version-fragile; a directory walk is dull but
+/// it moves, and it cannot claim progress for a step that wrote nothing.
+struct Monitor {
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Monitor {
+    fn spawn(step: &Step, paths: &Paths, progress: Progress) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let id = step.id.to_string();
+        let root = step_root(step.id, paths);
+        let expected = step.bytes.max(1) as f32;
+        let thread = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                let fraction = (dir_size(&root) as f32 / expected).clamp(0.0, 1.0);
+                progress.emit(&id, fraction);
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        });
+        Self { stop, thread }
+    }
+
+    fn stop(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.thread.join();
+    }
+}
+
+/// The directory a step fills, for the size monitor.
+fn step_root(id: &str, paths: &Paths) -> PathBuf {
+    match id {
+        STEP_PYTHON => paths.python_dir(),
+        STEP_VENV | STEP_WHEELS => paths.venv_dir(),
+        STEP_FLASHSR => paths.flashsr_dir(),
+        STEP_WEIGHTS => paths.models_dir(),
+        _ => paths.runtime_dir(),
+    }
+}
+
+/// Total size of the regular files under `path`, ignoring symlinks (which can point
+/// outside the tree and, on a bad day, loop).
+fn dir_size(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            total += dir_size(&entry.path());
+        } else if kind.is_file() {
+            total += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        }
+    }
+    total
 }
 
 /// A token a long step can be stopped with. Cloning one shares the same flag.
@@ -555,8 +621,10 @@ pub fn ensure_with(paths: &Paths, runner: &dyn Runner, progress: Progress) -> Re
             continue;
         }
         progress.emit(step.id, 0.0);
-        run_step(step.id, paths, runner, &mut uv)
-            .with_context(|| format!("setup step {:?} failed", step.id))?;
+        let monitor = Monitor::spawn(&step, paths, progress.clone());
+        let result = run_step(step.id, paths, runner, &mut uv);
+        monitor.stop();
+        result.with_context(|| format!("setup step {:?} failed", step.id))?;
         state.mark_done(step.id);
         state
             .save(paths, runner)
@@ -1042,7 +1110,10 @@ fn home_dir() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{receipt_wheels, torch_install_args, wheels_manifest, PYTHON_WHEELS};
+    use super::{dir_size, receipt_wheels, torch_install_args, wheels_manifest, PYTHON_WHEELS};
+    use std::env;
+    use std::fs;
+    use std::path::Path;
 
     #[test]
     fn given_a_receipt_from_another_index_when_read_then_the_same_wheels_are_listed() {
@@ -1091,5 +1162,21 @@ mod tests {
                 "https://download.pytorch.org/whl/cu132",
             ]
         );
+    }
+
+    #[test]
+    fn given_nested_files_when_measured_then_every_regular_byte_is_counted() {
+        let root = env::temp_dir().join(format!("flacify-dirsize-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a/b")).expect("creating the tree");
+        fs::write(root.join("a/one"), b"12345").expect("writing");
+        fs::write(root.join("a/b/two"), b"123").expect("writing");
+        assert_eq!(dir_size(&root), 8);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn given_a_missing_directory_when_measured_then_it_is_zero() {
+        assert_eq!(dir_size(Path::new("this/path/does/not/exist")), 0);
     }
 }

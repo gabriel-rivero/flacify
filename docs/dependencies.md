@@ -16,6 +16,12 @@ PyPI's `torch` is CPU-only on Windows and Linux. A CUDA build comes from PyTorch
 index and costs about 2.5 GB more, so it is opt-in per machine rather than assumed:
 
 ```sh
+flacify setup --cuda
+```
+
+That is the same as exporting `FLACIFY_TORCH_INDEX` yourself:
+
+```sh
 FLACIFY_TORCH_INDEX=https://download.pytorch.org/whl/cu132 flacify setup
 ```
 
@@ -24,7 +30,8 @@ that publishes 2.15.0. Setting it upgrades an existing CPU install on the next
 `setup` (2.0 GiB, about 13 minutes measured), and the chosen index is recorded in the
 wheels receipt, so changing it re-runs that step. On Windows the PowerShell form is
 `$env:FLACIFY_TORCH_INDEX = "https://download.pytorch.org/whl/cu132"`. Leaving it
-unset keeps the CPU wheel and does not re-download anything.
+unset keeps the CPU wheel and does not re-download anything. The in-window setup does
+not offer the flag yet; use `flacify setup --cuda` on the CUDA machine.
 
 ## Rust crates
 

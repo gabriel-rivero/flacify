@@ -46,7 +46,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Install the Python runtime, the wheels and the model weights (about 6 GB, once).
-    Setup,
+    Setup {
+        /// Install the CUDA build of torch from PyTorch's index instead of PyPI's CPU
+        /// wheel. Only meaningful on Windows and Linux with an NVIDIA GPU.
+        #[arg(long)]
+        cuda: bool,
+    },
     /// Report the detected band limit and the playback verdict for a file.
     Probe {
         /// Any format symphonia can decode.
@@ -86,7 +91,7 @@ fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Setup => run_setup(),
+        Command::Setup { cuda } => run_setup(cuda),
         Command::Probe { file, rtf } => probe(&file, rtf),
         Command::Enhance { file, out, splice } => enhance(&file, out, splice),
         Command::Play {
@@ -97,7 +102,17 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_setup() -> Result<()> {
+fn run_setup(cuda: bool) -> Result<()> {
+    if cuda {
+        if cfg!(target_os = "macos") {
+            anyhow::bail!(
+                "macOS gets Metal from PyPI's torch; the CUDA wheel is for Windows and Linux"
+            );
+        }
+        if std::env::var_os("FLACIFY_TORCH_INDEX").is_none() {
+            std::env::set_var("FLACIFY_TORCH_INDEX", setup::CUDA_TORCH_INDEX);
+        }
+    }
     let paths = setup::Paths::discover()?;
     let bytes: u64 = setup::plan().iter().map(|step| step.bytes).sum();
     println!("flacify installs into {}", paths.root().display());

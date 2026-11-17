@@ -36,6 +36,10 @@ const STEP_WEIGHTS: &str = "weights";
 const HOME_ENV: &str = "FLACIFY_HOME";
 const UV_ENV: &str = "FLACIFY_UV";
 
+/// The PyTorch index that carries CUDA builds of the pinned torch. `cu132` is the tag
+/// measured on Windows (2026-11-15) that publishes torch 2.15.0.
+pub const CUDA_TORCH_INDEX: &str = "https://download.pytorch.org/whl/cu132";
+
 /// Approximate download sizes for the setup screen. The weights are exact.
 ///
 /// `WHEELS_BYTES` is the macOS/PyPI figure. A Linux CUDA install measured 3.20 GB of
@@ -132,6 +136,12 @@ fn receipt_wheels(text: &str) -> Vec<&str> {
 ///
 /// PyPI's torch is CPU-only on Windows and Linux; a CUDA build lives on PyTorch's own
 /// index and is about 2.5 GB larger. Opting in is per machine:
+///
+/// ```text
+/// flacify setup --cuda
+/// ```
+///
+/// which is the same as exporting
 ///
 /// ```text
 /// FLACIFY_TORCH_INDEX=https://download.pytorch.org/whl/cu132
@@ -1110,7 +1120,10 @@ fn home_dir() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dir_size, receipt_wheels, torch_install_args, wheels_manifest, PYTHON_WHEELS};
+    use super::{
+        dir_size, receipt_wheels, torch_install_args, wheels_manifest, CUDA_TORCH_INDEX,
+        PYTHON_WHEELS,
+    };
     use std::env;
     use std::fs;
     use std::path::Path;
@@ -1145,10 +1158,7 @@ mod tests {
 
     #[test]
     fn given_a_torch_index_when_the_torch_command_is_built_then_it_upgrades_from_that_index() {
-        let args = torch_install_args(
-            "/venv/python",
-            Some("https://download.pytorch.org/whl/cu132"),
-        );
+        let args = torch_install_args("/venv/python", Some(CUDA_TORCH_INDEX));
         assert_eq!(
             args,
             vec![
@@ -1159,7 +1169,7 @@ mod tests {
                 "--upgrade",
                 "torch",
                 "--index-url",
-                "https://download.pytorch.org/whl/cu132",
+                CUDA_TORCH_INDEX,
             ]
         );
     }

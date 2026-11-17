@@ -144,6 +144,11 @@ impl Cache {
         Self { root }
     }
 
+    /// The directory holding every entry. The source tier lives in its `source/`.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn entry_dir(&self, key: &str) -> PathBuf {
         self.root.join(key)
     }
@@ -353,8 +358,8 @@ impl Cache {
 }
 
 /// Frames per segment, derived from the settings so that every segment starts on a
-/// multiple of the render step.
-fn frames_per_segment(window: usize, overlap: usize) -> Result<usize> {
+/// multiple of the render step. The source tier uses the same length.
+pub(crate) fn frames_per_segment(window: usize, overlap: usize) -> Result<usize> {
     let step = window
         .checked_sub(overlap)
         .filter(|step| *step > 0)
@@ -428,7 +433,8 @@ fn write_manifest(dir: &Path, meta: &Meta) -> Result<()> {
     std::fs::rename(&temp, &path).with_context(|| format!("replacing {}", path.display()))
 }
 
-fn now() -> u64 {
+/// Unix seconds, for `created_at` and `last_used` in the manifests.
+pub(crate) fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())

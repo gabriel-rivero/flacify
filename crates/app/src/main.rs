@@ -19,6 +19,7 @@ mod render;
 mod render_status;
 mod session;
 mod setup;
+mod source;
 mod spectrum;
 mod splice;
 mod ui;
@@ -155,7 +156,7 @@ fn run_setup(cuda: bool) -> Result<()> {
 }
 
 fn probe(path: &Path, rtf: f64) -> Result<()> {
-    let loaded = render::load(path)?;
+    let loaded = render::load_in_memory(path)?;
     let (track, analysis) = (&loaded.track, &loaded.analysis);
     let seconds = track.frames as f64 / f64::from(SAMPLE_RATE);
     let plan = plan(&Probe::from_rtf(rtf), 5.12, Some(seconds));

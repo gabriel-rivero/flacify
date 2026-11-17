@@ -92,6 +92,9 @@ pub struct Loaded {
     /// blake3 of the file's bytes, the identity part of a cache key. Computed in [`load`]
     /// so nothing downstream reopens the file.
     pub source_hash: String,
+    /// Per-second RMS of the 48 kHz source, for the waveform.
+    #[allow(dead_code)] // Carried for the waveform; the window does not read it yet.
+    pub peaks: Vec<crate::source::SecondPeaks>,
 }
 
 impl Loaded {
@@ -106,10 +109,51 @@ impl Loaded {
             )
         }
     }
+
+    /// The one place a track becomes a [`Loaded`], wherever the audio came from.
+    fn from_track(
+        track: Track,
+        source: Source,
+        source_hash: String,
+        peaks: Vec<crate::source::SecondPeaks>,
+        path: &Path,
+    ) -> Result<Self> {
+        let analysis = flacify_core::dsp::cutoff::analyse(track.channel(0))
+            .with_context(|| format!("analysing {}", path.display()))?;
+        Ok(Self {
+            track,
+            analysis,
+            source,
+            source_hash,
+            peaks,
+        })
+    }
 }
 
-/// Decode any supported file to 48 kHz stereo, then report what the spectrum looks like.
-pub fn load(path: &Path) -> Result<Loaded> {
+/// Decode any supported file to 48 kHz stereo, keep that source on disk, and report what
+/// the spectrum looks like.
+///
+/// `cache_root` is the render cache's directory; the source tier lives in its `source/`.
+pub fn load(path: &Path, cache_root: &Path) -> Result<Loaded> {
+    let source_hash = crate::cache::source_hash(path)?;
+    let frames_per_segment = crate::cache::frames_per_segment(WINDOW, OVERLAP)?;
+    let tier = crate::source::Tier::new(cache_root, frames_per_segment)?;
+    let entry = tier.build_or_reuse(path, &source_hash)?;
+    let source = Source {
+        sample_rate: entry.meta().native_sample_rate,
+        channels: entry.meta().native_channels,
+    };
+    let planar = entry.read_all()?;
+    let frames = planar.len() / 2;
+    let track = Track { planar, frames };
+    Loaded::from_track(track, source, source_hash, entry.meta().peaks.clone(), path)
+}
+
+/// Decode any supported file to 48 kHz stereo in memory and write nothing.
+///
+/// [`load`] materialises the source tier; a diagnosis must not spend half a gigabyte of
+/// disk (or fail on a read-only cache) to print a verdict, so `probe` takes this path.
+pub fn load_in_memory(path: &Path) -> Result<Loaded> {
     let source_hash = crate::cache::source_hash(path)?;
     let decoded = decode::decode(path)?;
     let source = Source {
@@ -118,15 +162,9 @@ pub fn load(path: &Path) -> Result<Loaded> {
     };
     let planar = decode::to_stereo_48k(&decoded)?;
     let frames = planar.len() / 2;
+    let peaks = crate::source::second_peaks(&planar, frames);
     let track = Track { planar, frames };
-    let analysis = flacify_core::dsp::cutoff::analyse(track.channel(0))
-        .with_context(|| format!("analysing {}", path.display()))?;
-    Ok(Loaded {
-        track,
-        analysis,
-        source,
-        source_hash,
-    })
+    Loaded::from_track(track, source, source_hash, peaks, path)
 }
 
 /// A seed that survives re-renders, cache keys and bug reports (ADR-006).
@@ -486,7 +524,8 @@ pub fn enhance_file(
         analysis,
         source,
         source_hash,
-    } = load(input)?;
+        peaks: _,
+    } = load(input, store.cache.root())?;
     eprintln!(
         "source {} Hz, {} ch -> {} Hz stereo ({} frames)",
         source.sample_rate, source.channels, SAMPLE_RATE, track.frames
@@ -601,6 +640,29 @@ mod tests {
         }
     }
 
+    /// A unique cache root in the temp directory, deleted when the test ends.
+    struct TempRoot {
+        path: std::path::PathBuf,
+    }
+
+    impl TempRoot {
+        fn new(name: &str) -> Self {
+            let unique = NEXT_OUTPUT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "flacify-render-root-{}-{unique}-{name}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("creating the test cache root");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     /// One block of a constant signal: enough audio for a well-formed stream, cheap to
     /// encode.
     fn one_block() -> Vec<f32> {
@@ -700,13 +762,73 @@ mod tests {
     #[test]
     fn given_a_file_when_loaded_then_the_source_hash_is_the_cache_hash_of_that_path() {
         let source = write_source("source-hash.wav");
-        let loaded = load(&source.path).expect("loading the file");
+        let root = TempRoot::new("source-hash");
+        let loaded = load(&source.path, &root.path).expect("loading the file");
 
         assert_eq!(loaded.source_hash.len(), 32);
         assert_eq!(
             loaded.source_hash,
             crate::cache::source_hash(&source.path).expect("hashing the file")
         );
+    }
+
+    #[test]
+    fn given_a_file_when_loaded_then_the_source_tier_holds_it_and_a_second_load_reuses_it() {
+        let source = write_source("load-source.wav");
+        let root = TempRoot::new("load-source");
+        let loaded = load(&source.path, &root.path).expect("loading the file");
+
+        let decoded = crate::decode::decode(&source.path).expect("decoding the source");
+        assert_eq!(loaded.track.frames, 4_800);
+        assert_eq!(loaded.source.sample_rate, decoded.sample_rate);
+        assert_eq!(loaded.source.channels, decoded.channels);
+        assert_eq!(loaded.peaks.len(), 1, "100 ms is one waveform second");
+
+        let entry = root.path.join("source").join(&loaded.source_hash);
+        assert!(entry.join("source.json").is_file());
+        assert!(entry.join("src-000000.flac").is_file());
+        let manifest = entry.join("source.json");
+        let written = std::fs::metadata(&manifest)
+            .expect("measuring the manifest")
+            .modified()
+            .expect("a modification time");
+
+        let again = load(&source.path, &root.path).expect("loading again");
+        assert_eq!(again.track.planar, loaded.track.planar);
+        assert_eq!(
+            std::fs::metadata(&manifest)
+                .expect("measuring the manifest")
+                .modified()
+                .expect("a modification time"),
+            written,
+            "a second load reuses the entry instead of rewriting it"
+        );
+    }
+
+    #[test]
+    fn given_a_file_when_loaded_in_memory_then_it_matches_a_one_shot_decode() {
+        // The property that matters here is structural: `load_in_memory` takes no cache
+        // root, so it cannot write an entry. This test pins the audio and the peaks.
+        let source = write_source("probe.wav");
+
+        let loaded = load_in_memory(&source.path).expect("loading in memory");
+        let decoded = crate::decode::decode(&source.path).expect("decoding the source");
+        let expected = crate::decode::to_stereo_48k(&decoded).expect("resampling the source");
+
+        assert_eq!(loaded.track.frames, 4_800);
+        let bits = |samples: &[f32]| {
+            samples
+                .iter()
+                .map(|sample| sample.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&loaded.track.planar), bits(&expected));
+        assert_eq!(
+            loaded.peaks,
+            crate::source::second_peaks(&expected, 4_800),
+            "an in-memory load still reports the waveform"
+        );
+        assert_eq!(loaded.peaks.len(), 1);
     }
 
     /// A fixed signal with no platform-dependent rounding: a 4 096-frame ramp and its

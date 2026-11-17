@@ -286,6 +286,11 @@ problem, and it buys seek, instant replay, and a zero-GPU second listen.
 - **Format**: FLAC, 24-bit. This is what FLAC is for: lossless storage of the
   generated signal. Output f32 rounded to 24-bit is transparent (−144 dB quantisation
   floor) and roughly half the size of raw float.
+- **Source tier**: `cache/source/<source_hash>/source.json` plus `src-000000.flac` …,
+  the decoded 48 kHz stereo source in segments of the same 7-step length. One sequential
+  decode+resample pass writes it; `source.json` records the native rate and channels, the
+  segment table, one RMS pair per second for the waveform, and the `frames_per_segment`
+  a reader checks on open. A range read decodes only the segments it touches.
 - **Playback from cache**: two readers (original 48 kHz and enhanced) at the same
   position. Toggle is a crossfade with `D = 0`. Unrendered regions fall back to
   passthrough and are drawn differently on the waveform.

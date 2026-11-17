@@ -31,7 +31,7 @@ not acceptable**. Packaging stays, one release later.
 | **v0.0** | kill the risk | model runs, RTF measured, audio out | done |
 | **v0.1** | walking skeleton | `play` decodes, enhances, plays; A/B is sample-locked | done |
 | **v0.2** | **the player** | first sound in ≤ 2 s, enhanced within ~10 s, a window worth looking at | 2 |
-| **v0.3** | **a real app** | `.app` bundle, first-run setup inside the window, signing | 2 |
+| **v0.3** | **a real app** | `.app` bundle, first-run setup inside the window (signing deferred) | 2 |
 | **v0.4** | streaming and cache polish | any-length track, seek anywhere, eviction, no full-track buffers | 2 |
 | **v1.0** | utility | system-wide sink, batch folder, Windows/Linux builds | 3 |
 
@@ -146,22 +146,18 @@ the install, a worker that restarts after a death or a wedge, `flacify setup --c
 `flacify diagnose`, and packaging: the release workflow builds a per-user Windows `flacify-setup.exe`, an
 unsigned macOS `.dmg` with `Flacify.app`, and a Linux `.deb`.
 
-Still to do:
-
-- Code signing and notarisation. The `flacify-setup.exe`, `.dmg` and `.deb` are unsigned, and macOS
-  Gatekeeper needs right-click → Open (or `xattr -dr com.apple.quarantine`).
-- RAM/VRAM detection for the hardware gate. The CPU warning and passthrough are there.
-- Auto-detecting an NVIDIA GPU; the CUDA wheel is a manual checkbox and `--cuda`.
-- Resume inside a setup step: a dropped connection still restarts that step.
-- An end-to-end setup test (network + 6.9 GB); the state machine and cancellation are
-  tested, the download is not.
+Signed by nobody: the `flacify-setup.exe`, `.dmg` and `.deb` are unsigned, and macOS
+Gatekeeper needs right-click → Open (or `xattr -dr com.apple.quarantine`). Signing waits
+on a certificate and is deferred, with the rest of the v0.3 leftovers, to
+[Not on the roadmap](#not-on-the-roadmap).
 
 Exit: a clean machine installs from the window, plays a file, and a second run uses the
 install without contacting the network — met, with unsigned artifacts.
 
 ## v0.4 — streaming and cache polish
 
-This is where the player stops being a demo.
+This is where the player stops being a demo. The plan, the decisions and the evidence are
+in [`v0.4-plan.md`](v0.4-plan.md).
 
 - Segmented FLAC cache, content-addressed by `(file hash, model hash, params)`.
 - Background renderer fills it at whatever speed the GPU allows; the player reads
@@ -173,6 +169,14 @@ This is where the player stops being a demo.
 Exit: 60-minute track, zero dropouts, seek to 55:00 works, second play has 0 s of
 GPU time.
 
+**De-risked 2026-11-17.** The FLAC blocker is solved: `flacenc` 0.5.1 writes
+`STREAMINFO.min_blocksize` as the short last frame instead of the block size, so symphonia
+cannot probe its output. Restoring the field after encoding through the public API makes
+the file bit-exact in symphonia and claxon and clean under `flac -t`; no fork. Segments
+become 7 render steps (28.84 s, not 30 s) because a segment start must sit on the window
+lattice, and rendering a segment alone needs three carried values: the absolute window
+index for the seed, the previous window's tail, and the track gain from window 0.
+
 ## v1.0 — utility
 
 - Real-time mode: what the PoC does today, done with a policy object instead of a separate
@@ -182,15 +186,7 @@ GPU time.
 - Optional live capture source (input device), which is the same code the system sink needs.
 - System-wide sink: virtual output device, "enhance everything" mode.
 - Batch: drop a folder, render to cache, progress, resume, skip list.
-- Signed and notarised builds for all three platforms.
 - A blind A/B report you can export and share, which is the marketing asset.
-## Later, explicitly not scheduled
-
-Playlists and library management; Winamp `.wsz` skin support; EQ and DSP chain;
-VST/DAW plugin; alternative models behind the `Upscaler` trait (AERO, AudioSR,
-AP-BWE); a local HTTP + MCP server so agents and other tools can call the enhancer;
-multi-channel and 44.1 kHz-native models; a public RTF-by-GPU compatibility table fed
-by opt-in reports.
 
 ## Gaps found building the prototype (2026-11-12)
 
@@ -202,7 +198,11 @@ release where it should land.
 **v0.2, before anyone else uses it**
 
 1. **No FLAC out.** `enhance` writes 32-bit float WAV; `flacenc` is not wired up, so the
-   cache container from ADR-003 does not exist yet. WAV is also 3× larger.
+   cache container from ADR-003 does not exist yet. WAV is also 3× larger. The encoder
+   question is now answered (2026-11-17): `flacenc`'s output is unreadable by symphonia
+   because it advertises a variable blocksize over fixed-strategy frames, and restoring
+   `STREAMINFO.min_blocksize` after encoding fixes it exactly. Wiring it is V4-3 in
+   [`v0.4-plan.md`](v0.4-plan.md).
 2. ~~No loudness match.~~ **Done (2026-11-13):** the generated side was 1.49 LU louder;
    BS.1770 matching brings the step to −0.10 LU, measured twice (the app's meter and an
    independent scipy implementation). One gain per track, taken from the first window, so
@@ -393,3 +393,31 @@ not do, in the order it would hurt:
    `flacify setup`", and `--smoke` bails for the same reason: a headless run cannot click.
 9. **Only the state machine is tested.** The screen's transitions are unit-tested; the
    download path is not exercised end to end without a network and 6.9 GB.
+
+## Not on the roadmap
+
+Everything below is real and none of it is scheduled. The first table waits on a trigger;
+the second has no trigger yet.
+
+### Deferred, with the trigger that revives it
+
+| item | why it waits | what brings it back |
+|---|---|---|
+| macOS signing and notarisation (E7-4) | Needs a paid Apple Developer certificate. The unsigned `.dmg` installs with right-click → Open, or `xattr -dr com.apple.quarantine`. Deferred 2026-11-17; it will be paid for eventually. | the certificate, or a release handed to anyone who will not read the README |
+| Windows and Linux code signing | Same shape: a certificate and a price, and SmartScreen/AV warnings do not block the install. | the certificate |
+| RAM/VRAM detection for the hardware gate | The CPU warning and passthrough cover the case that hurts (v0.3 exit). | a report of the app wedging a low-memory machine |
+| Auto-detecting an NVIDIA GPU | The CUDA checkbox and `flacify setup --cuda` cover it, and a wrong guess downloads 2.7 GiB more. | a second CUDA user, or a wrong guess becoming likely |
+| Resume inside a setup step | Per-step progress landed and a dropped connection restarts only that step, not the install. | a flaky connection long enough to lose a whole step |
+| End-to-end setup test | Needs a network and 6.9 GB of weights in CI. | a hosted runner with a warm cache, or a nightly job |
+| Checksum verification of the weights (E7-1) | Size checks caught the real download bugs so far. | a download that passes its size and is still wrong |
+| Linux AppImage (E7-5) | The `.deb` installs and plays. | a non-Debian Linux user |
+| `CONTRIBUTING.md`, issue and PR templates (E0-3) | One developer, no outside contributors. | a first outside contributor |
+| `flacify probe --rtf` still defaults to 0.3 | The app measures RTF for real on every render; the saved hardware profile has no consumer yet. | the RTF-by-GPU table, below |
+
+### Later, no trigger
+
+Playlists and library management; Winamp `.wsz` skin support; EQ and DSP chain;
+VST/DAW plugin; alternative models behind the `Upscaler` trait (AERO, AudioSR,
+AP-BWE); a local HTTP + MCP server so agents and other tools can call the enhancer;
+multi-channel and 44.1 kHz-native models; a public RTF-by-GPU compatibility table fed
+by opt-in reports.

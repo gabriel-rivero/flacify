@@ -64,7 +64,7 @@ not level (see
 Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
 which builds and attaches:
 
-- **Windows:** `flacify.msi` (per-user install, Start Menu shortcut) and the raw `flacify.exe`.
+- **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) and the raw `flacify.exe`.
 - **macOS:** `flacify.dmg` containing `Flacify.app`.
 - **Linux:** `flacify_0.3.0_amd64.deb`.
 

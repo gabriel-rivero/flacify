@@ -143,12 +143,12 @@ Goal: a downloaded app that installs and starts without a terminal.
 **Landed 2026-11-16 — a real app.** First-run setup in the window (size, Download, Cancel,
 Resume, per-step byte progress, a CUDA checkbox), full-band and cached files playing without
 the install, a worker that restarts after a death or a wedge, `flacify setup --cuda`,
-`flacify diagnose`, and packaging: the release workflow builds a per-user Windows `.msi`, an
+`flacify diagnose`, and packaging: the release workflow builds a per-user Windows `flacify-setup.exe`, an
 unsigned macOS `.dmg` with `Flacify.app`, and a Linux `.deb`.
 
 Still to do:
 
-- Code signing and notarisation. The `.msi`, `.dmg` and `.deb` are unsigned, and macOS
+- Code signing and notarisation. The `flacify-setup.exe`, `.dmg` and `.deb` are unsigned, and macOS
   Gatekeeper needs right-click → Open (or `xattr -dr com.apple.quarantine`).
 - RAM/VRAM detection for the hardware gate. The CPU warning and passthrough are there.
 - Auto-detecting an NVIDIA GPU; the CUDA wheel is a manual checkbox and `--cuda`.

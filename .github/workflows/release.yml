@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   windows:
-    name: windows (exe + msi)
+    name: windows (exe + installer)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,20 +19,20 @@ jobs:
       - name: Build the release binary
         run: cargo build --release --bin flacify
 
-      - name: Install WiX
+      - name: Install Inno Setup
         shell: pwsh
-        run: choco install wixtoolset --no-progress -y
+        run: choco install innosetup --no-progress -y
 
-      - name: Build the MSI
+      - name: Build the installer
         shell: pwsh
         run: |
-          $candle = Get-ChildItem "${env:ProgramFiles(x86)}\WiX Toolset*\bin\candle.exe" |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $candle) { throw "candle.exe not found after installing WiX" }
-          $light = Join-Path $candle.DirectoryName "light.exe"
-          & $candle.FullName packaging\flacify.wxs -out target\release\flacify.wixobj
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $light target\release\flacify.wixobj -out target\release\flacify.msi
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source }
+          if (-not $iscc) { throw "ISCC.exe not found after installing Inno Setup" }
+          & $iscc packaging\flacify.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v4
@@ -40,7 +40,7 @@ jobs:
           name: windows
           path: |
             target/release/flacify.exe
-            target/release/flacify.msi
+            target/release/flacify-setup.exe
 
   macos:
     name: macos (app + dmg)
@@ -150,7 +150,7 @@ jobs:
           body: |
             flacify 0.3.0 — the player, now a real app.
 
-            - **Windows:** `flacify.msi` (per-user install, Start Menu shortcut) or the raw `flacify.exe`.
+            - **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) or the raw `flacify.exe`.
             - **macOS:** `flacify.dmg` with `Flacify.app`. Nothing is signed yet; right-click → Open,
               or `xattr -dr com.apple.quarantine /Applications/Flacify.app`.
             - **Linux:** `flacify_0.3.0_amd64.deb` (unsigned).

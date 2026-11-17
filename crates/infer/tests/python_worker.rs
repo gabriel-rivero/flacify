@@ -267,7 +267,10 @@ fn given_a_reply_with_a_bad_magic_when_spawning_then_the_handshake_fails() {
 #[test]
 fn given_a_worker_that_reads_but_never_answers_when_a_window_runs_then_it_times_out() {
     let mut config = config();
-    config.timeout = std::time::Duration::from_millis(200);
+    // The budget covers the handshake too, which starts a Python interpreter; 200 ms
+    // flaked when the whole suite ran in parallel. The test is about the watchdog firing,
+    // not about how tight the budget can be.
+    config.timeout = std::time::Duration::from_secs(2);
     let mut worker = PythonWorker::spawn_with_args(&config, &["--hang".to_string()])
         .expect("the fake worker should start");
 

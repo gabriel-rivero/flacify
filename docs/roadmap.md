@@ -169,13 +169,37 @@ in [`v0.4-plan.md`](v0.4-plan.md).
 Exit: 60-minute track, zero dropouts, seek to 55:00 works, second play has 0 s of
 GPU time.
 
-**De-risked 2026-11-17.** The FLAC blocker is solved: `flacenc` 0.5.1 writes
+**Released 2026-11-17 as 0.4.0.** The FLAC blocker is solved: `flacenc` 0.5.1 writes
 `STREAMINFO.min_blocksize` as the short last frame instead of the block size, so symphonia
-cannot probe its output. Restoring the field after encoding through the public API makes
-the file bit-exact in symphonia and claxon and clean under `flac -t`; no fork. Segments
-become 7 render steps (28.84 s, not 30 s) because a segment start must sit on the window
-lattice, and rendering a segment alone needs three carried values: the absolute window
-index for the seed, the previous window's tail, and the track gain from window 0.
+cannot probe its output; restoring the field after encoding through the public API makes
+the file exact in symphonia and claxon and clean under `flac -t`, no fork. Segments are 7
+render steps (28.84 s), because a segment start must sit on the window lattice.
+
+What 0.4.0 does:
+
+- A render is written as 24-bit FLAC segments behind a manifest, each readable as soon as it
+  is finished, so a killed render resumes. `CACHE_VERSION` 9.
+- A source tier (`cache/source/<hash>/`) holds the decoded 48 kHz stereo source in the same
+  segments; the cache key is the source file's bytes, not a decode.
+- The renderer works a segment at a time and holds about 25 MB, against 1.38 GB per hour.
+- A track with a complete entry plays from three resident segments: 66 MB for an hour,
+  seek is a segment read, and the A/B switch runs the same arithmetic as a whole-track render.
+- `flacify enhance -o out.flac` writes 24-bit FLAC.
+
+What 0.4.0 does not do, and the next release needs to:
+
+- **The first play of an uncached track still holds the whole track and a never-released
+  frontier**, about 1.4 GB each per hour. Only the complete-entry path is bounded.
+- **No eviction, and no accounting of disk use.** Every render is kept, and `flacify diagnose`
+  counts the source tier as one entry.
+- **The waveform and the spectrum are blank** on the segment path, because the buffers they
+  read no longer exist.
+- **No 60-minute acceptance run.** The memory figure is measured on a synthetic entry; the
+  end-to-end run with a real hour of audio, zero-dropout counting and a 55:00 seek has not
+  happened.
+
+Those four are in [Not on the roadmap](#not-on-the-roadmap) with the trigger that revives
+each one.
 
 ## v1.0 — utility
 
@@ -402,6 +426,10 @@ the second has no trigger yet.
 
 | item | why it waits | what brings it back |
 |---|---|---|
+| The 60-minute acceptance run (V4-10) | The memory and seek numbers were measured on a synthetic entry; the end-to-end hour with zero-dropout counting and a 55:00 seek needs an hour of audio and a quiet machine. | the next release, or the first report of a dropout on a long track |
+| Cache eviction and accounting (V4-7) | Eviction needs a policy for two entry kinds (rendered and source) and a decision on whether a full-band load may skip the source tier. Nothing evicts today, so the cache grows with every render. | the cache directory passing a few GB, or a full disk |
+| Waveform and spectrum on the segment path (V4-9) | Those views read the whole-track buffers that segment playback removed, so cached playback draws neither. The peaks are already stored per second in the source manifest. | the next release's UI work |
+| Bounded memory on the first play (V4-8c) | The progressive path holds the decoded track and a frontier that never releases a published second: about 1.4 GB each per hour. Only a complete entry is bounded. | a 60-minute uncached first play, or any low-memory report |
 | macOS signing and notarisation (E7-4) | Needs a paid Apple Developer certificate. The unsigned `.dmg` installs with right-click → Open, or `xattr -dr com.apple.quarantine`. Deferred 2026-11-17; it will be paid for eventually. | the certificate, or a release handed to anyone who will not read the README |
 | Windows and Linux code signing | Same shape: a certificate and a price, and SmartScreen/AV warnings do not block the install. | the certificate |
 | RAM/VRAM detection for the hardware gate | The CPU warning and passthrough cover the case that hurts (v0.3 exit). | a report of the app wedging a low-memory machine |

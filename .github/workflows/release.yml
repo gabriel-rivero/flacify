@@ -66,8 +66,8 @@ jobs:
             <key>CFBundleName</key><string>flacify</string>
             <key>CFBundleDisplayName</key><string>flacify</string>
             <key>CFBundleIdentifier</key><string>com.gabrielrivero.flacify</string>
-            <key>CFBundleVersion</key><string>0.3.0</string>
-            <key>CFBundleShortVersionString</key><string>0.3.0</string>
+            <key>CFBundleVersion</key><string>0.4.0</string>
+            <key>CFBundleShortVersionString</key><string>0.4.0</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleExecutable</key><string>flacify</string>
             <key>LSMinimumSystemVersion</key><string>11.0</string>
@@ -103,7 +103,7 @@ jobs:
 
       - name: Build the .deb
         run: |
-          VERSION=0.3.0
+          VERSION=0.4.0
           ROOT=target/deb
           rm -rf "$ROOT"
           mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/share/applications"
@@ -131,7 +131,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: target/release/flacify_0.3.0_amd64.deb
+          path: target/release/flacify_0.4.0_amd64.deb
 
   publish:
     name: publish the release
@@ -148,14 +148,21 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           body: |
-            flacify 0.3.0 — the player, now a real app.
+            flacify 0.4.0: the cache is a set of FLAC segments, and playback reads them.
 
             - **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) or the raw `flacify.exe`.
-            - **macOS:** `flacify.dmg` with `Flacify.app`. Nothing is signed yet; right-click → Open,
-              or `xattr -dr com.apple.quarantine /Applications/Flacify.app`.
-            - **Linux:** `flacify_0.3.0_amd64.deb` (unsigned).
+            - **macOS:** `flacify.dmg` with `Flacify.app`. Nothing is signed yet; right-click, then Open,
+              or run `xattr -dr com.apple.quarantine /Applications/Flacify.app`.
+            - **Linux:** `flacify_0.4.0_amd64.deb` (unsigned).
 
-            The first `flacify play` opens a setup screen and downloads the Python sidecar,
-            wheels and weights (about 6.9 GB with CUDA, 4.2 GB without); `flacify setup` does
-            the same from a terminal. A full-band file or an already-cached render plays
-            without the model, and Cancel keeps the finished steps for the next run.
+            A render is now written as 24-bit FLAC segments, each written and readable as soon
+            as it finishes, so an interrupted render resumes instead of starting over. A track
+            with a complete cache entry plays from three resident segments: 66 MB for an hour
+            of audio instead of 1.38 GB per buffer, and seeking is a segment read. The first
+            play of an uncached track still holds the whole track in memory, and cached
+            playback draws no waveform or spectrum until the UI work lands.
+
+            `flacify enhance in.mp3 -o out.flac` writes 24-bit FLAC as well as WAV. The first
+            `flacify play` still opens a setup screen and downloads the Python sidecar, wheels
+            and weights (about 6.9 GB with CUDA, 4.2 GB without); a full-band file or a cached
+            render plays without the model.

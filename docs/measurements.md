@@ -599,3 +599,19 @@ that writer, release profile, M5 Max:
 | FLAC bytes | 4 157 946 (ratio 0.50 of 24-bit raw, 0.38 of float WAV) |
 | encode wall time | 58 ms, single-threaded, no `par` feature |
 | share of the model time for the same audio (RTF 0.54, ≈53 s) | 0.11% |
+
+## Segment playback (2026-11-17)
+
+A complete cache entry plays from three resident segments, each holding both the source
+and the rendered side. Measured by building two segment sources over 172 800 000 frames
+(one hour at 48 kHz) with the shipped 1 384 320-frame segment and reading them the way the
+mixer does, M5 Max, release profile:
+
+| quantity | value |
+|---|---|
+| resident after a seek | 44 298 240 bytes |
+| resident in steady playback | 66 447 360 bytes |
+| the same hour as whole-track buffers (before) | 1 380 000 000 bytes per side |
+
+The first play of an uncached track still holds the decoded track and the frontier, so this
+figure applies to an entry that is complete.

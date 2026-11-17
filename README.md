@@ -66,7 +66,7 @@ which builds and attaches:
 
 - **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) and the raw `flacify.exe`.
 - **macOS:** `flacify.dmg` containing `Flacify.app`.
-- **Linux:** `flacify_0.3.0_amd64.deb`.
+- **Linux:** `flacify_0.4.0_amd64.deb`.
 
 Nothing is signed or notarised yet: on macOS, right-click → Open (or
 `xattr -dr com.apple.quarantine /Applications/Flacify.app`) the first time. The first
@@ -105,7 +105,7 @@ See [`docs/vision.md`](docs/vision.md).
 ## Start here
 
 ```sh
-cargo test --workspace   # 264 tests, no GPU, no audio device, no model, no Python
+cargo test --workspace   # 290 tests, no GPU, no audio device, no model, no Python
 ```
 
 `core` and `infer` are testable without a model, which is what makes the DSP and the

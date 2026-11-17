@@ -7,7 +7,7 @@
 [Setup]
 AppId={{6F3B6C2E-9C1A-4F1B-9E3D-2A7C5B8D4E10}
 AppName=flacify
-AppVersion=0.3.0
+AppVersion=0.4.0
 AppPublisher=Gabriel Rivero
 DefaultDirName={localappdata}\flacify\bin
 DefaultGroupName=flacify

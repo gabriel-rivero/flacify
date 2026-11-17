@@ -155,7 +155,9 @@ Still to do:
 - Code signing. A `v*` tag already attaches a raw Windows `flacify.exe` from
   `.github/workflows/release.yml`.
 - Per-step byte progress (the bar still jumps 0→100 per step).
-- A hardware gate: a clear message and passthrough mode on 8 GB Macs or old GPUs.
+- A hardware gate: **partly here (2026-11-16)** — the window names CPU inference and says
+  the switch may never unlock, while the original keeps playing. RAM/VRAM detection and a
+  passthrough choice at launch are still open.
 - Choosing the CUDA torch wheel without `FLACIFY_TORCH_INDEX` (a per-platform default or a
   documented `setup` flag).
 - Worker supervision: a dead child is replaced and the window retried once; a model that

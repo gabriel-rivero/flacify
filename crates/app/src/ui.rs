@@ -140,6 +140,13 @@ impl PlayerApp {
     }
 
     fn draw_transport(&mut self, ui: &mut egui::Ui) {
+        // The first progressive render cannot know the device until the worker has loaded;
+        // once it does, replace "rendering" with the truth so the gate below can fire.
+        if self.info.device == "rendering" {
+            if let Some(device) = self.session.worker().device() {
+                self.info.device = device;
+            }
+        }
         let rate = self.engine.device_rate;
         let controls = Arc::clone(&self.engine.controls);
         let position = controls.position_secs(rate);
@@ -288,6 +295,16 @@ impl PlayerApp {
                 egui::RichText::new(format!("device stream errors: {errors}"))
                     .weak()
                     .size(11.0),
+            );
+        }
+
+        // The hardware gate: say it rather than let the switch silently never unlock.
+        if is_cpu_device(&self.info.device) {
+            ui.add_space(6.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 160, 60),
+                "CPU inference: this machine renders slower than realtime, so the A/B switch \
+                 may unlock late or not at all. The original plays throughout.",
             );
         }
 
@@ -569,6 +586,12 @@ impl PlayerApp {
     }
 }
 
+/// A worker on the CPU is a renderer, not a player; the window says so rather than letting
+/// the switch silently never unlock.
+fn is_cpu_device(device: &str) -> bool {
+    device == "cpu"
+}
+
 /// Frequency at a fraction of the way across a log axis from 40 Hz to Nyquist.
 fn frequency_at(fraction: f32, sample_rate: f32) -> f32 {
     let nyquist = sample_rate / 2.0;
@@ -761,5 +784,14 @@ mod tests {
         let (bars, bar_frames) = waveform_bars(&[], 2, 44_100, WAVEFORM_MAX_BARS);
         assert!(bars.is_empty());
         assert_eq!(bar_frames, 44_100);
+    }
+
+    #[test]
+    fn given_a_worker_device_when_asked_then_only_cpu_is_the_slow_case() {
+        assert!(is_cpu_device("cpu"));
+        assert!(!is_cpu_device("cuda"));
+        assert!(!is_cpu_device("mps"));
+        assert!(!is_cpu_device("none"));
+        assert!(!is_cpu_device("rendering"));
     }
 }

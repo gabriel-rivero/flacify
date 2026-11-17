@@ -589,3 +589,13 @@ worst case for a lossless codec (M5 Max, 2026-11-17):
 
 Music compresses better than pink noise, so the real cache ratio sits between the two FLAC
 rows. Encoding costs under 0.5% of the model's render time either way.
+
+**The writer that shipped (2026-11-17).** `flacify enhance -o x.flac` now uses
+`crates/app/src/flac.rs`. Measured on 1 384 320 frames (28.84 s) of white noise through
+that writer, release profile, M5 Max:
+
+| quantity | value |
+|---|---|
+| FLAC bytes | 4 157 946 (ratio 0.50 of 24-bit raw, 0.38 of float WAV) |
+| encode wall time | 58 ms, single-threaded, no `par` feature |
+| share of the model time for the same audio (RTF 0.54, ≈53 s) | 0.11% |

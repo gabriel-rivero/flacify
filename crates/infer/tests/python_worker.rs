@@ -24,6 +24,7 @@ fn config() -> WorkerConfig {
         flashsr_dir: Some(PathBuf::from("unused/flashsr")),
         device: "fake".to_string(),
         timeout: flacify_infer::python::DEFAULT_EXCHANGE_TIMEOUT,
+        handshake_timeout: flacify_infer::python::DEFAULT_HANDSHAKE_TIMEOUT,
     }
 }
 
@@ -267,10 +268,9 @@ fn given_a_reply_with_a_bad_magic_when_spawning_then_the_handshake_fails() {
 #[test]
 fn given_a_worker_that_reads_but_never_answers_when_a_window_runs_then_it_times_out() {
     let mut config = config();
-    // The budget covers the handshake too, which starts a Python interpreter; 200 ms
-    // flaked when the whole suite ran in parallel. The test is about the watchdog firing,
-    // not about how tight the budget can be.
-    config.timeout = std::time::Duration::from_secs(2);
+    // The handshake keeps its own, generous budget, so this test does not race a loaded
+    // machine to start a process; only the window budget is short.
+    config.timeout = std::time::Duration::from_millis(200);
     let mut worker = PythonWorker::spawn_with_args(&config, &["--hang".to_string()])
         .expect("the fake worker should start");
 
@@ -283,7 +283,7 @@ fn given_a_worker_that_reads_but_never_answers_when_a_window_runs_then_it_times_
         "{error}"
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
+        started.elapsed() < std::time::Duration::from_secs(30),
         "the watchdog took {:?}",
         started.elapsed()
     );

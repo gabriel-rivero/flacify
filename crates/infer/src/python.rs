@@ -59,6 +59,10 @@ pub const MODEL_LATENCY_SAMPLES: usize = 12;
 /// machine runs a 5.12 s window at about 7x realtime (~36 s), so this is generous.
 pub const DEFAULT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long the handshake may take: the worker starts an interpreter and loads 3.3 GB of
+/// weights, which is minutes on a slow box and nothing like one window's budget.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Where the interpreter, the worker script and the weights live.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -74,6 +78,9 @@ pub struct WorkerConfig {
     pub device: String,
     /// How long one window may take before the child is killed and the caller told.
     pub timeout: Duration,
+    /// How long the handshake may take before the child is killed. Separate because it
+    /// waits on an interpreter start and a weight load, not on one window.
+    pub handshake_timeout: Duration,
 }
 
 /// What the loaded model reported at startup.
@@ -302,6 +309,8 @@ struct Connection {
     next_id: u64,
     /// How long one exchange may take before the child is killed.
     timeout: Duration,
+    /// How long the handshake may take before the child is killed.
+    handshake_timeout: Duration,
     /// Set once the child has been reaped, so `Drop` does not reap it again.
     has_exited: bool,
 }
@@ -364,6 +373,7 @@ impl Connection {
             stderr_thread: Some(stderr_thread),
             next_id: 0,
             timeout: config.timeout,
+            handshake_timeout: config.handshake_timeout,
             has_exited: false,
         })
     }
@@ -382,7 +392,7 @@ impl Connection {
             frames: 0,
             noise_len: 0,
         };
-        let (reply, payload) = self.exchange(&request, &[])?;
+        let (reply, payload) = self.exchange_within(&request, &[], self.handshake_timeout)?;
         if reply.status != STATUS_OK {
             return Err(Error::Inference(format!(
                 "the worker rejected the handshake: {}",
@@ -398,9 +408,19 @@ impl Connection {
     /// A watchdog kills the child if it does not answer within `timeout`; the retry in
     /// [`ResidentModel`](crate::session::ResidentModel) then starts a fresh one.
     fn exchange(&mut self, request: &Request, body: &[u8]) -> Result<(Reply, Vec<u8>)> {
+        self.exchange_within(request, body, self.timeout)
+    }
+
+    /// The same exchange under a stated budget, so the handshake can wait on a weight load
+    /// while a window keeps the tighter one.
+    fn exchange_within(
+        &mut self,
+        request: &Request,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<(Reply, Vec<u8>)> {
         let timed_out = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&timed_out);
-        let timeout = self.timeout;
         let pid = self.child.id();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let watchdog = thread::spawn(move || {

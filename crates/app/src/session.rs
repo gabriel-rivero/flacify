@@ -331,6 +331,7 @@ fn worker_config(paths: &setup::Paths) -> WorkerConfig {
         flashsr_dir: Some(paths.flashsr_dir()),
         device: "auto".to_string(),
         timeout: flacify_infer::python::DEFAULT_EXCHANGE_TIMEOUT,
+        handshake_timeout: flacify_infer::python::DEFAULT_HANDSHAKE_TIMEOUT,
     }
 }
 

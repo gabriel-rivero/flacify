@@ -190,6 +190,7 @@ mod tests {
             flashsr_dir: None,
             device: "cpu".to_string(),
             timeout: crate::python::DEFAULT_EXCHANGE_TIMEOUT,
+            handshake_timeout: crate::python::DEFAULT_HANDSHAKE_TIMEOUT,
         }
     }
 

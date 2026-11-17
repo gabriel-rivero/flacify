@@ -111,7 +111,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("flacify-cache-sum-{}", std::process::id()));
         let entry = root.join("entry");
         std::fs::create_dir_all(&entry).expect("creating the entry");
-        std::fs::write(entry.join("audio.wav"), vec![0u8; 2_000_000]).expect("writing");
+        std::fs::write(entry.join("manifest.json"), vec![0u8; 2_000_000]).expect("writing");
 
         let summary = cache_summary(&root);
         assert!(summary.contains("1 entries"), "{summary}");

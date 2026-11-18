@@ -143,13 +143,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # One test at a time: the bin's suite spawns pump and capture threads, and this
-      # runner has no audio device. Serial output also names the test that dies instead of
-      # losing it to the harness abort (a STATUS_ACCESS_VIOLATION in the parallel run).
       - name: Test
         run: |
           if (-not (Test-Path tools/fixtures/out/manifest.json)) { throw "fixtures missing" }
-          cargo test --workspace --all-targets -- --test-threads=1
+          cargo test --workspace --all-targets
 
   deny:
     name: licences and advisories

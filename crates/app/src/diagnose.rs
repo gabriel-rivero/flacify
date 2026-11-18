@@ -25,6 +25,14 @@ pub fn run(out: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 pub fn report(paths: &Paths) -> String {
+    report_devices(paths, device::list())
+}
+
+/// The report with the device inventory supplied.
+///
+/// Enumerating real audio devices is a host call that Windows runners without an audio
+/// device do not survive, so the unit tests hand in a list instead of touching cpal.
+pub fn report_devices(paths: &Paths, devices: Result<device::DeviceList>) -> String {
     let mut text = String::new();
     let _ = writeln!(text, "flacify  {}", env!("CARGO_PKG_VERSION"));
     let _ = writeln!(
@@ -75,7 +83,7 @@ pub fn report(paths: &Paths) -> String {
     }
 
     let _ = writeln!(text, "\ndevices");
-    match device::list() {
+    match devices {
         Ok(list) => {
             for line in device::describe(&list).lines() {
                 let _ = writeln!(text, "  {line}");
@@ -197,7 +205,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("creating the temp home");
         let paths = Paths::at(root.clone());
 
-        let text = report(&paths);
+        let text = report_devices(&paths, Ok(device::DeviceList::default()));
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
         assert!(text.contains("ready    false"), "{text}");
         assert!(text.contains("vae.pth missing"), "{text}");
@@ -220,7 +228,7 @@ mod tests {
         let written = crate::batch::report_path(&cache);
         std::fs::write(&written, "# flacify batch\n").expect("writing the report");
 
-        let text = report(&paths);
+        let text = report_devices(&paths, Ok(device::DeviceList::default()));
         assert!(
             text.contains(&format!("batch    last run {}", written.display())),
             "{text}"
@@ -238,7 +246,7 @@ mod tests {
         write_entry(&cache_dir, "half", 1_000_000, State::Partial);
         std::fs::create_dir_all(cache_dir.join("left-behind.tmp")).expect("creating a stale dir");
 
-        let text = report(&paths);
+        let text = report_devices(&paths, Ok(device::DeviceList::default()));
         assert!(line_for(&text, "rendered").contains("1 entry "), "{text}");
         assert!(line_for(&text, "rendered").contains("2.0 MB"), "{text}");
         assert!(line_for(&text, "partial").contains("1 entry "), "{text}");

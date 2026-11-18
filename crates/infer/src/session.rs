@@ -165,11 +165,7 @@ impl Model for ResidentModel {
     }
 
     fn noise_len(&self, channels: usize, frames: usize) -> usize {
-        if channels == 2 && frames == self.hello.window {
-            self.hello.noise_len_stereo
-        } else {
-            channels * frames
-        }
+        self.hello.noise_len(channels, frames)
     }
 
     fn name(&self) -> &str {
@@ -222,6 +218,18 @@ mod tests {
             hello: hello(),
         };
         assert_eq!(model.noise_len(2, 245_760), 1_920);
-        assert_eq!(model.noise_len(2, 1_024), 2_048);
+    }
+
+    #[test]
+    fn given_a_shorter_window_when_sized_then_the_noise_scales_with_it() {
+        let session = WorkerSession::new(config());
+        let model = ResidentModel {
+            session,
+            hello: hello(),
+        };
+        // One granule of the same latent grid, not one sample per audio sample.
+        assert_eq!(model.noise_len(2, 30_720), 240);
+        assert_eq!(model.noise_len(2, 61_440), 480);
+        assert_eq!(model.noise_len(1, 245_760), 960);
     }
 }

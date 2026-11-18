@@ -105,6 +105,21 @@ pub struct Hello {
 }
 
 impl Hello {
+    /// Noise samples the model's latent grid needs for a window of this shape.
+    ///
+    /// The handshake reports the count for the trained window only. The grid has one
+    /// latent per 80 ms and the same channel and bin axes at every window, so the count
+    /// scales linearly with frames and channels; a window that is not a whole number of
+    /// latents is rejected by the worker, not here.
+    pub fn noise_len(&self, channels: usize, frames: usize) -> usize {
+        if frames == self.window {
+            return self.noise_len_stereo / 2 * channels;
+        }
+        let window_frames = self.window.max(1);
+        let scaled = self.noise_len_stereo * frames / window_frames;
+        scaled / 2 * channels
+    }
+
     /// Parse the handshake reply. Every field is required, and the protocol must match.
     fn from_json(text: &str) -> std::result::Result<Hello, String> {
         let mut fields = json::parse_object(text)?;
@@ -217,15 +232,10 @@ impl Model for PythonWorker {
         Ok(decode_f32(&payload))
     }
 
-    /// The model's latent grid for its trained stereo window, and one sample per audio
-    /// sample otherwise. The grid is a property of the model, which is why the count
-    /// comes from the handshake and not from a constant here.
+    /// The noise lives on the model's latent grid, which the handshake reports for the
+    /// trained window; [`Hello::noise_len`] scales it to any window the sidecar accepts.
     fn noise_len(&self, channels: usize, frames: usize) -> usize {
-        if channels == 2 && frames == self.hello.window {
-            self.hello.noise_len_stereo
-        } else {
-            channels * frames
-        }
+        self.hello.noise_len(channels, frames)
     }
 
     /// Measured on the published checkpoint with a band-limited burst at two positions
@@ -957,6 +967,21 @@ mod tests {
         assert_eq!(hello.latent_shape_stereo, vec![4, 8, 60]);
         assert_eq!(hello.load_secs, 8.2);
         assert_eq!(hello.warmup_secs, 1.5);
+    }
+
+    #[test]
+    fn given_a_preset_window_when_sized_then_the_noise_is_the_latent_grid_for_it() {
+        // The shape the shipped checkpoint reported on the M5, so this pins the real
+        // grid rather than the synthetic fixture above.
+        let text = HANDSHAKE
+            .replace("\"noise_len_stereo\": 1920", "\"noise_len_stereo\": 65536")
+            .replace("[4, 8, 60]", "[2, 16, 64, 32]");
+        let hello = Hello::from_json(&text).unwrap();
+        assert_eq!(hello.noise_len(2, 245_760), 65_536);
+        assert_eq!(hello.noise_len(2, 122_880), 32_768);
+        assert_eq!(hello.noise_len(2, 61_440), 16_384);
+        assert_eq!(hello.noise_len(2, 30_720), 8_192);
+        assert_eq!(hello.noise_len(1, 30_720), 4_096);
     }
 
     #[test]

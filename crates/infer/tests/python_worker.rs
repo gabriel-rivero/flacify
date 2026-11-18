@@ -62,11 +62,11 @@ fn given_the_fake_worker_when_spawned_then_the_handshake_reports_the_protocol_fi
 fn given_a_window_when_run_then_the_samples_round_trip_and_noise_len_follows_the_shape() {
     let mut worker = spawn_with(&[]);
 
-    // The trained stereo window uses the model's latent grid; every other shape falls
-    // back to one noise sample per audio sample.
+    // The noise lives on the latent grid at every window, so it scales with frames and
+    // channels rather than falling back to one sample per audio sample.
     assert_eq!(worker.noise_len(2, WINDOW), NOISE_LEN_STEREO);
-    assert_eq!(worker.noise_len(1, WINDOW), WINDOW);
-    assert_eq!(worker.noise_len(2, WINDOW / 2), WINDOW);
+    assert_eq!(worker.noise_len(1, WINDOW), NOISE_LEN_STEREO / 2);
+    assert_eq!(worker.noise_len(2, WINDOW / 2), NOISE_LEN_STEREO / 2);
 
     let stereo = signal(2 * WINDOW);
     let out = worker
@@ -75,8 +75,10 @@ fn given_a_window_when_run_then_the_samples_round_trip_and_noise_len_follows_the
     assert_eq!(out, stereo);
 
     let mono = signal(WINDOW / 2);
+    let mono_noise = worker.noise_len(1, WINDOW / 2);
+    assert_eq!(mono_noise, NOISE_LEN_STEREO / 4);
     let out = worker
-        .run(&mono, &noise(WINDOW / 2), 1, WINDOW / 2)
+        .run(&mono, &noise(mono_noise), 1, WINDOW / 2)
         .unwrap();
     assert_eq!(out, mono);
     worker.shutdown();

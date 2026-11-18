@@ -100,8 +100,10 @@ Data flow between them:
 - meters: `AtomicU64`/`AtomicU32` only, read by the UI at 30 Hz.
 
 The audio callback's only job is to pop samples from a ring, apply the A/B crossfade
-and the master gain, and write them to the device. If the ring is empty, it writes
-silence and increments a dropout counter. It never waits for anything.
+and the master gain, and write them to the device. What it does when the ring is empty
+depends on the source: a segment-backed file holds the playhead and writes silence
+until the segment arrives, while the live path emits the dry side and counts the frames
+it starved. It never waits for anything either way.
 
 ## Buffer math
 
@@ -160,6 +162,40 @@ output ring ──▶ enhanced tap ───────────────
 
 In cache mode (v0.3) both taps are file readers at the same position and `D` is zero.
 Keep the same crossfade code so the two paths cannot drift apart.
+
+## Live mode (v1.0)
+
+One pipeline, two feeds. `Source::Live` takes a `Feed` — the decoder for a file, the
+capture stream for the sink — and the mixer, ramp, level match and starvation policy are
+the same code for both. ADR-014 records the decision; this section records the mechanics.
+
+```
+feed ──▶ dry ring (B + W) ──┐
+                            ├──▶ wet producer (model) ──▶ wet ring (B) ──┐
+                            │                                          ├──▶ callback
+                            └──────────── alignment delay W ───────────┘
+```
+
+- `W` is the model window and `B` is the buffer `live_policy` derives from the measured
+  RTF. The dry ring holds `B + W` because the dry side is delayed by one window: the
+  wet side cannot exist earlier than that, and A/B must compare the same instant.
+- Resident audio is `(2B + W) × 2 channels × 4 bytes`. It is the rings only; the model's
+  own input window and the in-flight output block are not counted.
+- Credit backpressure: the producer blocks while the wet ring holds `B`. Nothing is
+  dropped and nothing grows; a slow model slows the producer instead of the memory.
+- Starvation: when the wet side cannot cover the playhead, the callback emits the dry
+  side, counts the frames, and `has_enhanced` goes false with a stated reason until the
+  buffer refills. This is deliberately different from the segmented path, which holds
+  the playhead and writes silence — right for a missing cache segment, wrong for live
+  audio, where silence is a gap.
+- Latency is `W + B + device`, printed from `live_policy`, never implied by the preset.
+- A stream has no length, no content hash and no segments, so live audio is in memory
+  only: nothing about it joins the cache.
+- A file feed has one clock. The sink has two — the capture device and the output device
+  drift by tens of ppm — so the sink owns a rate correction; the spike measures which
+  one, and a restart-on-drift is the fallback that beats a click.
+- In 1.0 this path is opt-in (`play --live`, `flacify sink`). The default first play of
+  an uncached file stays on the progressive path until 1.1.
 
 ## Determinism
 

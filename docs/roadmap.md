@@ -219,6 +219,9 @@ working plan: decisions, risks and waves.
   going, resume after a kill, exit non-zero, skip list next to the cache.
 - **`flacify ab <file>`**: blind trials with randomised order and a fixed replay seed,
   promotion disabled for the run, a report that states the measured level match.
+- **Waveform and spectrum on the segment path** (landed 2026-11-18): a cache hit draws the
+  whole track from the source tier's one-second peaks and the spectrum from the resident
+  segment, so neither reads a buffer the segmented path does not have.
 
 1.0 also closes what 0.4 left open: cache eviction and accounting (V4-7), the waveform and
 spectrum on the segment path (V4-9), and the 60-minute acceptance run (V4-10). It does

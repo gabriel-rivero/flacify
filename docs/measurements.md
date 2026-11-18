@@ -816,3 +816,47 @@ Two caveats, stated rather than implied. This is one device pair on one machine;
 interface with its own clock is the case to check if a user reports it. And the capture
 stream was silent, so this measures the two clocks rather than audio through them — which
 is all the drift question needs, since the sample counts are what drift moves.
+
+## The sink, end to end (A3), 2026-11-18
+
+M1, `flacify sink --from "BlackHole 2ch" --to "External Headphones" --smoke --watch 600`,
+with a 620 s WAV fed into BlackHole by `sink_probe --play` (ffmpeg's AudioToolbox output
+would not start on this machine: `AudioQueueStart -66637`).
+
+| what | value |
+|---|---|
+| played | 600.04 s in 600.0 s of watching, i.e. real time |
+| dropouts | **0** |
+| starved frames | **0** |
+| resyncs | 1 |
+| measured RTF | 0.85 over 147 blocks |
+| ring capacity | 245 760 frames (one window), steering target 200 ms, latency 10.46 s |
+
+**The first run of this failed, and found a bug the simulations could not.** The capture
+ring was 19 200 frames (400 ms) because it was sized to the steering target, while one
+model call takes 3.7 s. A capture callback cannot be blocked, so the ring overflowed on
+every window: 11 044 640 frames dropped and 369.77 s played out of 600. The ring is now one
+model window with the target unchanged, and the second run above is the result.
+
+Two caveats, so this is not read as a clean acceptance. The output device fell back to the
+MacBook Pro Speakers — the headphones had disconnected — so the route tested was not the
+one this run names. And the capture state reads `silent` at report time, most likely
+because the feeder's 620 s ran out a few seconds before the sink's report; that is the
+harness, not the sink, but it is unconfirmed. A clean A3 needs one more run with both
+devices present and a feeder that outlasts the watch.
+
+## The blind report (A5), 2026-11-18
+
+`flacify ab "<NieR track>" --trials 20 --seed 1` on the release binary. It **refused to
+score**, which is the gate working:
+
+```
+Error: trial 2 at 27.551 s is out of level by +0.53 dB, over the 0.5 dB gate;
+the score would measure loudness
+```
+
+The report was still written, marked not evidence. What this says is worth keeping: the
+loudness match is fixed per track from the first window, and on real dynamic music one
+6 s excerpt landed 0.53 dB out. Either the match needs to be per-excerpt or the gate needs
+a defensible number; 1.1 owns that. 1.0 ships the command and the refusal, and **no blind
+report is attached to this release**, because the only run of it failed its own gate.

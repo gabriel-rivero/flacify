@@ -256,7 +256,10 @@ jobs:
             The cache now has a 20 GB default cap with LRU eviction, shown by `flacify diagnose`.
 
             **`flacify ab <file>`** runs blind trials with a randomised order you can replay from a
-            seed, and exports the report this release's evidence came from.
+            seed. It measures the two sides before the first trial and refuses to score a run whose
+            excerpts are more than 0.5 dB apart, because an unmatched comparison measures loudness,
+            not the model. No blind report is attached to this release: the one run made against it
+            failed that gate by 0.03 dB on a single excerpt.
 
             The default `flacify play` of a track that has never been rendered still holds the whole
             track in memory while it renders; `--live` is the bounded path in this release, and making

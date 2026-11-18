@@ -50,6 +50,14 @@ pub struct Controls {
 }
 
 impl Controls {
+    /// Keep the A/B switch on the original until the user asks for it.
+    ///
+    /// A blind test needs the enhanced side not to appear on its own, and `promote_if_ready`
+    /// reads this flag on the audio thread, so it is set before playback starts.
+    #[allow(dead_code)] // `flacify ab` calls it before the first fill (U3).
+    pub fn hold_promotion(&self) {
+        self.auto_promote.store(false, Ordering::Relaxed);
+    }
     pub fn is_playing(&self) -> bool {
         self.playing.load(Ordering::Relaxed)
     }
@@ -876,6 +884,27 @@ mod tests {
         let mut again = vec![0.0f32; 9_600];
         mixer.fill(&mut again);
         assert!(!controls.is_enhanced(), "promotion must happen only once");
+    }
+
+    #[test]
+    fn given_a_held_promotion_when_the_frontier_is_ahead_then_the_switch_stays_off() {
+        let frames = 8 * CHUNK_FRAMES;
+        let frontier = Frontier::new(frames);
+        for index in 0..4 {
+            frontier.publish(index, vec![0.5f32; CHUNK_FRAMES * 2]);
+        }
+        let (mut mixer, controls) =
+            Mixer::progressive(vec![0.0f32; frames * 2], Arc::clone(&frontier), 2, 48_000);
+        controls.set_playing(true);
+        controls.hold_promotion();
+
+        let mut out = vec![0.0f32; 9_600];
+        mixer.fill(&mut out);
+        assert!(
+            !controls.is_enhanced(),
+            "a blind run must not promote on its own"
+        );
+        assert!(!controls.promoted.load(Ordering::Relaxed));
     }
 
     #[test]

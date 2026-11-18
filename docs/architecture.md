@@ -347,8 +347,10 @@ problem, and it buys seek, instant replay, and a zero-GPU second listen.
   thread decodes the segment at the playhead and the next one and keeps at most three
   resident, so a complete entry is never decoded whole. A segment that is not decoded yet
   falls back to passthrough; a seek past the prefetch holds until the worker catches up.
-  The first play of an uncached track still holds the whole source, and is drawn
-  differently on the waveform.
+  The window draws a cache hit without a whole-track buffer: the waveform from the source
+  tier's per-second peaks, the spectrum from the one resident segment at the playhead. The
+  first play of an uncached track still holds the whole source, and is drawn differently on
+  the waveform.
 - **Eviction**: LRU by the manifest's `last_used`, against a 20 GB default cap
   (`flacify cache --evict [--cap-gb]`). It sweeps leftover staging and other-version
   directories first, then drops each entry's source tier, which a decode pass rebuilds, and

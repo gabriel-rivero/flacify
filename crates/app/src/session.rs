@@ -107,6 +107,13 @@ impl LivePlayback {
     }
 }
 
+/// What a segmented playback offers the window in place of a whole-track buffer: the
+/// peaks the source tier measured, and the reader that holds one segment at a time.
+pub struct SegmentView {
+    pub reader: Arc<segments::Reader>,
+    pub peaks: Vec<source::SecondPeaks>,
+}
+
 /// Everything one file owns. Dropping it is not enough to stop the render, because the
 /// render thread holds its own `Arc`s: call [`Playback::cancel`] first.
 pub struct Playback {
@@ -117,6 +124,9 @@ pub struct Playback {
     pub path: PathBuf,
     /// Present when this playback is a live stream rather than a file-shaped source.
     pub live: Option<LivePlayback>,
+    /// Present when the track plays from segments: the waveform and spectrum draw from
+    /// this instead of a whole-track buffer.
+    pub segments: Option<SegmentView>,
     /// Present when a background renderer is running for this file.
     pub(crate) cancel: Option<Arc<AtomicBool>>,
 }
@@ -216,6 +226,7 @@ impl Session {
                 },
                 path,
                 live: None,
+                segments: None,
                 cancel: None,
             });
         }
@@ -281,6 +292,7 @@ impl Session {
                 },
                 path,
                 live: None,
+                segments: None,
                 cancel: None,
             });
         }
@@ -374,6 +386,7 @@ impl Session {
             },
             path,
             live: None,
+            segments: None,
             cancel: Some(cancel),
         })
     }
@@ -442,6 +455,7 @@ impl Session {
                 source,
                 pump: Some(pump),
             }),
+            segments: None,
             cancel: None,
         })
     }
@@ -514,6 +528,7 @@ impl Session {
                 },
                 path,
                 live: None,
+                segments: None,
                 cancel: None,
             });
         }
@@ -525,8 +540,9 @@ impl Session {
                 "already full-band ({:.4}% of the spectrum above 21 kHz); nothing to generate",
                 analysis.high_band_ratio * 100.0
             );
+            let peaks = source.meta().peaks.clone();
             let reader = segments::Reader::open(Arc::new(source), None)?;
-            let engine = device::AudioEngine::start_segmented(reader)?;
+            let engine = device::AudioEngine::start_segmented(Arc::clone(&reader))?;
             return Ok(Playback {
                 engine,
                 frontier: None,
@@ -543,13 +559,15 @@ impl Session {
                 },
                 path,
                 live: None,
+                segments: Some(SegmentView { reader, peaks }),
                 cancel: None,
             });
         }
 
         eprintln!("cache hit: {audio_secs:.0} s of audio, nothing to render");
+        let peaks = source.meta().peaks.clone();
         let reader = segments::Reader::open(Arc::new(source), Some(Arc::new(rendered)))?;
-        let engine = device::AudioEngine::start_segmented(reader)?;
+        let engine = device::AudioEngine::start_segmented(Arc::clone(&reader))?;
         Ok(Playback {
             engine,
             frontier: None,
@@ -566,6 +584,7 @@ impl Session {
             },
             path,
             live: None,
+            segments: Some(SegmentView { reader, peaks }),
             cancel: None,
         })
     }

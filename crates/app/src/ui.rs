@@ -15,7 +15,9 @@ use eframe::egui;
 use crate::device::{self, AudioEngine};
 use crate::frontier::Frontier;
 use crate::render_status::RenderStatus;
-use crate::session::{LivePlayback, Playback, Session};
+use crate::segments::Resident;
+use crate::session::{LivePlayback, Playback, SegmentView, Session};
+use crate::source::SecondPeaks;
 use crate::spectrum;
 
 /// What the window needs to know about the track, none of it expensive.
@@ -60,6 +62,9 @@ pub struct PlayerApp {
     /// Device frames each waveform bar covers: at least one second, never more bars than
     /// pixels.
     waveform_bar_frames: usize,
+    /// Present when the track plays from segments: the peaks and the resident segment
+    /// its waveform and spectrum read.
+    segments: Option<SegmentView>,
 }
 
 /// No more waveform bars than this; a pixel is narrower than a bar worth drawing.
@@ -107,11 +112,13 @@ const TRANSPORT_SECTIONS: [TransportSection; 14] = [
 impl PlayerApp {
     pub fn new(session: Session, playback: Playback) -> Self {
         let engine = playback.engine;
-        let (waveform, waveform_bar_frames) = waveform_bars(
-            &engine.display_original,
+        let segments = playback.segments;
+        let (waveform, waveform_bar_frames) = waveform_for(
+            engine.controls.frames,
             engine.device_channels,
             engine.device_rate,
-            WAVEFORM_MAX_BARS,
+            &engine.display_original,
+            peaks_of(segments.as_ref()),
         );
         // One second of slack before the switch is offered, so a toggle cannot land on
         // the edge of what exists and fall back mid-ramp. A live stream has no frontier to
@@ -138,6 +145,7 @@ impl PlayerApp {
             title_dirty: true,
             waveform,
             waveform_bar_frames,
+            segments,
         }
     }
 
@@ -163,16 +171,18 @@ impl PlayerApp {
         self.live = playback.live;
         self.info = playback.info;
         self.path = playback.path;
+        self.segments = playback.segments;
         self.promote_margin = match self.live {
             Some(_) => 0,
             None => self.engine.device_rate as usize,
         };
         self.prebuffer_frames = (self.engine.device_rate as usize).saturating_mul(2);
-        let (waveform, bar_frames) = waveform_bars(
-            &self.engine.display_original,
+        let (waveform, bar_frames) = waveform_for(
+            self.engine.controls.frames,
             self.engine.device_channels,
             self.engine.device_rate,
-            WAVEFORM_MAX_BARS,
+            &self.engine.display_original,
+            peaks_of(self.segments.as_ref()),
         );
         self.waveform = waveform;
         self.waveform_bar_frames = bar_frames;
@@ -603,18 +613,9 @@ impl PlayerApp {
         let rect = response.rect;
         painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(17, 19, 23));
 
-        let channels = self.engine.device_channels;
         let position = self.engine.controls.position_frames();
-        let Some(original) = spectrum::analyse(&self.engine.display_original, channels, position)
-        else {
+        let Some((original, generated)) = self.spectra(position) else {
             return;
-        };
-        let generated = match &self.engine.display_generated {
-            Some(buffer) => spectrum::analyse(buffer, channels, position),
-            None => self.frontier.as_ref().and_then(|frontier| {
-                window_from_frontier(frontier, position)
-                    .and_then(|window| spectrum::analyse(&window, 2, spectrum::WINDOW / 2))
-            }),
         };
 
         let top = 0.0f32;
@@ -725,6 +726,29 @@ impl PlayerApp {
             egui::Color32::from_rgb(120, 126, 135),
         );
     }
+
+    /// Both curves at `position`, from whichever source this playback holds: the
+    /// whole-track buffers, the render frontier, or the one resident segment.
+    fn spectra(&self, position: usize) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
+        let channels = self.engine.device_channels;
+        let has_whole_track = !self.engine.display_original.is_empty();
+        if has_whole_track {
+            let original = spectrum::analyse(&self.engine.display_original, channels, position)?;
+            let generated = match &self.engine.display_generated {
+                Some(buffer) => spectrum::analyse(buffer, channels, position),
+                None => self.frontier.as_ref().and_then(|frontier| {
+                    window_from_frontier(frontier, position)
+                        .and_then(|window| spectrum::analyse(&window, 2, spectrum::WINDOW / 2))
+                }),
+            };
+            return Some((original, generated));
+        }
+        // No whole-track buffer: a segmented playback reads the segment at the playhead,
+        // and one resident segment answers both sides of the window.
+        let segment = self.segments.as_ref()?.reader.segment_at(position);
+        let segment = segment.as_ref()?;
+        segment_spectra(segment, position)
+    }
 }
 
 /// A worker on the CPU is a renderer, not a player; the window says so rather than letting
@@ -802,12 +826,87 @@ fn waveform_bars(
         let count = (end - start) * channels;
         out.push((sum / count.max(1) as f64).sqrt() as f32);
     }
-    let peak = out.iter().copied().fold(0.0f32, f32::max);
+    normalize(&mut out);
+    (out, bar_frames)
+}
+
+/// Scale the bars so the loudest is 1.0; silence stays silence rather than being amplified.
+fn normalize(bars: &mut [f32]) {
+    let peak = bars.iter().copied().fold(0.0f32, f32::max);
     if peak > 1e-6 {
-        for value in &mut out {
+        for value in bars.iter_mut() {
             *value = (*value / peak).clamp(0.0, 1.0);
         }
     }
+}
+
+/// The waveform for one playback: the source tier's peaks when the track plays as
+/// segments, the whole-track buffer otherwise.
+fn waveform_for(
+    frames: usize,
+    channels: usize,
+    sample_rate: u32,
+    original: &[f32],
+    peaks: &[SecondPeaks],
+) -> (Vec<f32>, usize) {
+    if peaks.is_empty() {
+        return waveform_bars(original, channels, sample_rate, WAVEFORM_MAX_BARS);
+    }
+    waveform_bars_from_peaks(peaks, frames, sample_rate, WAVEFORM_MAX_BARS)
+}
+
+/// The peaks a segmented playback carries; empty on the whole-track paths.
+fn peaks_of(segments: Option<&SegmentView>) -> &[SecondPeaks] {
+    match segments {
+        Some(segments) => &segments.peaks,
+        None => &[],
+    }
+}
+
+/// Per-bar RMS from the source tier's one-second peaks, normalized to its loudest bar.
+///
+/// The segmented path's replacement for [`waveform_bars`]: two numbers per second
+/// instead of the whole track, on the same bar grid, with each bar weighting the seconds
+/// it covers. The tier measures one peak per [`flacify_core::SAMPLE_RATE`] frames.
+fn waveform_bars_from_peaks(
+    peaks: &[SecondPeaks],
+    frames: usize,
+    sample_rate: u32,
+    max_bars: usize,
+) -> (Vec<f32>, usize) {
+    let rate = sample_rate.max(1) as usize;
+    if frames == 0 || max_bars == 0 || peaks.is_empty() {
+        return (Vec::new(), rate);
+    }
+    let peak_frames = flacify_core::SAMPLE_RATE as usize;
+    let bar_frames = rate.max(frames.div_ceil(max_bars)).max(1);
+    let bars = frames.div_ceil(bar_frames);
+    let mut out = Vec::with_capacity(bars);
+    for bar in 0..bars {
+        let start = bar * bar_frames;
+        let end = ((bar + 1) * bar_frames).min(frames);
+        let first = start / peak_frames;
+        let last = ((end - 1) / peak_frames).min(peaks.len() - 1);
+        let mut energy = 0.0f64;
+        let mut covered = 0.0f64;
+        for (index, peak) in peaks.iter().enumerate().take(last + 1).skip(first) {
+            let second_start = index * peak_frames;
+            let second_end = second_start.saturating_add(peak_frames).min(frames);
+            let overlap = end.min(second_end).saturating_sub(start.max(second_start)) as f64;
+            if overlap <= 0.0 {
+                continue;
+            }
+            let left = f64::from(peak.left_rms);
+            let right = f64::from(peak.right_rms);
+            energy += overlap * (left * left + right * right) / 2.0;
+            covered += overlap;
+        }
+        out.push(match covered > 0.0 {
+            true => (energy / covered).sqrt() as f32,
+            false => 0.0,
+        });
+    }
+    normalize(&mut out);
     (out, bar_frames)
 }
 
@@ -824,6 +923,50 @@ fn window_from_frontier(frontier: &Frontier, centre: usize) -> Option<Vec<f32>> 
         let (left, right) = frontier.frame(frame)?;
         window.push(left);
         window.push(right);
+    }
+    Some(window)
+}
+
+/// Both curves from the one resident segment at `position`: the source's own audio and,
+/// when the segment has it, the rendered side. `None` for a segment shorter than a window,
+/// which is only the last one of a track.
+fn segment_spectra(segment: &Resident, position: usize) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
+    let start = segment.start();
+    let frames = segment.frames();
+    let window = window_from_segment(start, frames, position, |offset, channel| {
+        segment.dry(offset, channel)
+    })?;
+    let original = spectrum::analyse(&window, 2, spectrum::WINDOW / 2)?;
+    let generated = match segment.has_wet() {
+        false => None,
+        true => window_from_segment(start, frames, position, |offset, channel| {
+            segment.wet(offset, channel)
+        })
+        .and_then(|window| spectrum::analyse(&window, 2, spectrum::WINDOW / 2)),
+    };
+    Some((original, generated))
+}
+
+/// `spectrum::WINDOW` frames of interleaved stereo around `centre`, clamped inside the
+/// segment at `start`, so one resident segment answers the whole window.
+fn window_from_segment(
+    start: usize,
+    frames: usize,
+    centre: usize,
+    sample: impl Fn(usize, usize) -> f32,
+) -> Option<Vec<f32>> {
+    if frames < spectrum::WINDOW {
+        return None;
+    }
+    let offset = centre
+        .saturating_sub(start)
+        .saturating_sub(spectrum::WINDOW / 2)
+        .min(frames - spectrum::WINDOW);
+    let mut window = Vec::with_capacity(spectrum::WINDOW * 2);
+    for frame in offset..offset + spectrum::WINDOW {
+        for channel in 0..2 {
+            window.push(sample(frame, channel));
+        }
     }
     Some(window)
 }
@@ -953,6 +1096,277 @@ mod tests {
         let (bars, bar_frames) = waveform_bars(&[], 2, 44_100, WAVEFORM_MAX_BARS);
         assert!(bars.is_empty());
         assert_eq!(bar_frames, 44_100);
+    }
+
+    /// Planar stereo whose amplitude changes once per second, the layout the source tier
+    /// measures its peaks from.
+    fn stepped_planar(amplitudes: &[f32], frames: usize) -> Vec<f32> {
+        let mut planar = Vec::with_capacity(frames * 2);
+        for _ in 0..2 {
+            for frame in 0..frames {
+                planar.push(amplitudes[(frame / 48_000).min(amplitudes.len() - 1)]);
+            }
+        }
+        planar
+    }
+
+    /// The interleaved form of [`stepped_planar`], which is what the mixer and the
+    /// whole-buffer waveform read.
+    fn stepped_interleaved(planar: &[f32], frames: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(frames * 2);
+        for frame in 0..frames {
+            out.push(planar[frame]);
+            out.push(planar[frames + frame]);
+        }
+        out
+    }
+
+    #[test]
+    fn given_peaks_measured_from_a_stepped_track_when_the_waveform_is_built_then_it_matches_the_whole_buffer(
+    ) {
+        let frames = 48_000 * 4;
+        let planar = stepped_planar(&[0.1, 0.1, 0.5, 0.5], frames);
+        let buffer = stepped_interleaved(&planar, frames);
+        let peaks = crate::source::second_peaks(&planar, frames);
+        let (from_peaks, peak_bar_frames) =
+            waveform_bars_from_peaks(&peaks, frames, 48_000, WAVEFORM_MAX_BARS);
+        let (from_samples, sample_bar_frames) =
+            waveform_bars(&buffer, 2, 48_000, WAVEFORM_MAX_BARS);
+        assert_eq!(peak_bar_frames, sample_bar_frames);
+        assert_eq!(from_peaks.len(), 4, "one bar per second of the track");
+        assert_eq!(from_peaks.len(), from_samples.len());
+        for (peak, sample) in from_peaks.iter().zip(&from_samples) {
+            assert!((peak - sample).abs() < 1e-6, "{peak} against {sample}");
+        }
+    }
+
+    #[test]
+    fn given_bars_that_do_not_end_on_a_second_when_built_from_peaks_then_they_match_the_sample_bars(
+    ) {
+        // 10.5 seconds and seven bars: each bar is 72 000 frames, so most of them straddle
+        // a second boundary and the weighting is what makes them agree.
+        let frames = 48_000 * 10 + 24_000;
+        let planar = stepped_planar(
+            &[0.2, 0.4, 0.1, 0.8, 0.05, 0.6, 0.3, 0.9, 0.15, 0.7, 0.5],
+            frames,
+        );
+        let buffer = stepped_interleaved(&planar, frames);
+        let peaks = crate::source::second_peaks(&planar, frames);
+        let (from_peaks, peak_bar_frames) = waveform_bars_from_peaks(&peaks, frames, 48_000, 7);
+        let (from_samples, sample_bar_frames) = waveform_bars(&buffer, 2, 48_000, 7);
+        assert_eq!(peak_bar_frames, 72_000);
+        assert_eq!(sample_bar_frames, peak_bar_frames);
+        assert_eq!(from_peaks.len(), 7);
+        assert_eq!(from_peaks.len(), from_samples.len());
+        for (peak, sample) in from_peaks.iter().zip(&from_samples) {
+            assert!((peak - sample).abs() < 1e-5, "{peak} against {sample}");
+        }
+    }
+
+    #[test]
+    fn given_a_segmented_playback_when_the_waveform_is_built_then_it_reads_the_peaks_not_the_buffer(
+    ) {
+        let frames = 48_000 * 2;
+        let planar = stepped_planar(&[0.25, 0.5], frames);
+        let peaks = crate::source::second_peaks(&planar, frames);
+        // No whole-track buffer: this is the state a cache hit is in.
+        let (bars, bar_frames) = waveform_for(frames, 2, 48_000, &[], &peaks);
+        assert_eq!(bar_frames, 48_000);
+        assert_eq!(bars.len(), 2);
+        assert!((bars[0] - 0.5).abs() < 1e-6, "{}", bars[0]);
+        assert!((bars[1] - 1.0).abs() < 1e-6, "{}", bars[1]);
+    }
+
+    #[test]
+    fn given_no_peaks_when_the_waveform_is_built_then_it_reads_the_whole_buffer() {
+        let frames = 48_000;
+        let planar = stepped_planar(&[0.5], frames);
+        let buffer = stepped_interleaved(&planar, frames);
+        let (bars, bar_frames) = waveform_for(frames, 2, 48_000, &buffer, &[]);
+        assert_eq!(bar_frames, 48_000);
+        assert_eq!(bars.len(), 1);
+        assert!((bars[0] - 1.0).abs() < 1e-6, "{}", bars[0]);
+    }
+
+    #[test]
+    fn given_no_peaks_when_the_peaks_waveform_is_built_then_there_are_no_bars() {
+        let (bars, bar_frames) = waveform_bars_from_peaks(&[], 48_000, 44_100, WAVEFORM_MAX_BARS);
+        assert!(bars.is_empty());
+        assert_eq!(bar_frames, 44_100);
+    }
+
+    #[test]
+    fn given_an_hour_of_peaks_when_the_waveform_is_built_then_it_allocates_the_bars_not_the_track()
+    {
+        let peaks = vec![
+            SecondPeaks {
+                left_rms: 0.25,
+                right_rms: 0.25,
+            };
+            3_600
+        ];
+        let frames = 3_600 * 48_000;
+        let ((bars, _bar_frames), allocated) = crate::alloc_counter::measure(|| {
+            waveform_bars_from_peaks(&peaks, frames, 48_000, WAVEFORM_MAX_BARS)
+        });
+        let whole_track = frames * 2 * std::mem::size_of::<f32>();
+        println!("waveform from an hour of peaks: {allocated} bytes, track is {whole_track} bytes");
+        assert_eq!(bars.len(), WAVEFORM_MAX_BARS);
+        assert!(
+            allocated <= WAVEFORM_MAX_BARS * std::mem::size_of::<f32>(),
+            "{allocated} bytes for {} bars",
+            bars.len()
+        );
+        assert!(allocated * 10_000 < whole_track);
+    }
+
+    /// Planar stereo holding `hz` in both planes, the layout a resident segment has.
+    fn tone_planes(hz: f32, frames: usize, amplitude: f32) -> Vec<f32> {
+        let mut planar = vec![0.0f32; frames * 2];
+        for frame in 0..frames {
+            let value = amplitude * (std::f32::consts::TAU * hz * frame as f32 / 48_000.0).sin();
+            planar[frame] = value;
+            planar[frames + frame] = value;
+        }
+        planar
+    }
+
+    /// The frequency of a spectrum's loudest bin.
+    fn peak_hz(spectrum: &[f32]) -> f32 {
+        let peak = spectrum
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).expect("a finite bin"))
+            .map(|(index, _)| index)
+            .expect("at least one bin");
+        peak as f32 * 48_000.0 / spectrum::WINDOW as f32
+    }
+
+    #[test]
+    fn given_a_resident_segment_with_a_1khz_tone_when_the_spectrum_is_taken_then_the_curve_peaks_at_1khz(
+    ) {
+        let frames = 48_000;
+        let segment = Resident::new(
+            0,
+            0,
+            frames,
+            Arc::from(tone_planes(1_000.0, frames, 0.5)),
+            None,
+        );
+        let (original, generated) = segment_spectra(&segment, 24_000).expect("a spectrum");
+        assert!(
+            (peak_hz(&original) - 1_000.0).abs() < 25.0,
+            "peak at {} Hz",
+            peak_hz(&original)
+        );
+        assert!(
+            generated.is_none(),
+            "a segment with no rendered side has no second curve"
+        );
+    }
+
+    #[test]
+    fn given_a_rendered_resident_segment_when_the_spectrum_is_taken_then_each_curve_is_its_own_plane(
+    ) {
+        let frames = 48_000;
+        let segment = Resident::new(
+            0,
+            0,
+            frames,
+            Arc::from(tone_planes(1_000.0, frames, 0.5)),
+            Some(Arc::from(tone_planes(8_000.0, frames, 0.5))),
+        );
+        let (original, generated) = segment_spectra(&segment, 24_000).expect("a spectrum");
+        let generated = generated.expect("a rendered side");
+        assert!((peak_hz(&original) - 1_000.0).abs() < 25.0);
+        assert!((peak_hz(&generated) - 8_000.0).abs() < 50.0);
+    }
+
+    #[test]
+    fn given_a_playhead_inside_a_segment_when_the_window_is_taken_then_it_is_centred_on_it_and_inside(
+    ) {
+        let frames = 48_000;
+        let second = Resident::new(
+            1,
+            96_000,
+            frames,
+            Arc::from(tone_planes(1_000.0, frames, 0.5)),
+            None,
+        );
+        let window = window_from_segment(
+            second.start(),
+            frames,
+            96_000 + 10_000,
+            |offset, channel| second.dry(offset, channel),
+        )
+        .expect("a window");
+        assert_eq!(window.len(), spectrum::WINDOW * 2);
+        let offset = 10_000 - spectrum::WINDOW / 2;
+        assert_eq!(window[0], second.dry(offset, 0));
+        assert_eq!(
+            window[window.len() - 1],
+            second.dry(offset + spectrum::WINDOW - 1, 1)
+        );
+    }
+
+    #[test]
+    fn given_a_playhead_at_a_segment_end_when_the_window_is_taken_then_it_stays_inside_the_segment()
+    {
+        let frames = 48_000;
+        let segment = Resident::new(
+            0,
+            0,
+            frames,
+            Arc::from(tone_planes(1_000.0, frames, 0.5)),
+            None,
+        );
+        let window = window_from_segment(segment.start(), frames, frames - 1, |offset, channel| {
+            segment.dry(offset, channel)
+        })
+        .expect("a window");
+        assert_eq!(window[0], segment.dry(frames - spectrum::WINDOW, 0));
+        assert_eq!(
+            window[window.len() - 1],
+            segment.dry(frames - 1, 1),
+            "the window must end on the segment's last frame"
+        );
+    }
+
+    #[test]
+    fn given_a_segment_shorter_than_a_window_when_the_spectrum_is_taken_then_there_is_none() {
+        let frames = spectrum::WINDOW - 1;
+        let segment = Resident::new(
+            0,
+            0,
+            frames,
+            Arc::from(tone_planes(1_000.0, frames, 0.5)),
+            None,
+        );
+        assert!(segment_spectra(&segment, 0).is_none());
+    }
+
+    #[test]
+    fn given_a_resident_segment_when_the_spectrum_window_is_taken_then_it_allocates_one_window() {
+        let frames = 48_000;
+        let segment = Resident::new(
+            0,
+            0,
+            frames,
+            Arc::from(tone_planes(1_000.0, frames, 0.5)),
+            None,
+        );
+        let (window, allocated) = crate::alloc_counter::measure(|| {
+            window_from_segment(segment.start(), frames, 0, |offset, channel| {
+                segment.dry(offset, channel)
+            })
+            .expect("a window")
+        });
+        println!("spectrum window: {allocated} bytes");
+        assert_eq!(window.len(), spectrum::WINDOW * 2);
+        assert!(
+            allocated <= spectrum::WINDOW * 2 * std::mem::size_of::<f32>(),
+            "{allocated} bytes for one window"
+        );
     }
 
     #[test]

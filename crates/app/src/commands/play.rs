@@ -88,14 +88,10 @@ pub(crate) fn run(request: Request<'_>) -> Result<()> {
         return ui::run(ui::PlayerApp::new(session, playback))
             .map_err(|error| anyhow::anyhow!("{error}"));
     }
-    let seek = request.seek_secs.map(|seconds| {
-        let rate = playback.engine.device_rate;
-        seek_to(&playback, seconds, rate)
-    });
     let result = if playback.live.is_some() {
         report_live(&mut playback, request.watch_secs)
     } else {
-        report(&playback, started, request.watch_secs, seek)
+        report(&playback, started, request.watch_secs, request.seek_secs)
     };
     playback.cancel();
     result
@@ -249,9 +245,11 @@ fn seek_to(playback: &Playback, seconds: f64, rate: u32) -> SeekOutcome {
     let started = Instant::now();
     playback.engine.controls.seek_frames(target);
     let deadline = Duration::from_secs(10);
+    // `seek_frames` moves the counter immediately; the audio is there only once the
+    // playhead has advanced past the target, which needs a fill that found a segment.
     let mut landed = false;
     while started.elapsed() < deadline {
-        if playback.engine.controls.position_frames() >= target {
+        if playback.engine.controls.position_frames() > target {
             landed = true;
             break;
         }
@@ -273,7 +271,7 @@ fn report(
     playback: &Playback,
     started: Instant,
     watch_secs: f64,
-    seek: Option<SeekOutcome>,
+    seek_secs: Option<f64>,
 ) -> Result<()> {
     let engine = &playback.engine;
     let info = &playback.info;
@@ -293,6 +291,10 @@ fn report(
     }
     let first_audio = started.elapsed();
     engine.controls.set_playing(true);
+
+    // After playback has started, so the playhead can actually move: a seek before the
+    // first fill only moves a counter and measures nothing.
+    let seek = seek_secs.map(|seconds| seek_to(playback, seconds, engine.device_rate));
 
     // Then watch for a few seconds: the toggle should become live, and promotion should
     // fire on its own.

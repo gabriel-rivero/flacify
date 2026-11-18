@@ -83,7 +83,8 @@ fn main() -> Result<(), String> {
         ));
     }
     let in_channels = input_config.channels() as usize;
-    out!(report, 
+    out!(
+        report,
         "format    in {} Hz x{} ch ({:?}), out {} Hz x{} ch",
         rate,
         input_config.channels(),
@@ -194,7 +195,8 @@ fn main() -> Result<(), String> {
         }
         if elapsed.as_secs() >= last_report.as_secs() + 60 {
             last_report = elapsed;
-            out!(report, 
+            out!(
+                report,
                 "  {:>4} s  in {}  out {}",
                 elapsed.as_secs(),
                 in_frames.load(Ordering::Relaxed),
@@ -215,8 +217,13 @@ fn main() -> Result<(), String> {
     let window = elapsed.saturating_sub(base_elapsed);
     out!(report, "");
     out!(report, "elapsed   {:.3} s", elapsed.as_secs_f64());
-    out!(report, "played    {played} frames ({:.0} expected)", expected);
-    out!(report, 
+    out!(
+        report,
+        "played    {played} frames ({:.0} expected)",
+        expected
+    );
+    out!(
+        report,
         "captured  {captured} frames ({:.0} expected), {:.1} dBFS peak{}",
         expected,
         20.0 * (peak_value.max(1e-9)).log10(),
@@ -230,12 +237,13 @@ fn main() -> Result<(), String> {
     );
     let in_ppm = ppm(captured - base_in, window, rate);
     let out_ppm = ppm(played - base_out, window, rate);
-    out!(report, 
+    out!(report,
         "drift     capture {in_ppm:+.1} ppm, playback {out_ppm:+.1} ppm, relative {:+.1} ppm          over {:.0} s",
         in_ppm - out_ppm,
         window.as_secs_f64()
     );
-    out!(report, 
+    out!(
+        report,
         "drops     {} discontinuities in the captured stream",
         drops.load(Ordering::Relaxed)
     );
@@ -266,7 +274,12 @@ fn find(host: &cpal::Host, name: &str, input: bool) -> Result<cpal::Device, Stri
     };
     let matches: Vec<(cpal::Device, String)> = devices
         .into_iter()
-        .filter_map(|device| device.name().ok().map(|device_name| (device, device_name)))
+        .filter_map(|device| {
+            device
+                .description()
+                .ok()
+                .map(|description| (device, description.name().to_string()))
+        })
         .collect();
     if let Some((device, _)) = matches
         .iter()

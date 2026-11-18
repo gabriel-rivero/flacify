@@ -756,3 +756,37 @@ A second ten-minute run taken while the machine was busier (load average mean 8.
 6.6 s of the 600 (1.1 %), the dry side played through each one, no gap and no silent
 stall, and the same flat RSS. A spike the producer cannot cover costs a dropout, not a
 stall, and the next block recovers it on its own.
+
+## The 60-minute acceptance (A1), 2026-11-18
+
+M1 (Apple M5 Max, 36 GB, macOS 27.2.1), release build, a 3600.0 s file built by
+`tools/make_hour.py` from two library MP3s (82 MB, 48 kHz stereo, cutoff 13.1 kHz).
+
+**Render**, through `flacify batch` on a folder holding that one file: 3401.6 s of wall
+clock for 3600 s of audio (ratio 0.945), including the source tier, the FLAC segments and
+the 8 s model load. One file, one worker.
+
+**Replay**, `play hour.mp3 --smoke --watch 60` from the completed entry:
+
+| what | value |
+|---|---|
+| first audio | 0.33 s after the command (2 s prebuffer included) |
+| played | 60.03 s in 60 s of watching |
+| dropouts | **0** frames (0.000 s) |
+| model process | none started: a cache hit does not load the model |
+| user CPU | 0.12 s |
+
+**Seek to 55:00**, `play hour.mp3 --smoke --watch 20 --seek 3300`:
+
+| what | value |
+|---|---|
+| landed | 0.07 s after the seek (playhead past 3300.0 s, audio flowing) |
+| starved | 2048 frames (0.043 s), the segment read and decode |
+| rest of the run | no further dropouts |
+
+**The replay used to take 78 s to first audio.** A cache hit re-ran `analyse_streaming`
+over the whole source to rediscover a cutoff the manifest already stored, which cost 60 s
+of CPU for an hour-long track. Reading it from the entry took first audio from 78.18 s to
+0.33 s and user CPU from 62.24 s to 0.12 s. The startup starvation those 78 s produced
+was also being counted as dropouts; a miss before the first sample is now reported once,
+as time to first audio, not twice.

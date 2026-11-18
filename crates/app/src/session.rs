@@ -490,18 +490,19 @@ impl Session {
         let frames_per_segment = cache::frames_per_segment(render::WINDOW, render::OVERLAP)?;
         let tier = source::Tier::new(self.cache.root(), frames_per_segment)?;
         let source = tier.build_or_reuse(file, &fields.source_hash)?;
-        let analysis = render::analyse_streaming(&source)
-            .with_context(|| format!("analysing {}", file.display()))?;
+        // A complete entry is one that rendered, and it recorded the cutoff it found, so a
+        // replay does not decode the track to rediscover what the manifest says. Analysing
+        // an hour here cost 60 s of CPU and 78 s to first audio.
         let frames = source.meta().frames;
         let audio_secs = frames as f64 / f64::from(SAMPLE_RATE);
-        let cutoff_hz = analysis.cutoff_hz;
+        let cutoff_hz = rendered.meta().cutoff_hz;
         let gain_db = rendered.meta().gain_db.unwrap_or(0.0);
         let device = rendered.meta().device.clone();
 
         // A device that is not 48 kHz stereo cannot take segments, so it keeps the path
         // every cache hit used before: both sides whole, resampled once by `start`.
         if !device::progressive_supported() {
-            let has_enhanced = !analysis.looks_full_band();
+            let has_enhanced = true;
             let original = render::interleave_stereo(&source.read_all()?, frames);
             let enhanced = match has_enhanced {
                 true => Some(render::interleave_stereo(&rendered.read_all()?, frames)),
@@ -529,37 +530,6 @@ impl Session {
                 path,
                 live: None,
                 segments: None,
-                cancel: None,
-            });
-        }
-
-        // This build never renders full-band audio, so an entry for it can only come from
-        // somewhere else. The source tier is still a passthrough, one segment at a time.
-        if analysis.looks_full_band() {
-            eprintln!(
-                "already full-band ({:.4}% of the spectrum above 21 kHz); nothing to generate",
-                analysis.high_band_ratio * 100.0
-            );
-            let peaks = source.meta().peaks.clone();
-            let reader = segments::Reader::open(Arc::new(source), None)?;
-            let engine = device::AudioEngine::start_segmented(Arc::clone(&reader))?;
-            return Ok(Playback {
-                engine,
-                frontier: None,
-                status: None,
-                info: TrackInfo {
-                    name,
-                    title: tags.title,
-                    artist: tags.artist,
-                    cutoff_hz,
-                    audio_secs,
-                    device: "none".to_string(),
-                    from_cache: true,
-                    gain_db: 0.0,
-                },
-                path,
-                live: None,
-                segments: Some(SegmentView { reader, peaks }),
                 cancel: None,
             });
         }

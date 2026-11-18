@@ -473,9 +473,12 @@ impl Mixer {
                     let guard = reader.segment_at(position);
                     let Some(segment) = guard.as_ref() else {
                         // Nothing to play yet, so the rest of this buffer is silence. The
-                        // playhead does not advance, and the frames are counted because
-                        // this is the one path where a miss is audible.
-                        self.controls.add_underrun(frames - written);
+                        // playhead does not advance. Before the first sample this is the
+                        // startup wait, which the smoke report states separately, so only
+                        // a miss once something has played counts as a dropout.
+                        if position > 0 {
+                            self.controls.add_underrun(frames - written);
+                        }
                         out[written * channels..].fill(0.0);
                         break;
                     };

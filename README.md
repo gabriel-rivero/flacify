@@ -54,11 +54,21 @@ cargo build --release
 ./target/release/flacify ab song.mp3           # blind A/B trials -> song.mp3.flacify-ab.md
 ./target/release/flacify batch ~/Music         # render a folder; skips cached files, writes batch-last.md
 ./target/release/flacify batch . --dry-run     # what would render, and why each file is skipped
+./target/release/flacify sink --from "BlackHole 2ch" --to "External Headphones"  # capture -> enhance -> play
 ./target/release/flacify devices               # capture and playback devices, with rates and channels
 ./target/release/flacify diagnose              # -> flacify-diagnose.txt
 ./target/release/flacify cache                 # what the cache holds, by kind, against its 20 GB cap
 ./target/release/flacify cache --evict         # evict least recently used entries until it fits
 ```
+
+`flacify sink` captures one device, enhances it, and plays it on another: it is the same
+bounded path as `play --live`, with the capture stream as the feed. macOS has no loopback of
+its own, so install BlackHole and route your player's output to it; Windows has no cpal
+loopback in 1.0 and is unsupported there. Capture also needs Microphone permission for the
+app that launched the sink: without it macOS returns digital silence rather than an error, so
+the sink treats five seconds of silence as that state, says so, and refuses to start. The two
+devices run on different crystals, so the sink trims its read rate by up to 1000 ppm and
+resyncs with a 10 ms crossfade when that is not enough; the status line prints both.
 
 `flacify ab` renders or loads the generated side once, plays 20 six-second excerpts in a
 seeded order, and asks which of the two was the generated one. The seed is in the report,

@@ -76,6 +76,34 @@ pub(crate) enum Command {
         #[arg(long)]
         seek: Option<f64>,
     },
+    /// Play a device's input through the enhancer and out of another device: the sink.
+    ///
+    /// The input must be a loopback the user installed and routed a player to (BlackHole on
+    /// macOS; Windows has no loopback and is unsupported in 1.0). The input must be the
+    /// device named; the output may fall back to the default with a stated reason.
+    Sink {
+        /// Capture device, for example "BlackHole 2ch".
+        #[arg(long, value_name = "DEVICE")]
+        from: String,
+        /// Playback device, for example "External Headphones".
+        #[arg(long, value_name = "DEVICE")]
+        to: String,
+        /// Model window in granules: 1 (0.64 s), 2, 4 or 8 (5.12 s). The latency is the
+        /// window plus the buffer plus the device plus the capture ring, printed by the
+        /// command.
+        #[arg(long, default_value = "8", value_name = "1|2|4|8")]
+        window: String,
+        /// Sustained compute ratio the live buffer is sized from, in seconds per second
+        /// of audio. 0.78 is the end-to-end figure the live path measured on the M5.
+        #[arg(long, default_value_t = 0.78)]
+        rtf: f64,
+        /// Watch, report and exit instead of opening the window.
+        #[arg(long)]
+        smoke: bool,
+        /// Seconds a --smoke run listens before it reports.
+        #[arg(long, default_value_t = 4.0)]
+        watch: f64,
+    },
     /// List the capture and playback devices, with the rate and channels each defaults to.
     Devices,
     /// Render every audio file under a folder, in order, skipping what is already done.

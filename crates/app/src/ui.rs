@@ -16,7 +16,8 @@ use crate::device::{self, AudioEngine};
 use crate::frontier::Frontier;
 use crate::render_status::RenderStatus;
 use crate::segments::Resident;
-use crate::session::{LivePlayback, Playback, SegmentView, Session};
+use crate::session::{LivePlayback, Playback, SegmentView, Session, SinkRoute};
+use crate::sink::{CaptureState, SILENT_HINT};
 use crate::source::SecondPeaks;
 use crate::spectrum;
 
@@ -43,6 +44,8 @@ pub struct PlayerApp {
     status: Option<Arc<RenderStatus>>,
     /// Present only when this window is playing a live stream (`play --live`).
     live: Option<LivePlayback>,
+    /// Present only when this window is the sink: the route and its drift correction.
+    sink: Option<SinkRoute>,
     info: TrackInfo,
     /// The file on screen, so an error names it and a reload knows what to ask for.
     path: PathBuf,
@@ -83,6 +86,7 @@ enum TransportSection {
     Progress,
     RenderStatus,
     Live,
+    Sink,
     Metadata,
     Disclaimer,
     StreamErrors,
@@ -92,7 +96,7 @@ enum TransportSection {
 
 /// The draw order. Add a variant here as well as to `TransportSection`; a list entry with
 /// no arm is a compile error, an arm with no list entry is a section that never draws.
-const TRANSPORT_SECTIONS: [TransportSection; 14] = [
+const TRANSPORT_SECTIONS: [TransportSection; 15] = [
     TransportSection::Heading,
     TransportSection::Toggle,
     TransportSection::Spectrum,
@@ -102,6 +106,7 @@ const TRANSPORT_SECTIONS: [TransportSection; 14] = [
     TransportSection::Progress,
     TransportSection::RenderStatus,
     TransportSection::Live,
+    TransportSection::Sink,
     TransportSection::Metadata,
     TransportSection::Disclaimer,
     TransportSection::StreamErrors,
@@ -134,6 +139,7 @@ impl PlayerApp {
             frontier: playback.frontier,
             status: playback.status,
             live: playback.live,
+            sink: playback.sink,
             info: playback.info,
             path: playback.path,
             cancel: playback.cancel,
@@ -169,6 +175,7 @@ impl PlayerApp {
         self.frontier = playback.frontier;
         self.status = playback.status;
         self.live = playback.live;
+        self.sink = playback.sink;
         self.info = playback.info;
         self.path = playback.path;
         self.segments = playback.segments;
@@ -220,6 +227,7 @@ impl PlayerApp {
                 TransportSection::Progress => self.draw_progress(ui),
                 TransportSection::RenderStatus => self.draw_render_status(ui, prepared_frames),
                 TransportSection::Live => self.draw_live(ui),
+                TransportSection::Sink => self.draw_sink(ui),
                 TransportSection::Metadata => self.draw_metadata(ui),
                 TransportSection::Disclaimer => self.draw_disclaimer(ui),
                 TransportSection::StreamErrors => self.draw_stream_errors(ui),
@@ -456,6 +464,41 @@ impl PlayerApp {
         if let Some(reason) = self.engine.controls.enhanced_blocked() {
             ui.label(
                 egui::RichText::new(format!("A/B unavailable: {reason}"))
+                    .weak()
+                    .size(11.0),
+            );
+        }
+    }
+
+    /// The sink's route and its clock correction: what is captured from what, what it is
+    /// played to, what it costs in latency, and what the drift loop has had to do.
+    fn draw_sink(&mut self, ui: &mut egui::Ui) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        let dropouts = self
+            .live
+            .as_ref()
+            .map_or(0, |live| live.source.stats().dropouts());
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(sink_line(sink, dropouts))
+                .weak()
+                .size(11.0),
+        );
+        if sink.stats.capture_state() == CaptureState::Silent {
+            // Louder than the rest of the line, because this one means nothing is being
+            // captured at all: a working-looking sink with silence in it is the failure mode.
+            ui.colored_label(egui::Color32::from_rgb(200, 160, 60), SILENT_HINT);
+        }
+        ui.label(
+            egui::RichText::new(sink_correction_line(sink))
+                .weak()
+                .size(11.0),
+        );
+        if let Some(reason) = &sink.fallback {
+            ui.label(
+                egui::RichText::new(format!("output: {reason}"))
                     .weak()
                     .size(11.0),
             );
@@ -782,6 +825,41 @@ fn live_line(
         policy.model_latency_secs,
         policy.buffer_latency_secs,
         policy.device_latency_secs,
+    )
+}
+
+/// The sink's line: the route, the latency it costs, and what has gone wrong so far.
+///
+/// The latency includes the capture ring's target fill, which the panel would otherwise
+/// leave out: on the sink that ring is delay the listener hears. The capture state comes
+/// last because it decides whether any other number on the line means anything.
+fn sink_line(route: &SinkRoute, dropouts: usize) -> String {
+    let fallback = match route.fallback {
+        Some(_) => " (default)",
+        None => "",
+    };
+    let state = match route.stats.capture_state() {
+        CaptureState::Signal => "capture signal",
+        CaptureState::Silent => "capture silent",
+    };
+    format!(
+        "sink · {} → {}{fallback} · latency {:.2} s · dropouts {dropouts} · resyncs {} · {state}",
+        route.from,
+        route.to,
+        route.latency_secs,
+        route.stats.resyncs()
+    )
+}
+
+/// The drift loop's own line: the correction it is applying, and how full the ring is.
+fn sink_correction_line(route: &SinkRoute) -> String {
+    format!(
+        "drift {:+.0} ppm (peak {:.0}) · ring fill {} of {} frames · {} dropped",
+        route.stats.correction_ppm(),
+        route.stats.peak_correction_ppm(),
+        route.stats.fill_frames(),
+        route.ring_capacity_frames,
+        route.stats.dropped_frames()
     )
 }
 
@@ -1393,6 +1471,7 @@ mod tests {
                 Progress,
                 RenderStatus,
                 Live,
+                Sink,
                 Metadata,
                 Disclaimer,
                 StreamErrors,
@@ -1436,5 +1515,71 @@ mod tests {
         let measured = live_line(&policy, 0, Some(0.74));
         assert!(measured.contains("dropouts 0"), "{measured}");
         assert!(measured.ends_with("RTF 0.74"), "{measured}");
+    }
+
+    /// A sink route at a fixed latency, with the correction at a known value.
+    fn sink_route(fallback: Option<&str>) -> SinkRoute {
+        let stats = Arc::new(crate::sink::SinkStats::default());
+        SinkRoute {
+            from: "BlackHole 2ch".to_string(),
+            to: "External Headphones".to_string(),
+            fallback: fallback.map(str::to_string),
+            cutoff_hz: 15_200,
+            ring_capacity_frames: crate::sink::RING_FRAMES,
+            latency_secs: 2.78,
+            stats,
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn given_a_sink_route_when_labelled_then_the_line_states_route_latency_and_resyncs() {
+        let line = sink_line(&sink_route(None), 4);
+        assert!(
+            line.contains("BlackHole 2ch → External Headphones"),
+            "{line}"
+        );
+        assert!(line.contains("latency 2.78 s"), "{line}");
+        assert!(line.contains("dropouts 4"), "{line}");
+        assert!(line.contains("resyncs 0"), "{line}");
+        assert!(line.contains("capture signal"), "{line}");
+        assert!(!line.contains("(default)"), "nothing fell back: {line}");
+    }
+
+    #[test]
+    fn given_a_fallback_route_when_labelled_then_the_panel_says_the_default_plays() {
+        let line = sink_line(&sink_route(Some("no output matches \"AirPods\"")), 0);
+        assert!(line.contains("(default)"), "{line}");
+    }
+
+    #[test]
+    fn given_a_capture_of_digital_silence_when_labelled_then_the_panel_says_capture_silent() {
+        let route = sink_route(None);
+        let silent = vec![0.0f32; crate::sink::SILENT_FRAMES * 2];
+        let ring = crate::live::Ring::new(crate::sink::RING_FRAMES, 2);
+        let head = std::sync::atomic::AtomicUsize::new(0);
+        crate::sink::write_capture(&ring, &head, &route.stats, &silent);
+
+        let line = sink_line(&route, 0);
+        assert!(line.contains("capture silent"), "{line}");
+        assert!(
+            SILENT_HINT.contains("Microphone"),
+            "the hint names the permission"
+        );
+    }
+
+    #[test]
+    fn given_a_correction_when_labelled_then_the_line_states_it_and_the_fill() {
+        let route = sink_route(None);
+        let line = sink_correction_line(&route);
+        assert!(line.contains("drift +0 ppm"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "ring fill 0 of {} frames",
+                route.ring_capacity_frames
+            )),
+            "{line}"
+        );
+        assert!(line.contains("0 dropped"), "{line}");
     }
 }

@@ -179,7 +179,9 @@ impl Stats {
 ///
 /// Samples are `AtomicU32` so the producer writes and the consumer reads the same buffer
 /// without a lock or `unsafe`; the frame index carries the ordering that makes it sound.
-struct Ring {
+/// The sink's capture ring is the same primitive with the opposite write policy: it drops
+/// a block it cannot fit rather than waiting, because a capture callback may not wait.
+pub(crate) struct Ring {
     samples: Vec<AtomicU32>,
     /// Frames the ring holds.
     capacity: usize,
@@ -190,7 +192,7 @@ struct Ring {
 }
 
 impl Ring {
-    fn new(capacity: usize, channels: usize) -> Self {
+    pub(crate) fn new(capacity: usize, channels: usize) -> Self {
         Self {
             samples: (0..capacity * channels)
                 .map(|_| AtomicU32::new(0))
@@ -205,12 +207,18 @@ impl Ring {
         self.capacity * self.channels * std::mem::size_of::<f32>()
     }
 
-    fn written(&self) -> usize {
+    /// Frames the ring holds. The sink's writer asks, so its room check follows the ring it
+    /// actually has.
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub(crate) fn written(&self) -> usize {
         self.written.load(Ordering::Acquire)
     }
 
-    /// Frames readable from `frame`: 0 once the playhead has left what the ring still holds.
-    fn available(&self, frame: usize) -> usize {
+    /// Frames readable from `frame`: 0 once `frame` has left what the ring still holds.
+    pub(crate) fn available(&self, frame: usize) -> usize {
         let written = self.written();
         if frame < written.saturating_sub(self.capacity) {
             return 0;
@@ -220,13 +228,13 @@ impl Ring {
 
     /// One sample of a frame [`Ring::available`] reported. That load is what makes the
     /// sample visible here; this one is relaxed for the same reason.
-    fn sample(&self, frame: usize, channel: usize) -> f32 {
+    pub(crate) fn sample(&self, frame: usize, channel: usize) -> f32 {
         let index = (frame % self.capacity) * self.channels + channel;
         f32::from_bits(self.samples[index].load(Ordering::Relaxed))
     }
 
     /// Write `frames` frames starting at absolute frame `frame`, then publish them.
-    fn write(&self, frame: usize, samples: &[f32]) {
+    pub(crate) fn write(&self, frame: usize, samples: &[f32]) {
         debug_assert_eq!(samples.len() % self.channels, 0);
         for offset in 0..samples.len() / self.channels {
             let slot = ((frame + offset) % self.capacity) * self.channels;

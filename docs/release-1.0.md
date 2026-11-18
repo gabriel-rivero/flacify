@@ -62,7 +62,7 @@ tag on the strength of reading the workflow.
 
 | platform | check |
 |---|---|
-| macOS (this Mac) | open the `.dmg`, drag to Applications, right-click → Open, `flacify play --smoke` on a cached track, then `flacify sink --from "BlackHole 2ch"` and confirm the microphone prompt is the app's, not the terminal's |
+| macOS (this Mac) | open the `.dmg`, drag to Applications, right-click → Open, `flacify play --smoke` on a cached track, then launch the sink **from the app**, not a terminal: a shell-launched process gets digital silence with no prompt, because the permission belongs to the launching app. The first run asks for Microphone access as flacify. |
 | Windows | from the record of 0.4.0: installer runs per-user, menu shows 1.0.0, a cached track plays |
 | Linux (deb) | `sudo apt install ./flacify_1.0.0_amd64.deb`, `flacify play --smoke` |
 | Arch | `sudo pacman -U flacify-bin-1.0.0-1-x86_64.pkg.tar.zst` |

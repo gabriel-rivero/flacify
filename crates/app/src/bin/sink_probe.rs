@@ -24,15 +24,30 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 const TONE_HZ: f32 = 440.0;
 const AMPLITUDE: f32 = 0.05;
 
+macro_rules! out {
+    ($buf:expr, $($arg:tt)*) => {{
+        let line = format!($($arg)*);
+        println!("{line}");
+        $buf.push(line);
+    }};
+}
+
 fn main() -> Result<(), String> {
+    let mut report: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     let mut from = None;
     let mut to = None;
     let mut seconds = 600.0f64;
+    let mut log: Option<std::path::PathBuf> = None;
+    let mut silent = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--from" => from = Some(args.next().ok_or("--from wants a device name")?),
             "--to" => to = Some(args.next().ok_or("--to wants a device name")?),
+            "--log" => log = Some(args.next().ok_or("--log wants a path")?.into()),
+            // Two different devices drift against each other whether or not anything is
+            // playing, so a clock measurement does not have to make a sound.
+            "--silent" => silent = true,
             "--seconds" => {
                 seconds = args
                     .next()
@@ -49,8 +64,8 @@ fn main() -> Result<(), String> {
     let host = cpal::default_host();
     let input_device = find(&host, &from, true)?;
     let output_device = find(&host, &to, false)?;
-    println!("from      \"{from}\" (capture)");
-    println!("to        \"{to}\" (playback)");
+    out!(report, "from      \"{from}\" (capture)");
+    out!(report, "to        \"{to}\" (playback)");
 
     let input_config = input_device
         .default_input_config()
@@ -68,7 +83,7 @@ fn main() -> Result<(), String> {
         ));
     }
     let in_channels = input_config.channels() as usize;
-    println!(
+    out!(report, 
         "format    in {} Hz x{} ch ({:?}), out {} Hz x{} ch",
         rate,
         input_config.channels(),
@@ -133,8 +148,9 @@ fn main() -> Result<(), String> {
             .build_output_stream(
                 &output_config.clone().into(),
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if !running.load(Ordering::Relaxed) {
+                    if !running.load(Ordering::Relaxed) || silent {
                         data.fill(0.0);
+                        out_frames.fetch_add((data.len() / 2) as u64, Ordering::Relaxed);
                         return;
                     }
                     for frame in data.chunks_mut(2) {
@@ -178,7 +194,7 @@ fn main() -> Result<(), String> {
         }
         if elapsed.as_secs() >= last_report.as_secs() + 60 {
             last_report = elapsed;
-            println!(
+            out!(report, 
                 "  {:>4} s  in {}  out {}",
                 elapsed.as_secs(),
                 in_frames.load(Ordering::Relaxed),
@@ -197,10 +213,10 @@ fn main() -> Result<(), String> {
     let peak_value = f32::from_bits(peak.load(Ordering::Relaxed) as u32);
     let (base_elapsed, base_in, base_out) = baseline.unwrap_or((Duration::ZERO, 0, 0));
     let window = elapsed.saturating_sub(base_elapsed);
-    println!();
-    println!("elapsed   {:.3} s", elapsed.as_secs_f64());
-    println!("played    {played} frames ({:.0} expected)", expected);
-    println!(
+    out!(report, "");
+    out!(report, "elapsed   {:.3} s", elapsed.as_secs_f64());
+    out!(report, "played    {played} frames ({:.0} expected)", expected);
+    out!(report, 
         "captured  {captured} frames ({:.0} expected), {:.1} dBFS peak{}",
         expected,
         20.0 * (peak_value.max(1e-9)).log10(),
@@ -214,15 +230,19 @@ fn main() -> Result<(), String> {
     );
     let in_ppm = ppm(captured - base_in, window, rate);
     let out_ppm = ppm(played - base_out, window, rate);
-    println!(
+    out!(report, 
         "drift     capture {in_ppm:+.1} ppm, playback {out_ppm:+.1} ppm, relative {:+.1} ppm          over {:.0} s",
         in_ppm - out_ppm,
         window.as_secs_f64()
     );
-    println!(
+    out!(report, 
         "drops     {} discontinuities in the captured stream",
         drops.load(Ordering::Relaxed)
     );
+    if let Some(path) = log {
+        std::fs::write(&path, report.join("\n") + "\n")
+            .map_err(|error| format!("writing {}: {error}", path.display()))?;
+    }
     Ok(())
 }
 

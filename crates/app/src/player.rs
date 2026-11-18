@@ -7,9 +7,9 @@
 //! ramps over 8 ms, which is short enough to feel instant and long enough to hide the
 //! step.
 //!
-//! Both sides arrive either as whole buffers or from [`Reader`]'s decoded segments, and
-//! the mixing loop is the same one for both, so a cache hit and a whole-track render
-//! produce identical samples.
+//! Both sides arrive as whole buffers, from [`Reader`]'s decoded segments, or from
+//! [`live::Live`]'s bounded rings, and the mixing loop is the same one for all three, so a
+//! cache hit and a whole-track render produce identical samples.
 //!
 //! Nothing here allocates, locks or logs: `fill` is called from the audio callback.
 
@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::frontier::{Frontier, CHUNK_FRAMES};
+use crate::live;
 use crate::segments::Reader;
 
 /// How long the switch takes, in seconds.
@@ -29,14 +30,19 @@ const PROMOTE_MARGIN: usize = 2 * 48_000;
 /// The parts of playback the UI touches. Atomics, because the audio thread reads them
 /// without taking a lock.
 pub struct Controls {
-    /// Playhead in frames.
-    pub position: AtomicUsize,
+    /// Playhead in frames. Shared with a live stream's pump, which measures its credit
+    /// against the same number.
+    pub position: Arc<AtomicUsize>,
     pub playing: AtomicBool,
     /// True when the user wants the generated signal.
     pub use_enhanced: AtomicBool,
+    /// Frames in the track. A live stream has no known length, so this is 0 there and
+    /// [`Mixer::fill`] asks the source for the end instead.
     pub frames: usize,
     /// False when there is nothing to switch to (already full-band, or not rendered).
-    pub has_enhanced: bool,
+    has_wet_side: bool,
+    /// The live counters, when the source is a live stream.
+    stats: Option<Arc<live::Stats>>,
     /// Set while the app wants the switch to happen on its own, once.
     pub auto_promote: AtomicBool,
     /// True after that promotion has happened, so toggling back sticks.
@@ -48,8 +54,30 @@ impl Controls {
         self.playing.load(Ordering::Relaxed)
     }
 
+    /// Whether there is a generated side to switch to right now. A live stream's wet side
+    /// only counts once it covers the playhead, so the switch follows the buffer.
+    pub fn has_enhanced(&self) -> bool {
+        self.has_wet_side
+            && self
+                .stats
+                .as_ref()
+                .map_or(true, |stats| stats.is_wet_covered())
+    }
+
+    /// Why the switch cannot be used, in the words the status line prints.
+    #[allow(dead_code)] // The live status line prints it (U1).
+    pub fn enhanced_blocked(&self) -> Option<&'static str> {
+        if !self.has_wet_side {
+            return Some("the source has no generated side");
+        }
+        match &self.stats {
+            Some(stats) if !stats.is_wet_covered() => Some(live::STARVED_REASON),
+            _ => None,
+        }
+    }
+
     pub fn is_enhanced(&self) -> bool {
-        self.has_enhanced && self.use_enhanced.load(Ordering::Relaxed)
+        self.has_enhanced() && self.use_enhanced.load(Ordering::Relaxed)
     }
 
     pub fn position_secs(&self, sample_rate: u32) -> f64 {
@@ -58,7 +86,12 @@ impl Controls {
 
     /// Move the playhead. Clamped so a seek past the end lands on the last frame
     /// instead of stopping playback, which is what a scrubber at 100% should do.
+    ///
+    /// A live stream has no length and no seekable buffer, so its playhead does not move.
     pub fn seek_frames(&self, frame: usize) {
+        if self.frames == 0 {
+            return;
+        }
         let last = self.frames.saturating_sub(1);
         self.position.store(frame.min(last), Ordering::Relaxed);
     }
@@ -73,7 +106,7 @@ impl Controls {
     }
 
     pub fn toggle(&self) {
-        if self.has_enhanced {
+        if self.has_enhanced() {
             let next = !self.use_enhanced.load(Ordering::Relaxed);
             self.use_enhanced.store(next, Ordering::Relaxed);
         }
@@ -81,6 +114,31 @@ impl Controls {
 
     pub fn set_playing(&self, playing: bool) {
         self.playing.store(playing, Ordering::Relaxed);
+    }
+
+    /// Publish what the mixer is about to play from; a no-op on the file-shaped sources.
+    fn set_wet_covered(&self, is_covered: bool) {
+        if let Some(stats) = &self.stats {
+            stats.set_wet_covered(is_covered);
+        }
+    }
+}
+
+/// The A/B switch's position and how far it moves per frame.
+#[derive(Clone, Copy)]
+pub(crate) struct Ramp {
+    /// 0.0 plays the dry side, 1.0 the wet one.
+    pub(crate) value: f32,
+    /// Change per frame, from [`RAMP_SECS`].
+    pub(crate) step: f32,
+}
+
+impl Ramp {
+    pub(crate) fn new(is_enhanced: bool, sample_rate: u32) -> Self {
+        Self {
+            value: if is_enhanced { 1.0 } else { 0.0 },
+            step: 1.0 / (RAMP_SECS * sample_rate.max(1) as f32),
+        }
     }
 }
 
@@ -103,14 +161,17 @@ enum Source {
     /// A complete cache entry: both sides are decoded a segment at a time. The first play
     /// of an uncached track keeps [`Source::Progressive`]; replacing it is a later change.
     Segmented(Arc<Reader>),
+    /// A feed being read while it plays: bounded rings, passthrough when the wet side has
+    /// not caught up, no known length.
+    #[allow(dead_code)] // Built by `play --live` (U1) and the sink (K1).
+    Live(Arc<live::Live>),
 }
 
 #[derive(Clone)]
 pub struct Mixer {
     source: Source,
     channels: usize,
-    ramp: f32,
-    ramp_step: f32,
+    ramp: Ramp,
     controls: Arc<Controls>,
 }
 
@@ -128,11 +189,12 @@ impl Mixer {
         };
         let has_enhanced = enhanced.is_some();
         let controls = Arc::new(Controls {
-            position: AtomicUsize::new(0),
+            position: Arc::new(AtomicUsize::new(0)),
             playing: AtomicBool::new(false),
             use_enhanced: AtomicBool::new(has_enhanced),
             frames,
-            has_enhanced,
+            has_wet_side: has_enhanced,
+            stats: None,
             auto_promote: AtomicBool::new(false),
             promoted: AtomicBool::new(has_enhanced),
         });
@@ -142,8 +204,7 @@ impl Mixer {
                 enhanced: enhanced.map(Into::into),
             },
             channels,
-            ramp: if has_enhanced { 1.0 } else { 0.0 },
-            ramp_step: 1.0 / (RAMP_SECS * sample_rate.max(1) as f32),
+            ramp: Ramp::new(has_enhanced, sample_rate),
             controls: Arc::clone(&controls),
         };
         (mixer, controls)
@@ -164,11 +225,12 @@ impl Mixer {
             _ => original.len() / channels,
         };
         let controls = Arc::new(Controls {
-            position: AtomicUsize::new(0),
+            position: Arc::new(AtomicUsize::new(0)),
             playing: AtomicBool::new(false),
             use_enhanced: AtomicBool::new(false),
             frames,
-            has_enhanced: true,
+            has_wet_side: true,
+            stats: None,
             auto_promote: AtomicBool::new(true),
             promoted: AtomicBool::new(false),
         });
@@ -178,8 +240,7 @@ impl Mixer {
                 frontier,
             },
             channels,
-            ramp: 0.0,
-            ramp_step: 1.0 / (RAMP_SECS * sample_rate.max(1) as f32),
+            ramp: Ramp::new(false, sample_rate),
             controls: Arc::clone(&controls),
         };
         (mixer, controls)
@@ -190,19 +251,46 @@ impl Mixer {
     pub fn segmented(reader: Arc<Reader>, sample_rate: u32) -> (Self, Arc<Controls>) {
         let has_enhanced = reader.has_rendered();
         let controls = Arc::new(Controls {
-            position: AtomicUsize::new(0),
+            position: Arc::new(AtomicUsize::new(0)),
             playing: AtomicBool::new(false),
             use_enhanced: AtomicBool::new(has_enhanced),
             frames: reader.frames(),
-            has_enhanced,
+            has_wet_side: has_enhanced,
+            stats: None,
             auto_promote: AtomicBool::new(false),
             promoted: AtomicBool::new(has_enhanced),
         });
         let mixer = Self {
             source: Source::Segmented(reader),
             channels: 2,
-            ramp: if has_enhanced { 1.0 } else { 0.0 },
-            ramp_step: 1.0 / (RAMP_SECS * sample_rate.max(1) as f32),
+            ramp: Ramp::new(has_enhanced, sample_rate),
+            controls: Arc::clone(&controls),
+        };
+        (mixer, controls)
+    }
+
+    /// Play a live feed: rings instead of a buffer, and the dry side wherever the wet side
+    /// has not caught up.
+    ///
+    /// The stream has no known length, so `controls.frames` is 0 and the end comes from the
+    /// rings. The switch starts on the dry side; the user asks for the generated one.
+    #[allow(dead_code)] // Called by `play --live` (U1) and the sink (K1).
+    pub fn live(source: Arc<live::Live>, sample_rate: u32) -> (Self, Arc<Controls>) {
+        let channels = source.channels();
+        let controls = Arc::new(Controls {
+            position: source.playhead(),
+            playing: AtomicBool::new(false),
+            use_enhanced: AtomicBool::new(false),
+            frames: 0,
+            has_wet_side: true,
+            stats: Some(source.stats()),
+            auto_promote: AtomicBool::new(false),
+            promoted: AtomicBool::new(false),
+        });
+        let mixer = Self {
+            source: Source::Live(source),
+            channels,
+            ramp: Ramp::new(false, sample_rate),
             controls: Arc::clone(&controls),
         };
         (mixer, controls)
@@ -215,7 +303,7 @@ impl Mixer {
             Source::Whole { original, .. } | Source::Progressive { original, .. } => {
                 Some(Arc::clone(original))
             }
-            Source::Segmented(_) => None,
+            Source::Segmented(_) | Source::Live(_) => None,
         }
     }
 
@@ -233,6 +321,10 @@ impl Mixer {
     pub fn ready_frames(&self) -> usize {
         match &self.source {
             Source::Progressive { frontier, .. } => frontier.ready_frames(),
+            Source::Live(live) => {
+                let position = self.controls.position_frames();
+                position + live.wet_ahead(position)
+            }
             Source::Whole { .. } | Source::Segmented(_) => self.controls.frames,
         }
     }
@@ -260,15 +352,15 @@ impl Mixer {
             out.fill(0.0);
             return 0;
         }
+        self.publish_wet_coverage(frames);
         self.promote_if_ready();
 
         let mut ramp = self.ramp;
-        let ramp_step = self.ramp_step;
         let mut position = self.controls.position.load(Ordering::Relaxed);
         let mut written = 0;
 
         while written < frames {
-            if position >= self.controls.frames {
+            if self.is_at_end(position) {
                 self.controls.playing.store(false, Ordering::Relaxed);
                 out[written * channels..].fill(0.0);
                 break;
@@ -279,7 +371,7 @@ impl Mixer {
                 0.0
             };
             // Never mix past the end of the track; the next iteration writes silence.
-            let want = (frames - written).min(self.controls.frames - position);
+            let want = frames - written;
 
             match &self.source {
                 // A whole track: one stretch, no segment bookkeeping.
@@ -287,52 +379,52 @@ impl Mixer {
                     original,
                     enhanced: Some(enhanced),
                 } => {
+                    let span = want.min(self.controls.frames - position);
                     mix_stretch(
                         &mut ramp,
-                        ramp_step,
                         out,
                         written,
                         position,
-                        want,
+                        span,
                         channels,
                         target,
                         |frame, channel| original[frame * channels + channel],
                         |frame, channel| enhanced[frame * channels + channel],
                     );
-                    position += want;
-                    written += want;
+                    position += span;
+                    written += span;
                 }
                 // Nothing generated: both sides are the original, so the toggle is a no-op.
                 Source::Whole {
                     original,
                     enhanced: None,
                 } => {
+                    let span = want.min(self.controls.frames - position);
                     mix_stretch(
                         &mut ramp,
-                        ramp_step,
                         out,
                         written,
                         position,
-                        want,
+                        span,
                         channels,
                         target,
                         |frame, channel| original[frame * channels + channel],
                         |frame, channel| original[frame * channels + channel],
                     );
-                    position += want;
-                    written += want;
+                    position += span;
+                    written += span;
                 }
                 // Progressive: at most one chunk per iteration, so the slot is loaded
                 // once per second of audio instead of once per sample.
                 Source::Progressive { original, frontier } => {
                     let (_, guard, chunk_end) = frontier.chunk_at(position);
                     let chunk = guard.as_ref();
-                    let span = (chunk_end.min(position + want))
-                        .saturating_sub(position)
-                        .max(1);
+                    let span = (chunk_end
+                        .min(position + want.min(self.controls.frames - position)))
+                    .saturating_sub(position)
+                    .max(1);
                     mix_stretch(
                         &mut ramp,
-                        ramp_step,
                         out,
                         written,
                         position,
@@ -370,7 +462,6 @@ impl Mixer {
                         .max(1);
                     mix_stretch(
                         &mut ramp,
-                        ramp_step,
                         out,
                         written,
                         position,
@@ -383,12 +474,45 @@ impl Mixer {
                     position += span;
                     written += span;
                 }
+                // Live: one stretch from the rings, and the playhead holds still for
+                // whatever the rings do not hold yet.
+                Source::Live(live) => {
+                    let fill =
+                        live.fill(&mut ramp, target, position, &mut out[written * channels..]);
+                    position += fill.frames;
+                    written += fill.frames;
+                    if fill.frames < want {
+                        out[written * channels..].fill(0.0);
+                        break;
+                    }
+                }
             }
         }
 
         self.ramp = ramp;
         self.controls.position.store(position, Ordering::Relaxed);
         written
+    }
+
+    /// Whether playback has reached the end: a file source knows its length, and a live
+    /// stream ends when the feed has finished and the rings are drained.
+    fn is_at_end(&self, position: usize) -> bool {
+        match &self.source {
+            Source::Live(live) => live.is_finished(position),
+            _ => position >= self.controls.frames,
+        }
+    }
+
+    /// Publish whether a live stream's wet side covers the next callback, so
+    /// [`Controls::has_enhanced`] and the ramp answer for what the rings hold. A no-op on
+    /// the file-shaped sources.
+    fn publish_wet_coverage(&self, frames: usize) {
+        let Source::Live(live) = &self.source else {
+            return;
+        };
+        let position = self.controls.position_frames();
+        self.controls
+            .set_wet_covered(live.is_wet_covered(position, frames));
     }
 }
 
@@ -398,9 +522,8 @@ impl Mixer {
 /// source while mixing, and only the ramp is mutable state. Both sides are closures so
 /// a whole buffer and a decoded segment fill the loop with the same arithmetic.
 #[allow(clippy::too_many_arguments)]
-fn mix_stretch(
-    ramp: &mut f32,
-    ramp_step: f32,
+pub(crate) fn mix_stretch(
+    ramp: &mut Ramp,
     out: &mut [f32],
     written: usize,
     position: usize,
@@ -411,26 +534,27 @@ fn mix_stretch(
     wet: impl Fn(usize, usize) -> f32,
 ) {
     for index in 0..want {
-        let delta = (target - *ramp).clamp(-ramp_step, ramp_step);
-        *ramp += delta;
+        let delta = (target - ramp.value).clamp(-ramp.step, ramp.step);
+        ramp.value += delta;
         let frame = position + index;
         for channel in 0..channels {
             let dry = dry(frame, channel);
-            let generated = if *ramp > 0.0 {
+            let generated = if ramp.value > 0.0 {
                 wet(frame, channel)
             } else {
                 dry
             };
-            out[(written + index) * channels + channel] = dry + (generated - dry) * *ramp;
+            out[(written + index) * channels + channel] = dry + (generated - dry) * ramp.value;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::live::tests::{dry_sample, test_policy, RampFeed};
     use crate::segments::{self, MemorySource, Resident};
 
     /// The segment length the segmented tests use: small enough to cross a boundary in a
@@ -613,7 +737,7 @@ mod tests {
         let (mut mixer, controls) = Mixer::segmented(Arc::clone(&reader), 48_000);
         controls.set_playing(true);
         assert!(
-            !controls.has_enhanced,
+            !controls.has_enhanced(),
             "a reader with no rendered side has nothing to switch to"
         );
         controls.seek_frames(7 * SEGMENT);
@@ -832,5 +956,123 @@ mod tests {
             previous = value;
         }
         assert!(previous.abs() < 1e-3, "ramp ended at {previous}");
+    }
+
+    /// A live mixer over a feed of `frames` frames. The wet side is the dry side plus 1 000,
+    /// so a mix is visible in the output. The pump is left running: dropping the mixer stops
+    /// it.
+    fn live_mixer(
+        buffer_frames: usize,
+        window_frames: usize,
+        frames: usize,
+    ) -> (Mixer, Arc<Controls>, Arc<live::Live>) {
+        let (live, _pump) = live::Live::start(
+            Box::new(RampFeed::new(frames)),
+            &test_policy(buffer_frames, window_frames),
+            Box::new(|dry: &[f32], wet: &mut [f32]| {
+                wet.copy_from_slice(&dry[..wet.len()]);
+                for sample in wet.iter_mut() {
+                    *sample += 1_000.0;
+                }
+                Ok(())
+            }),
+        )
+        .expect("a live stream");
+        let (mixer, controls) = Mixer::live(Arc::clone(&live), 48_000);
+        (mixer, controls, live)
+    }
+
+    #[test]
+    fn given_a_live_source_when_the_callback_fills_then_it_allocates_nothing() {
+        let (mut mixer, controls, live) = live_mixer(4_096, 2_048, 64 * 1_024);
+        assert!(
+            live.wait_for_wet(0, 1_024, Duration::from_secs(5)),
+            "the prebuffer must fill"
+        );
+        controls.set_playing(true);
+
+        let mut out = vec![0.0f32; 1_024 * 2];
+        warm_up(&mut mixer, &mut out);
+        let (written, allocated) = crate::alloc_counter::measure(|| mixer.fill(&mut out));
+        assert_eq!(written, 1_024);
+        assert_eq!(allocated, 0, "the callback must not allocate");
+    }
+
+    #[test]
+    fn given_a_live_playhead_when_the_wet_side_does_not_cover_the_callback_then_the_switch_has_a_reason(
+    ) {
+        // The wet ring holds 2 048 frames, so a callback of 4 096 can never be covered: the
+        // switch must refuse and say why, and the dry side must play in full.
+        let (mut mixer, controls, live) = live_mixer(2_048, 1_024, 64 * 1_024);
+        assert!(live.wait_for_wet(0, 1_024, Duration::from_secs(5)));
+        controls.set_playing(true);
+
+        let mut out = vec![1.0f32; 4_096 * 2];
+        let written = mixer.fill(&mut out);
+        assert!(written > 0);
+        assert!(!controls.has_enhanced());
+        assert_eq!(controls.enhanced_blocked(), Some(live::STARVED_REASON));
+        controls.toggle();
+        assert!(
+            !controls.is_enhanced(),
+            "the switch must refuse while the wet side is behind"
+        );
+        for frame in 0..written {
+            assert_eq!(out[frame * 2], dry_sample(frame, 0), "frame {frame}");
+            assert_eq!(out[frame * 2 + 1], dry_sample(frame, 1), "frame {frame}");
+        }
+        assert!(
+            out[written * 2..].iter().all(|sample| *sample == 0.0),
+            "what the rings do not hold is silence, not a repeat"
+        );
+    }
+
+    #[test]
+    fn given_a_live_source_when_the_prebuffer_is_full_then_the_switch_plays_the_wet_side() {
+        let (mut mixer, controls, live) = live_mixer(4_096, 2_048, 64 * 1_024);
+        assert!(live.wait_for_wet(0, 1_024, Duration::from_secs(5)));
+        controls.set_playing(true);
+
+        let mut out = vec![0.0f32; 1_024 * 2];
+        mixer.fill(&mut out);
+        assert!(controls.has_enhanced(), "the buffer covers the callback");
+        assert_eq!(controls.enhanced_blocked(), None);
+        controls.toggle();
+        assert!(controls.is_enhanced());
+
+        let mut wet_out = vec![0.0f32; 1_024 * 2];
+        mixer.fill(&mut wet_out);
+        // The ramp takes 8 ms, so by the end of the buffer the sample is the wet side's.
+        let frame = controls.position_frames() - 1;
+        let last = (1_024 - 1) * 2;
+        assert!(
+            (wet_out[last] - (dry_sample(frame, 0) + 1_000.0)).abs() < 0.01,
+            "{} is not the wet side at {frame}",
+            wet_out[last]
+        );
+    }
+
+    #[test]
+    fn given_the_end_of_a_live_feed_when_filled_then_playback_stops_at_the_last_frame() {
+        let frames = 8 * 1_024;
+        let (mut mixer, controls, _live) = live_mixer(4_096, 2_048, frames);
+        controls.set_playing(true);
+
+        let mut out = vec![1.0f32; 1_024 * 2];
+        let mut delivered = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while controls.is_playing() && Instant::now() < deadline {
+            let written = mixer.fill(&mut out);
+            delivered += written;
+            if written == 0 {
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(delivered, frames, "every frame of the feed must be played");
+        assert!(
+            !controls.is_playing(),
+            "the fill must report the end rather than stall"
+        );
+        assert_eq!(controls.position_frames(), frames);
     }
 }

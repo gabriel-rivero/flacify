@@ -227,7 +227,7 @@ impl PlayerApp {
         let generated_here =
             prepared_frames >= controls.position_frames() + self.promote_margin.min(48_000);
         let live = controls.is_enhanced();
-        let label = if !controls.has_enhanced {
+        let label = if !controls.has_enhanced() {
             "Full-band source".to_string()
         } else if !generated_here {
             format!(
@@ -243,7 +243,7 @@ impl PlayerApp {
         let button = egui::Button::new(egui::RichText::new(label).size(21.0))
             .min_size(egui::vec2(400.0, 68.0));
         if ui
-            .add_enabled(controls.has_enhanced && generated_here, button)
+            .add_enabled(controls.has_enhanced() && generated_here, button)
             .clicked()
         {
             controls.toggle();
@@ -479,7 +479,7 @@ impl PlayerApp {
                 // A full-band source has nothing to generate, so there is no frontier to
                 // mark and one colour is the honest picture.
                 let colour =
-                    if !controls.has_enhanced || index * self.waveform_bar_frames < prepared {
+                    if !controls.has_enhanced() || index * self.waveform_bar_frames < prepared {
                         accent
                     } else {
                         dim

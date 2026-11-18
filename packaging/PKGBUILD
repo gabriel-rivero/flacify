@@ -4,10 +4,11 @@
 # carries, so there is no toolchain and no build on the user's machine.
 #
 # The release workflow fills PKGVER and the checksum in from the artifact it just built;
-# when building by hand, compute the hash of flacify-$pkgver-x86_64.tar.gz and set both.
+# when building by hand, set pkgver to the release you are packaging and compute the hash
+# of flacify-$pkgver-x86_64.tar.gz.
 
 pkgname=flacify-bin
-pkgver=0.4.0
+pkgver=0.0.0
 pkgrel=1
 pkgdesc="Desktop player that reconstructs the high frequencies lossy audio threw away"
 arch=('x86_64')

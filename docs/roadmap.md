@@ -203,9 +203,16 @@ each one.
 
 ## v1.0 — utility
 
-The first release where audio arrives while it is still happening, and the first one
-worth pointing at a library rather than a file. [`v1.0-plan.md`](v1.0-plan.md) is the
-working plan: decisions, risks and waves.
+**Released 2026-11-18 as 1.0.0.** The first release where audio arrives while it is still
+happening, and the first one worth pointing at a library rather than a file.
+[`v1.0-plan.md`](v1.0-plan.md) is the working plan: decisions, risks and waves.
+
+Shipped with the caveats the plan named rather than glossed: the sink is macOS-only and
+needs a loopback the user installs; its acceptance run is recorded with two caveats in
+`measurements.md` (the output device had disconnected, and the feeder outran the run); the
+blind report refused its own level gate by 0.03 dB, so no report is attached; and
+`flacify sink` from a terminal inherits the terminal's Microphone permission, which is why
+the app is the documented path.
 
 - **`play --live [--window 1|2|4|8]`**: one live pipeline with two feeds (a file and a
   capture stream), bounded wet/dry rings, credit backpressure, and passthrough with a

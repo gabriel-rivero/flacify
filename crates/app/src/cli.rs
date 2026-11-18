@@ -29,8 +29,9 @@ pub(crate) enum Command {
         /// Any format symphonia can decode.
         file: PathBuf,
         /// Measured sustained cost, in seconds of compute per second of audio.
-        /// The sidecar measured 0.54 on an M5 Max; this stays a flag, not a constant.
-        #[arg(long, default_value_t = 0.3)]
+        /// The default is the number the app measured end to end on an M5 Max
+        /// (0.75-0.79 while playing live, 2026-11-18), not the sidecar's 0.54.
+        #[arg(long, default_value_t = 0.78)]
         rtf: f64,
     },
     /// Render the generated high band and write a 32-bit float WAV, or a 24-bit FLAC
@@ -63,9 +64,9 @@ pub(crate) enum Command {
         #[arg(long, default_value = "8", value_name = "1|2|4|8")]
         window: String,
         /// Sustained compute ratio the live buffer is sized from, in seconds per second
-        /// of audio. 0.8 is the end-to-end figure measured on the M5; the app's own
-        /// measurement replaces it with S3.
-        #[arg(long, default_value_t = 0.8)]
+        /// of audio. 0.78 is the end-to-end figure the live path measured on the M5
+        /// (0.75-0.79 over ten minutes); the status line prints the measured one.
+        #[arg(long, default_value_t = 0.78)]
         rtf: f64,
         /// Seconds a --smoke run listens before it reports.
         #[arg(long, default_value_t = 4.0)]

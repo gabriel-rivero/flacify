@@ -51,6 +51,8 @@ cargo build --release
 ./target/release/flacify play song.mp3 --smoke # headless audio-path check
 ./target/release/flacify devices               # capture and playback devices, with rates and channels
 ./target/release/flacify diagnose              # -> flacify-diagnose.txt
+./target/release/flacify cache                 # what the cache holds, by kind, against its 20 GB cap
+./target/release/flacify cache --evict         # evict least recently used entries until it fits
 ```
 
 Measured on an M5 Max: a 30.7 s clip renders in 34.1 s (including the 8 s worker start)

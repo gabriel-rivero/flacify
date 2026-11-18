@@ -4,6 +4,10 @@
 //! length the render cache uses, so a reader can decode one frame range instead of the
 //! whole track. An entry is built in `<hash>.tmp` and renamed; a manifest its files do not
 //! keep up with is an error, not a miss.
+//!
+//! An open [`Entry`] records a claim in `cache/.claims/source-<hash>` and refreshes it on
+//! every range read, so eviction leaves a tier something is reading alone. The tier is the
+//! first thing eviction drops: nothing but a decode pass depends on it.
 
 use std::path::{Path, PathBuf};
 
@@ -12,7 +16,7 @@ use flacify_core::dsp::resample::Resampler;
 use flacify_core::SAMPLE_RATE;
 use serde::{Deserialize, Serialize};
 
-use crate::cache::{now, Segment};
+use crate::cache::{now, source_claim, InUse, Segment, CLAIMS};
 use crate::decode::{self, AudioStream};
 
 /// The entry layout's own version. A manifest from another version is rebuilt, not read.
@@ -85,6 +89,8 @@ pub struct Meta {
 pub struct Tier {
     root: PathBuf,
     frames_per_segment: usize,
+    /// `<cache>/.claims`, shared with the render entries so eviction reads one namespace.
+    claims: PathBuf,
 }
 
 impl Tier {
@@ -100,6 +106,7 @@ impl Tier {
         Ok(Self {
             root: cache_root.join("source"),
             frames_per_segment,
+            claims: cache_root.join(CLAIMS),
         })
     }
 
@@ -113,6 +120,9 @@ impl Tier {
     /// A directory with no manifest, or one from another version, is rebuilt; a manifest
     /// that parses but does not describe its files is an error.
     pub fn build_or_reuse(&self, input: &Path, source_hash: &str) -> Result<Entry> {
+        // Taken before the directory is touched: eviction skips a tier a reader holds, and
+        // the same claim covers the staging directory this build writes.
+        let in_use = InUse::acquire(&self.claims, &source_claim(source_hash));
         let dir = self.entry_dir(source_hash);
         if dir.exists() {
             let manifest = dir.join(MANIFEST);
@@ -121,16 +131,16 @@ impl Tier {
                 if meta.version == VERSION {
                     validate(&manifest, &meta, self.frames_per_segment)?;
                     ensure_segments(&manifest, &dir, &meta)?;
-                    return Ok(Entry { dir, meta });
+                    return Ok(Entry { in_use, dir, meta });
                 }
             }
             clear(&dir)?;
         }
-        self.build(input, source_hash)
+        self.build(input, source_hash, in_use)
     }
 
     /// One decode+resample pass into `<hash>.tmp`, then the rename that publishes it.
-    fn build(&self, input: &Path, source_hash: &str) -> Result<Entry> {
+    fn build(&self, input: &Path, source_hash: &str, in_use: InUse) -> Result<Entry> {
         let temp_dir = self.root.join(format!("{source_hash}.tmp"));
         if temp_dir.exists() {
             clear(&temp_dir)?;
@@ -160,7 +170,7 @@ impl Tier {
         }
         std::fs::rename(&temp_dir, &dir)
             .with_context(|| format!("publishing {}", dir.display()))?;
-        Ok(Entry { dir, meta })
+        Ok(Entry { in_use, dir, meta })
     }
 
     /// Decode and resample `input` in order, writing a segment each time one fills.
@@ -239,6 +249,9 @@ struct PassOutput {
 /// A complete entry on disk: the manifest, validated, and the directory holding it.
 #[derive(Debug)]
 pub struct Entry {
+    /// Held for as long as this entry is read, refreshed on every range read, so eviction
+    /// leaves the tier alone however long a render runs.
+    in_use: InUse,
     dir: PathBuf,
     meta: Meta,
 }
@@ -258,6 +271,7 @@ impl Entry {
     ///
     /// Only the segments the range touches are decoded.
     pub fn read_range(&self, start: usize, frames: usize) -> Result<Vec<f32>> {
+        self.in_use.refresh();
         let end = start
             .checked_add(frames)
             .with_context(|| format!("range {start} + {frames} frames overflows"))?;
@@ -544,6 +558,13 @@ fn read_meta(path: &Path) -> Result<Meta> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// The manifest of the tier entry at `dir`, for the cache's accounting; `None` when this
+/// build cannot read it. No segment is opened and no file is measured: the caller walks.
+pub(crate) fn measure(dir: &Path) -> Option<Meta> {
+    let meta = read_meta(&dir.join(MANIFEST)).ok()?;
+    (meta.version == VERSION).then_some(meta)
 }
 
 /// Write the manifest through a temporary file in the same directory, so a reader never

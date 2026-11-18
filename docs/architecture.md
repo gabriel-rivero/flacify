@@ -337,8 +337,18 @@ problem, and it buys seek, instant replay, and a zero-GPU second listen.
   falls back to passthrough; a seek past the prefetch holds until the worker catches up.
   The first play of an uncached track still holds the whole source, and is drawn
   differently on the waveform.
-- **Eviction**: LRU against a user-set cap (default 20 GB), never evict the file
-  currently open, always keep the manifest.
+- **Eviction**: LRU by the manifest's `last_used`, against a 20 GB default cap
+  (`flacify cache --evict [--cap-gb]`). It sweeps leftover staging and other-version
+  directories first, then drops each entry's source tier, which a decode pass rebuilds, and
+  only then whole entries. An entry something has open is skipped: an opener records
+  `<pid> <claim> <seconds>` in `cache/.claims/entry-<key>` and refreshes it on every segment
+  read, and eviction leaves a claim younger than an hour alone, so a process that died stops
+  pinning its entry once that hour is up. The claim is advisory, not a kernel lock, so
+  eviction re-checks it immediately before the rename: an opener that arrives in that gap
+  finds the entry gone and misses cleanly instead of half-reading. A removal renames the
+  directory to `<name>.evict-<pid>` and deletes that, so a kill leaves nothing a lookup can
+  open. The accounting comes from the manifests and the bytes are measured, so a manifest
+  that names more or less than its directory holds is reported rather than believed.
 - **Writer**: one segment at a time, each written whole and renamed into place; the
   manifest is rewritten atomically after it, with both `fsync`ed, so a manifest never
   names bytes that are not on disk. An entry stays `partial` until a writer marks it

@@ -21,9 +21,17 @@
 //! paths that need a whole track, and [`Cache::segments`] opens the entry for reads of one
 //! segment at a time, which is what playback of a complete entry does. Seeking needs
 //! nothing from the cache beyond that: the playhead is an index into a segment.
+//!
+//! Eviction ([`Cache::evict`]) keeps the cache under a cap, oldest `last_used` first. It
+//! never removes an entry something has open or part of one: an opener claims
+//! `.claims/entry-<key>` and refreshes the claim on every segment read, eviction skips a
+//! claim younger than an hour, and it re-checks the claim just before renaming. An opener
+//! in that gap misses cleanly; one reading through it fails naming the missing file.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -53,6 +61,21 @@ const STEPS_PER_SEGMENT: usize = 7;
 
 /// The one file in an entry that is not audio.
 const MANIFEST: &str = "manifest.json";
+
+/// The source tier's directory inside the cache root.
+const SOURCE_DIR: &str = "source";
+
+/// The default cap eviction works against: 20 GB, from `architecture.md` and D9.
+pub const DEFAULT_CAP_BYTES: u64 = 20_000_000_000;
+
+/// The directory holding one claim file per entry and per source entry. They name the
+/// process using the entry, live outside every directory eviction removes, and are not
+/// counted.
+pub(crate) const CLAIMS: &str = ".claims";
+
+/// The infix a directory is renamed to before it is deleted, so a half-deleted entry is
+/// never one a lookup can reach.
+const EVICTING: &str = ".evict-";
 
 /// One FLAC file of an entry, as the manifest describes it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -163,6 +186,9 @@ pub struct Cached {
 /// A complete entry opened for segment reads: the manifest, validated, and nothing decoded.
 #[derive(Debug)]
 pub struct Segments {
+    /// Held for as long as this handle reads the entry, so eviction skips it, refreshed on
+    /// every segment read because reading is what a play does.
+    in_use: InUse,
     dir: PathBuf,
     meta: Meta,
 }
@@ -175,6 +201,7 @@ impl Segments {
 
     /// Planar 48 kHz stereo for segment `index`, whole, in its own frame range.
     pub fn read_segment(&self, index: usize) -> Result<Vec<f32>> {
+        self.in_use.refresh();
         let manifest = self.dir.join(MANIFEST);
         let expected =
             expected_segment_frames(self.meta.frames, self.meta.frames_per_segment, index)
@@ -224,6 +251,299 @@ pub struct EntryProgress {
     pub gain_db: Option<f64>,
     /// What the limiter did to the segments on disk so far.
     pub limit: crate::limit::LimitReport,
+}
+
+/// How long a claim stays believable without being refreshed. A play refreshes it on every
+/// segment read, so this covers two cases: a process that died leaves its entry evictable
+/// again within the hour, and a play paused for longer than that can be evicted, whose next
+/// segment read then fails naming the missing file.
+const STALE_CLAIM_SECS: u64 = 3_600;
+
+/// Numbers claims within one process, so the last opener to claim an entry owns the record
+/// and an earlier handle's drop does not clear it.
+static NEXT_CLAIM: AtomicU64 = AtomicU64::new(1);
+
+/// A claim that an entry is in use, held for as long as this value lives: `claims/<name>`
+/// records `<pid> <claim> <unix seconds>`, and eviction skips an entry whose claim is
+/// younger than [`STALE_CLAIM_SECS`]. The claim is advisory, not a kernel lock: eviction
+/// re-checks it immediately before removing the directory, and an opener that arrives in
+/// that gap finds the entry gone and misses cleanly.
+#[derive(Debug)]
+pub struct InUse {
+    claim: Option<Claim>,
+}
+
+#[derive(Debug)]
+struct Claim {
+    path: PathBuf,
+    pid: u32,
+    id: u64,
+}
+
+/// One claim as its marker file holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Marker {
+    pid: u32,
+    id: u64,
+    secs: u64,
+}
+
+impl Marker {
+    fn parse(text: &str) -> Option<Self> {
+        let mut fields = text.split_whitespace();
+        Some(Self {
+            pid: fields.next()?.parse().ok()?,
+            id: fields.next()?.parse().ok()?,
+            secs: fields.next()?.parse().ok()?,
+        })
+    }
+
+    /// A claim in the future counts as live: a clock that moved backwards should keep an
+    /// entry, not delete it.
+    fn is_live(&self) -> bool {
+        self.secs.saturating_add(STALE_CLAIM_SECS) > now()
+    }
+}
+
+impl InUse {
+    /// The claim name for an entry directory: a staging directory claims the entry it
+    /// publishes, so a sweep cannot remove a render mid-write.
+    fn entry_name(dir: &Path) -> String {
+        entry_claim(key_of(&file_name(dir)))
+    }
+
+    /// Record that an entry is in use, or an empty claim when the cache root cannot be
+    /// written. An entry that cannot be claimed still plays: eviction then has only
+    /// `last_used` to go on.
+    pub(crate) fn acquire(claims: &Path, name: &str) -> Self {
+        if let Err(error) = std::fs::create_dir_all(claims) {
+            tracing::warn!(%error, dir = %claims.display(), "could not create the cache claim directory");
+            return Self { claim: None };
+        }
+        let claim = Claim {
+            path: claims.join(name),
+            pid: std::process::id(),
+            id: NEXT_CLAIM.fetch_add(1, Ordering::Relaxed),
+        };
+        if let Err(error) = claim.write(now()) {
+            tracing::warn!(
+                %error,
+                marker = %claim.path.display(),
+                "could not record that a cache entry is in use; eviction may remove it"
+            );
+            return Self { claim: None };
+        }
+        Self { claim: Some(claim) }
+    }
+
+    /// Say the entry is still in use. Every segment read does this, so a play that keeps
+    /// reading keeps its claim.
+    pub(crate) fn refresh(&self) {
+        if let Some(claim) = &self.claim {
+            let _ = claim.write(now());
+        }
+    }
+}
+
+impl Claim {
+    fn write(&self, secs: u64) -> std::io::Result<()> {
+        std::fs::write(&self.path, format!("{} {} {}\n", self.pid, self.id, secs))
+    }
+}
+
+impl Drop for InUse {
+    fn drop(&mut self) {
+        let Some(claim) = &self.claim else {
+            return;
+        };
+        // Only a claim still carrying this handle's number is ours to clear; a later opener
+        // that overwrote it keeps its own.
+        let Ok(text) = std::fs::read_to_string(&claim.path) else {
+            return;
+        };
+        let Some(marker) = Marker::parse(&text) else {
+            return;
+        };
+        if marker.pid == claim.pid && marker.id == claim.id {
+            let _ = std::fs::remove_file(&claim.path);
+        }
+    }
+}
+
+/// Whether something claims the named entry. No marker means nobody does; a marker that
+/// cannot be read counts as a claim, so eviction keeps what it could not inspect.
+fn is_held_open(claims: &Path, name: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(claims.join(name)) else {
+        return false;
+    };
+    Marker::parse(&text).map_or(true, |marker| marker.is_live())
+}
+
+/// A staging directory a writer is filling, or one eviction renamed aside: no lookup reads
+/// either, and the sweep removes both.
+fn is_transient(name: &str) -> bool {
+    name.ends_with(".tmp") || name.contains(EVICTING)
+}
+
+/// The load-bearing name, with an entry directory or path suffix stripped: `<key>.tmp` and
+/// `<key>.evict-<pid>` both belong to the claim of `<key>`.
+fn key_of(name: &str) -> &str {
+    match name.find(EVICTING) {
+        Some(at) => &name[..at],
+        None => name.strip_suffix(".tmp").unwrap_or(name),
+    }
+}
+
+/// One term for one concept: an entry's claim is named for its key, a tier's for its
+/// source hash, and both modules build the name here.
+pub(crate) fn entry_claim(key: &str) -> String {
+    format!("entry-{key}")
+}
+
+pub(crate) fn source_claim(source_hash: &str) -> String {
+    format!("source-{source_hash}")
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// What one part of the cache holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tally {
+    pub entries: usize,
+    pub bytes: u64,
+}
+
+impl Tally {
+    fn add(&mut self, bytes: u64) {
+        self.entries += 1;
+        self.bytes += bytes;
+    }
+}
+
+/// What the cache holds, split by what each part is.
+///
+/// Which bucket a directory falls in comes from its manifest; the bytes are what the
+/// directory holds, so the cap is measured against the disk rather than against a claim.
+/// Where the two disagree the entry is counted in `unaccounted_bytes` or
+/// `overstated_entries` instead of being believed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Complete entries: rendered segments, which are what a replay reads.
+    pub rendered: Tally,
+    /// Entries a killed render left resumable. A miss, but the work is not lost yet.
+    pub partial: Tally,
+    /// The decoded source tier, which any render can rebuild.
+    pub source: Tally,
+    /// Directories this build cannot read: another `CACHE_VERSION`, or no manifest at all.
+    pub unknown: Tally,
+    /// Leftover staging directories and half-deleted entries.
+    pub stale: Tally,
+    /// Bytes inside entries that their manifests do not name, such as an interrupted
+    /// segment write or a stray file.
+    pub unaccounted_bytes: u64,
+    /// Entries whose manifests name more bytes than their files hold.
+    pub overstated_entries: usize,
+}
+
+impl Usage {
+    /// Everything on disk under the cache root, which is what the cap is measured against.
+    pub fn total(&self) -> u64 {
+        self.rendered.bytes
+            + self.partial.bytes
+            + self.source.bytes
+            + self.unknown.bytes
+            + self.stale.bytes
+    }
+
+    /// Complete and partial entries: the renders, as opposed to the source tier.
+    pub fn entries(&self) -> usize {
+        self.rendered.entries + self.partial.entries
+    }
+}
+
+/// One directory eviction removes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Removal {
+    /// Relative to the cache root, as the user reads it: `abc123`, `source/abc123`.
+    pub name: String,
+    pub bytes: u64,
+    /// When the entry was last read, for ordering. A sweep has no clock: zero.
+    pub last_used: u64,
+}
+
+/// What `evict` would remove for a cap, before anything is touched. It is advisory: a
+/// holder can appear between the plan and the removal, so `evict` re-checks every entry and
+/// reports what it skipped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvictionPlan {
+    pub cap: u64,
+    pub before: u64,
+    /// Leftover staging directories and entries this build cannot read. These go first,
+    /// because none of them can be played.
+    pub sweeps: Vec<Removal>,
+    /// Source tiers, one entry at a time, before the render they belong to.
+    pub tiers: Vec<Removal>,
+    /// Whole entries, least recently used first.
+    pub entries: Vec<Removal>,
+    /// Entries and tiers a live holder protects. Listed so the plan explains what it kept.
+    pub open: Vec<Removal>,
+    /// The total once every removal above has happened.
+    pub after: u64,
+}
+
+/// What `evict` did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Eviction {
+    pub swept: Vec<Removal>,
+    pub tiers: Vec<Removal>,
+    pub entries: Vec<Removal>,
+    /// Planned removals a holder protected between the plan and the removal.
+    pub skipped: Vec<Removal>,
+    pub freed: u64,
+    /// Measured after the removals.
+    pub after: u64,
+}
+
+impl Eviction {
+    /// How many directories the run removed.
+    pub fn removals(&self) -> usize {
+        self.swept.len() + self.tiers.len() + self.entries.len()
+    }
+}
+
+/// One source tier entry, as the scan found it.
+#[derive(Clone, Copy, Debug)]
+struct TierFound {
+    bytes: u64,
+    created_at: u64,
+    is_open: bool,
+}
+
+/// One entry the plan can remove.
+#[derive(Debug)]
+struct Candidate {
+    key: String,
+    bytes: u64,
+    last_used: u64,
+    /// The entry's source tier, when it has one nothing holds open.
+    tier: Option<Removal>,
+}
+
+/// One pass over the cache root: the accounting, and everything eviction chooses from.
+#[derive(Debug, Default)]
+struct Scan {
+    usage: Usage,
+    sweeps: Vec<Removal>,
+    orphan_tiers: Vec<Removal>,
+    /// Complete and partial entries in one list: the least recently used goes first,
+    /// whatever state it is in. A partial nobody has resumed for a month is the least
+    /// valuable thing the cache holds.
+    entries: Vec<Candidate>,
+    open: Vec<Removal>,
 }
 
 pub struct Cache {
@@ -277,7 +597,7 @@ impl Cache {
         };
         let mut dirs: Vec<PathBuf> = entries
             .flatten()
-            .filter(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .filter(|entry| !is_transient(&entry.file_name().to_string_lossy()))
             .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
             .map(|entry| entry.path())
             .collect();
@@ -304,6 +624,7 @@ impl Cache {
     /// effort: a cache hit that cannot be annotated still plays.
     pub fn annotate(&self, key: &str, fields: &Fields) -> Result<()> {
         let dir = self.entry_dir(key);
+        let _in_use = self.hold_open(&dir);
         let Some(mut meta) = self.read_meta(&dir)? else {
             return Ok(());
         };
@@ -318,6 +639,9 @@ impl Cache {
     }
 
     fn load_dir(&self, dir: &Path) -> Result<Option<Cached>> {
+        // Held across the read, so eviction cannot take the bytes out from under it. The
+        // samples are in memory by the time this returns, so the claim ends there.
+        let in_use = self.hold_open(dir);
         let Some(mut meta) = self.read_meta(dir)? else {
             return Ok(None);
         };
@@ -332,6 +656,7 @@ impl Cache {
         validate_manifest(&manifest, &meta)?;
 
         let planar = Segments {
+            in_use,
             dir: dir.to_path_buf(),
             meta: meta.clone(),
         }
@@ -345,6 +670,9 @@ impl Cache {
     /// segment the manifest names has to be there; whether it decodes is checked when it
     /// is read.
     fn segments_dir(&self, dir: &Path) -> Result<Option<Segments>> {
+        // The claim comes before the manifest, so an eviction either sees this opener or has
+        // already removed the entry by the time the manifest is read, which then misses.
+        let in_use = self.hold_open(dir);
         let Some(mut meta) = self.read_meta(dir)? else {
             return Ok(None);
         };
@@ -364,6 +692,7 @@ impl Cache {
         }
         touch(dir, &mut meta);
         Ok(Some(Segments {
+            in_use,
             dir: dir.to_path_buf(),
             meta,
         }))
@@ -468,6 +797,9 @@ impl Cache {
                     existing.frames,
                     existing.cutoff_hz
                 );
+                // Resuming is using it, and the LRU clock has to say so.
+                let mut existing = existing;
+                existing.last_used = now();
                 existing
             }
             None => {
@@ -500,10 +832,408 @@ impl Cache {
         meta.rendered_frames = meta.segments.iter().map(|segment| segment.frames).sum();
         write_manifest(dir, &meta)?;
         Ok(EntryWriter {
+            in_use: self.hold_open(dir),
             dir: dir.to_path_buf(),
             meta,
             is_finished: false,
         })
+    }
+
+    /// The claim name of an entry directory, staging or published.
+    fn hold_open(&self, dir: &Path) -> InUse {
+        InUse::acquire(&self.root.join(CLAIMS), &InUse::entry_name(dir))
+    }
+
+    /// What the cache holds, split by what each part is. See [`Usage`].
+    pub fn usage(&self) -> Usage {
+        self.scan().usage
+    }
+
+    /// What `evict` would remove to get under `cap` bytes, without touching anything.
+    pub fn eviction_plan(&self, cap: u64) -> EvictionPlan {
+        plan_eviction(cap, self.scan())
+    }
+
+    /// Carry out `plan`: remove what it names, skipping anything a holder protected since
+    /// the plan was made. Every removal is one whole directory. Returns what was measured
+    /// after the work, so the caller does not have to trust the arithmetic.
+    pub fn evict(&self, plan: &EvictionPlan) -> Result<Eviction> {
+        let claims = self.root.join(CLAIMS);
+        let mut done = Eviction::default();
+        for removal in &plan.sweeps {
+            match self.remove_planned(removal, &claims)? {
+                Outcome::Removed(removed) => done.swept.push(removed),
+                Outcome::Held => done.skipped.push(removal.clone()),
+                Outcome::Absent => {}
+            }
+        }
+        for removal in &plan.tiers {
+            match self.remove_planned(removal, &claims)? {
+                Outcome::Removed(removed) => done.tiers.push(removed),
+                Outcome::Held => done.skipped.push(removal.clone()),
+                Outcome::Absent => {}
+            }
+        }
+        for removal in &plan.entries {
+            match self.remove_planned(removal, &claims)? {
+                Outcome::Removed(removed) => done.entries.push(removed),
+                Outcome::Held => done.skipped.push(removal.clone()),
+                Outcome::Absent => {}
+            }
+        }
+        done.freed = done
+            .swept
+            .iter()
+            .chain(&done.tiers)
+            .chain(&done.entries)
+            .map(|removal| removal.bytes)
+            .sum();
+        done.after = self.usage().total();
+        Ok(done)
+    }
+
+    /// One planned removal, re-checking the claim first: a holder that appeared since the
+    /// plan is seen here. An opener in the gap between this check and the rename misses
+    /// cleanly, because the rename takes the whole entry out of the namespace at once.
+    fn remove_planned(&self, removal: &Removal, claims: &Path) -> Result<Outcome> {
+        if is_held_open(claims, &removal_claim(&removal.name)) {
+            return Ok(Outcome::Held);
+        }
+        let path = self.root.join(&removal.name);
+        if !path.exists() {
+            return Ok(Outcome::Absent);
+        }
+        let bytes = remove_tree(&path)?;
+        Ok(Outcome::Removed(Removal {
+            name: removal.name.clone(),
+            bytes,
+            last_used: removal.last_used,
+        }))
+    }
+
+    /// One pass over the cache root. The accounting and the eviction candidates come from
+    /// the same walk, so the plan can never spend bytes the total does not have.
+    fn scan(&self) -> Scan {
+        let claims = self.root.join(CLAIMS);
+        let mut scan = Scan::default();
+        let mut names = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            Err(_) => return scan,
+        };
+        names.sort();
+        let tiers = self.scan_tiers(&claims, &mut scan);
+        let mut claimed: BTreeSet<String> = BTreeSet::new();
+
+        for name in names {
+            if name == CLAIMS || name == SOURCE_DIR {
+                continue;
+            }
+            let path = self.root.join(&name);
+            let bytes = path_bytes(&path);
+            if !path.is_dir() {
+                // This build writes directories here. A file is not ours to delete: it is
+                // counted so the total is honest and left alone.
+                scan.usage.unknown.add(bytes);
+                continue;
+            }
+            if is_transient(&name) {
+                sweep(&mut scan, &claims, Unreadable::Stale, name, bytes);
+                continue;
+            }
+            let meta = match self.read_meta(&path) {
+                Ok(Some(meta)) if meta.version == CACHE_VERSION => meta,
+                _ => {
+                    sweep(&mut scan, &claims, Unreadable::Unknown, name, bytes);
+                    continue;
+                }
+            };
+
+            let recorded = segment_bytes(&meta.segments)
+                + std::fs::metadata(path.join(MANIFEST))
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
+            account_size(&mut scan.usage, bytes, recorded);
+            match meta.state {
+                State::Complete => scan.usage.rendered.add(bytes),
+                State::Partial => scan.usage.partial.add(bytes),
+            }
+            let tier = self.tier_removal(&meta, &tiers, &mut claimed, &mut scan);
+            if is_held_open(&claims, &entry_claim(&name)) {
+                scan.open.push(Removal {
+                    name,
+                    bytes,
+                    last_used: meta.last_used,
+                });
+                continue;
+            }
+            let candidate = Candidate {
+                key: name,
+                bytes,
+                last_used: meta.last_used,
+                tier,
+            };
+            scan.entries.push(candidate);
+        }
+
+        // A tier no entry renders from is the cheapest thing to lose: nothing reads it.
+        for (hash, tier) in tiers {
+            if claimed.contains(&hash) {
+                continue;
+            }
+            let removal = Removal {
+                name: format!("{SOURCE_DIR}/{hash}"),
+                bytes: tier.bytes,
+                last_used: tier.created_at,
+            };
+            if tier.is_open {
+                scan.open.push(removal);
+            } else {
+                scan.orphan_tiers.push(removal);
+            }
+        }
+
+        scan.entries
+            .sort_by(|a, b| (a.last_used, &a.key).cmp(&(b.last_used, &b.key)));
+        scan.orphan_tiers
+            .sort_by(|a, b| (a.last_used, &a.name).cmp(&(b.last_used, &b.name)));
+        scan
+    }
+
+    /// Every entry of the source tier, by source hash, plus the sweeps and tallies the tier
+    /// itself contributes.
+    fn scan_tiers(&self, claims: &Path, scan: &mut Scan) -> BTreeMap<String, TierFound> {
+        let mut found = BTreeMap::new();
+        let dir = self.root.join(SOURCE_DIR);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return found;
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        for name in names {
+            let path = dir.join(&name);
+            let bytes = path_bytes(&path);
+            if !path.is_dir() {
+                scan.usage.unknown.add(bytes);
+                continue;
+            }
+            if is_transient(&name) {
+                sweep(
+                    scan,
+                    claims,
+                    Unreadable::Stale,
+                    format!("{SOURCE_DIR}/{name}"),
+                    bytes,
+                );
+                continue;
+            }
+            match crate::source::measure(&path) {
+                Some(meta) => {
+                    scan.usage.source.add(bytes);
+                    let recorded = segment_bytes(&meta.segments)
+                        + std::fs::metadata(path.join("source.json"))
+                            .map(|manifest| manifest.len())
+                            .unwrap_or(0);
+                    account_size(&mut scan.usage, bytes, recorded);
+                    found.insert(
+                        name.clone(),
+                        TierFound {
+                            bytes,
+                            created_at: meta.created_at,
+                            is_open: is_held_open(claims, &source_claim(&name)),
+                        },
+                    );
+                }
+                None => {
+                    sweep(
+                        scan,
+                        claims,
+                        Unreadable::Unknown,
+                        format!("{SOURCE_DIR}/{name}"),
+                        bytes,
+                    );
+                }
+            }
+        }
+        found
+    }
+
+    /// The source tier an entry renders from, when one exists and nothing holds it open.
+    /// Entries with different settings share one tier, so the first candidate claims it.
+    fn tier_removal(
+        &self,
+        meta: &Meta,
+        tiers: &BTreeMap<String, TierFound>,
+        claimed: &mut BTreeSet<String>,
+        scan: &mut Scan,
+    ) -> Option<Removal> {
+        if meta.source_hash.is_empty() {
+            return None;
+        }
+        let tier = tiers.get(&meta.source_hash)?;
+        let removal = Removal {
+            name: format!("{SOURCE_DIR}/{}", meta.source_hash),
+            bytes: tier.bytes,
+            last_used: meta.last_used,
+        };
+        let is_first = claimed.insert(meta.source_hash.clone());
+        if tier.is_open {
+            if is_first {
+                scan.open.push(removal);
+            }
+            return None;
+        }
+        is_first.then_some(removal)
+    }
+}
+
+/// What became of one planned removal.
+enum Outcome {
+    Removed(Removal),
+    /// A holder appeared between the plan and the removal.
+    Held,
+    /// Another process removed it first.
+    Absent,
+}
+
+/// The eviction policy, as a function of the scan and the cap: sweeps first, then the
+/// source tier of each entry least recently used, then whole entries least recently used.
+fn plan_eviction(cap: u64, scan: Scan) -> EvictionPlan {
+    let Scan {
+        usage,
+        sweeps,
+        orphan_tiers,
+        entries,
+        open,
+    } = scan;
+    let mut plan = EvictionPlan {
+        cap,
+        before: usage.total(),
+        sweeps,
+        open,
+        after: usage.total(),
+        ..EvictionPlan::default()
+    };
+    let mut after = plan.before;
+    for sweep in &plan.sweeps {
+        after = after.saturating_sub(sweep.bytes);
+    }
+    for tier in orphan_tiers {
+        if after <= cap {
+            break;
+        }
+        after = after.saturating_sub(tier.bytes);
+        plan.tiers.push(tier);
+    }
+    // Every tier before any render: a tier is one decode pass, a render is the model.
+    for candidate in &entries {
+        if after <= cap {
+            break;
+        }
+        if let Some(tier) = &candidate.tier {
+            after = after.saturating_sub(tier.bytes);
+            plan.tiers.push(tier.clone());
+        }
+    }
+    for candidate in entries {
+        if after <= cap {
+            break;
+        }
+        after = after.saturating_sub(candidate.bytes);
+        plan.entries.push(Removal {
+            name: candidate.key,
+            bytes: candidate.bytes,
+            last_used: candidate.last_used,
+        });
+    }
+    plan.after = after;
+    plan
+}
+
+/// Which tally a directory nothing can read counts under.
+#[derive(Clone, Copy)]
+enum Unreadable {
+    Stale,
+    Unknown,
+}
+
+/// Note a directory nothing can play: counted under `kind`, and queued for the sweep unless
+/// something holds it open.
+fn sweep(scan: &mut Scan, claims: &Path, kind: Unreadable, name: String, bytes: u64) {
+    match kind {
+        Unreadable::Stale => scan.usage.stale.add(bytes),
+        Unreadable::Unknown => scan.usage.unknown.add(bytes),
+    }
+    let removal = Removal {
+        name,
+        bytes,
+        last_used: 0,
+    };
+    if is_held_open(claims, &removal_claim(&removal.name)) {
+        scan.open.push(removal);
+    } else {
+        scan.sweeps.push(removal);
+    }
+}
+
+/// The bytes a cache directory or file occupies.
+fn path_bytes(path: &Path) -> u64 {
+    if path.is_dir() {
+        crate::setup::dir_size(path)
+    } else {
+        std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+    }
+}
+
+/// The claim that protects a directory named in a plan. A tier lives under `source/`, and
+/// so does a staging directory in the tier: both take the hash's claim.
+fn removal_claim(name: &str) -> String {
+    match name.strip_prefix(&format!("{SOURCE_DIR}/")) {
+        Some(rest) => source_claim(key_of(rest)),
+        None => entry_claim(key_of(name)),
+    }
+}
+
+/// Remove one directory by renaming it out of the namespace first, so a lookup either sees
+/// it whole or does not see it. A kill during the delete leaves `<name>.evict-<pid>`, which
+/// no lookup reads and the next sweep removes.
+fn remove_tree(path: &Path) -> Result<u64> {
+    let bytes = crate::setup::dir_size(path);
+    let name = file_name(path);
+    let doomed = path.with_file_name(format!("{name}{EVICTING}{}", std::process::id()));
+    std::fs::rename(path, &doomed).with_context(|| format!("moving {} aside", path.display()))?;
+    std::fs::remove_dir_all(&doomed).with_context(|| format!("removing {}", doomed.display()))?;
+    Ok(bytes)
+}
+
+/// The bytes a manifest's segment table accounts for, without the manifest itself.
+fn segment_bytes(segments: &[Segment]) -> u64 {
+    segments.iter().map(|segment| segment.bytes).sum()
+}
+
+/// Note where a manifest and its files disagree. A manifest that names more than the
+/// directory holds has been truncated or lived through a bad delete; one that names less
+/// has a stray file, which is what a killed segment write leaves.
+fn account_size(usage: &mut Usage, actual: u64, recorded: u64) {
+    if recorded > actual {
+        usage.overstated_entries += 1;
+    } else {
+        usage.unaccounted_bytes += actual - recorded;
+    }
+}
+
+/// A byte count as `flacify cache` and `diagnose` print it.
+pub fn human_bytes(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1_000_000_000 => format!("{:.1} GB", b as f64 / 1e9),
+        b if b >= 1_000_000 => format!("{:.1} MB", b as f64 / 1e6),
+        b if b >= 1_000 => format!("{:.0} kB", b as f64 / 1e3),
+        b => format!("{b} bytes"),
     }
 }
 
@@ -511,6 +1241,9 @@ impl Cache {
 /// leaves everything it recorded readable and resumable. Only `finish` marks it complete.
 #[derive(Debug)]
 pub struct EntryWriter {
+    /// Held for as long as the writer lives, refreshed as segments land, so eviction leaves
+    /// a render in progress alone however long it runs.
+    in_use: InUse,
     dir: PathBuf,
     meta: Meta,
     is_finished: bool,
@@ -544,6 +1277,7 @@ impl EntryWriter {
             self.dir.display(),
             planar.len() / 2
         );
+        self.in_use.refresh();
 
         let name = segment_name(index);
         let path = self.dir.join(&name);
@@ -1686,9 +2420,17 @@ mod tests {
             })
             .collect();
 
+        let mut meta = stored_meta(&cache, "key");
+        meta.last_used = 1;
+        store_meta(&cache, "key", &meta);
+
         let mut resumed = cache
             .begin("key", &spec(frames, &fields))
             .expect("resuming");
+        assert!(
+            stored_meta(&cache, "key").last_used > 1,
+            "resuming a partial entry is using it"
+        );
         let error = resumed
             .write_segment(0, &segment_planar(&render, frames, 0))
             .expect_err("a recorded segment is not rewritten");
@@ -2282,6 +3024,575 @@ mod tests {
         let actual = source_hash(&path).expect("hashing the file");
         assert_eq!(actual, expected[..32]);
         assert_eq!(actual.len(), 32);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Store a one-segment entry and set its LRU clock, so the order under test is the
+    /// test's decision and not the wall clock's. Returns the bytes the entry occupies.
+    fn store_one(cache: &Cache, key: &str, last_used: u64) -> u64 {
+        cache
+            .store(
+                key,
+                &render_of(SEGMENT_FRAMES),
+                12_000,
+                &fields_with_short_segments(),
+            )
+            .expect("storing");
+        let mut meta = stored_meta(cache, key);
+        meta.last_used = last_used;
+        store_meta(cache, key, &meta);
+        crate::setup::dir_size(&cache.entry_dir(key))
+    }
+
+    fn names(removals: &[Removal]) -> Vec<&str> {
+        removals
+            .iter()
+            .map(|removal| removal.name.as_str())
+            .collect()
+    }
+
+    /// A cache root with a wav in it and a built tier under the hash the entry records.
+    fn tier_fixture(name: &str, source_hash: &str) -> (PathBuf, Cache, crate::source::Tier) {
+        let root = temp_cache(name);
+        std::fs::create_dir_all(&root).expect("creating the cache root");
+        let wav = root.join("source.wav");
+        crate::wav::write(&wav, 48_000, 2, &pcm_for_containers()).expect("writing the source");
+        let tier = crate::source::Tier::new(&root, SEGMENT_FRAMES).expect("a tier");
+        let entry = tier
+            .build_or_reuse(&wav, source_hash)
+            .expect("building the tier");
+        drop(entry);
+        (root.clone(), Cache::new(root), tier)
+    }
+
+    #[test]
+    fn given_a_cache_under_its_cap_when_evicted_then_nothing_is_removed() {
+        let root = temp_cache("evict-under-cap");
+        let cache = Cache::new(root.clone());
+        store_one(&cache, "key", 100);
+        let usage = cache.usage();
+
+        let plan = cache.eviction_plan(usage.total());
+        assert!(plan.sweeps.is_empty(), "{:?}", plan.sweeps);
+        assert!(plan.tiers.is_empty(), "{:?}", plan.tiers);
+        assert!(plan.entries.is_empty(), "{:?}", plan.entries);
+        assert_eq!(plan.after, usage.total());
+
+        let outcome = cache.evict(&plan).expect("evicting nothing");
+        assert_eq!(outcome.removals(), 0);
+        assert_eq!(outcome.after, usage.total());
+        assert!(cache.load("key").expect("loading").is_some());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_three_entries_over_the_cap_when_evicted_then_only_the_oldest_goes_and_the_total_is_under_the_cap(
+    ) {
+        let root = temp_cache("evict-cap");
+        let cache = Cache::new(root.clone());
+        let oldest = store_one(&cache, "a", 100);
+        store_one(&cache, "b", 200);
+        store_one(&cache, "c", 300);
+        let usage = cache.usage();
+        assert_eq!(usage.rendered.entries, 3);
+        let cap = usage.total() - oldest;
+
+        let plan = cache.eviction_plan(cap);
+        assert_eq!(names(&plan.entries), ["a"]);
+        assert_eq!(plan.after, usage.total() - oldest);
+
+        let outcome = cache.evict(&plan).expect("evicting");
+        assert_eq!(names(&outcome.entries), ["a"]);
+        assert!(outcome.after <= cap, "{} > {cap}", outcome.after);
+        assert_eq!(cache.usage().rendered.entries, 2);
+        assert!(cache.load("a").expect("a miss").is_none());
+        assert!(cache.load("b").expect("loading").is_some());
+        assert!(cache.load("c").expect("loading").is_some());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_partial_entry_older_than_a_complete_one_when_evicted_then_the_partial_goes_first() {
+        let root = temp_cache("evict-partial");
+        let cache = Cache::new(root.clone());
+        let (fields, frames, _) = four_segments();
+        let partial_bytes;
+        {
+            let mut writer = cache
+                .begin("half", &spec(frames, &fields))
+                .expect("beginning a partial entry");
+            writer
+                .write_segment(0, &render_of(SEGMENT_FRAMES).planar)
+                .expect("writing a segment");
+            writer.abandon();
+            let mut meta = stored_meta(&cache, "half");
+            meta.last_used = 100;
+            store_meta(&cache, "half", &meta);
+            partial_bytes = crate::setup::dir_size(&cache.entry_dir("half"));
+        }
+        store_one(&cache, "done", 200);
+        let usage = cache.usage();
+        assert_eq!(usage.partial.entries, 1);
+        assert_eq!(usage.rendered.entries, 1);
+
+        let plan = cache.eviction_plan(usage.total() - partial_bytes);
+        assert_eq!(names(&plan.entries), ["half"], "the LRU clock decides");
+        assert_eq!(plan.entries[0].bytes, partial_bytes);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_two_entries_when_the_older_is_read_then_the_newer_is_evicted_instead() {
+        let root = temp_cache("evict-lru");
+        let cache = Cache::new(root.clone());
+        let bytes = store_one(&cache, "old", 100);
+        store_one(&cache, "new", 200);
+        let total = cache.usage().total();
+        let cap = total - bytes;
+
+        let plan = cache.eviction_plan(cap);
+        assert_eq!(
+            names(&plan.entries),
+            ["old"],
+            "stored oldest, so chosen first"
+        );
+
+        // Reading an entry is using it, and the manifest says so.
+        cache.segments("old").expect("opening").expect("an entry");
+        let total = cache.usage().total();
+        let cap = total - crate::setup::dir_size(&cache.entry_dir("new"));
+        let plan = cache.eviction_plan(cap);
+        assert_eq!(
+            names(&plan.entries),
+            ["new"],
+            "the read moved old out of the way"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_an_entry_open_for_reading_when_evicted_then_it_is_kept_and_named_in_the_plan() {
+        let root = temp_cache("evict-open");
+        let cache = Cache::new(root.clone());
+        store_one(&cache, "key", 100);
+
+        let reader = cache.segments("key").expect("opening").expect("an entry");
+        let plan = cache.eviction_plan(0);
+        assert!(plan.entries.is_empty(), "{:?}", plan.entries);
+        assert_eq!(names(&plan.open), ["key"]);
+
+        let outcome = cache.evict(&plan).expect("evicting");
+        assert_eq!(outcome.removals(), 0);
+        assert!(outcome.after > 0, "the cap is not met and the plan says so");
+        assert!(cache.entry_dir("key").is_dir());
+        assert!(
+            root.join(CLAIMS).join(entry_claim("key")).exists(),
+            "the claim is on disk while the handle lives"
+        );
+        drop(reader);
+        assert!(
+            !root.join(CLAIMS).join(entry_claim("key")).exists(),
+            "closing the handle clears the claim"
+        );
+
+        let plan = cache.eviction_plan(0);
+        assert_eq!(
+            names(&plan.entries),
+            ["key"],
+            "with the reader gone it goes"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_two_orphan_tiers_when_one_covers_the_excess_then_only_that_one_is_dropped() {
+        let root = temp_cache("evict-two-tiers");
+        std::fs::create_dir_all(&root).expect("creating the cache root");
+        let wav = root.join("source.wav");
+        crate::wav::write(&wav, 48_000, 2, &pcm_for_containers()).expect("writing the source");
+        let tier = crate::source::Tier::new(&root, SEGMENT_FRAMES).expect("a tier");
+        for hash in ["a", "b"] {
+            drop(tier.build_or_reuse(&wav, hash).expect("building a tier"));
+        }
+        let cache = Cache::new(root.clone());
+        let usage = cache.usage();
+        assert_eq!(usage.source.entries, 2);
+        let cap = usage.total() - usage.source.bytes / 2;
+
+        let plan = cache.eviction_plan(cap);
+        assert_eq!(plan.tiers.len(), 1, "one tier is enough: {:?}", plan.tiers);
+        assert!(plan.entries.is_empty());
+        assert!(plan.after <= cap);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_two_renders_each_with_a_tier_when_one_tier_covers_the_excess_then_only_it_goes() {
+        let (root, cache, tier) = tier_fixture("evict-two-renders", "a");
+        let wav = root.join("source.wav");
+        drop(
+            tier.build_or_reuse(&wav, "b")
+                .expect("building the second tier"),
+        );
+        for (hash, model) in [("a", "model-a"), ("b", "model-b")] {
+            let fields = Fields {
+                source_hash: hash.into(),
+                model_id: model.into(),
+                ..fields_with_short_segments()
+            };
+            cache
+                .store(&fields.key(), &render_of(SEGMENT_FRAMES), 12_000, &fields)
+                .expect("storing");
+        }
+        let usage = cache.usage();
+        assert_eq!(usage.source.entries, 2);
+        assert_eq!(usage.rendered.entries, 2);
+        let cap = usage.total() - usage.source.bytes / 2;
+
+        let plan = cache.eviction_plan(cap);
+        assert_eq!(plan.tiers.len(), 1, "one tier is enough: {:?}", plan.tiers);
+        assert!(
+            plan.entries.is_empty(),
+            "both renders stay: {:?}",
+            plan.entries
+        );
+        assert!(plan.after <= cap);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_two_entries_that_share_a_tier_when_evicted_then_the_tier_is_named_and_counted_once() {
+        let (root, cache, tier) = tier_fixture("evict-shared-tier", "shared");
+        let first = Fields {
+            source_hash: "shared".into(),
+            model_id: "model-a".into(),
+            ..fields_with_short_segments()
+        };
+        let second = Fields {
+            model_id: "model-b".into(),
+            ..first.clone()
+        };
+        for fields in [&first, &second] {
+            cache
+                .store(&fields.key(), &render_of(SEGMENT_FRAMES), 12_000, fields)
+                .expect("storing");
+        }
+        assert_eq!(cache.usage().rendered.entries, 2);
+
+        let plan = cache.eviction_plan(0);
+        assert_eq!(
+            names(&plan.tiers),
+            ["source/shared"],
+            "the tier is one directory"
+        );
+        assert_eq!(plan.entries.len(), 2);
+        // The wav the fixture keeps in the cache root is not something eviction removes, so
+        // it is exactly what the plan says is left: a tier counted twice would say zero.
+        let wav = std::fs::metadata(root.join("source.wav"))
+            .expect("the fixture's wav")
+            .len();
+        assert_eq!(plan.after, wav);
+        cache.evict(&plan).expect("evicting");
+        assert!(!tier.entry_dir("shared").exists());
+        let usage = cache.usage();
+        assert_eq!(usage.rendered.entries, 0);
+        assert_eq!(usage.source.entries, 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_an_eviction_that_cannot_finish_then_the_entry_is_gone_rather_than_half_removed() {
+        let root = temp_cache("evict-read-only");
+        let cache = Cache::new(root.clone());
+        store_one(&cache, "key", 100);
+        let dir = cache.entry_dir("key");
+        let original = std::fs::metadata(&dir).expect("stat").permissions();
+        let mut read_only = original.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&dir, read_only).expect("making the entry read-only");
+
+        let plan = cache.eviction_plan(0);
+        let error = cache
+            .evict(&plan)
+            .expect_err("a read-only directory cannot be emptied");
+        assert!(format!("{error:#}").contains("removing"), "{error:#}");
+
+        // The rename came first, so the entry is out of the namespace even though its bytes
+        // are still there: a miss, not an error and not a half entry.
+        assert!(!dir.exists(), "the entry directory is gone from its name");
+        assert!(cache.load("key").expect("a miss, not an error").is_none());
+        let leftover = std::fs::read_dir(&root)
+            .expect("listing")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| file_name(path).starts_with(&format!("key{EVICTING}")))
+            .expect("the renamed directory is still there");
+        std::fs::set_permissions(&leftover, original).expect("restoring the permissions");
+
+        let plan = cache.eviction_plan(0);
+        assert_eq!(names(&plan.sweeps), [file_name(&leftover)]);
+        cache.evict(&plan).expect("sweeping what the failure left");
+        assert!(!leftover.exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_claim_older_than_the_stale_window_when_evicted_then_the_entry_is_not_pinned_forever()
+    {
+        let root = temp_cache("evict-stale-claim");
+        let cache = Cache::new(root.clone());
+        store_one(&cache, "key", 100);
+        let claims = root.join(CLAIMS);
+        std::fs::create_dir_all(&claims).expect("creating the claim directory");
+        let marker = claims.join(entry_claim("key"));
+
+        // A claim written by a process that died an hour ago.
+        std::fs::write(
+            &marker,
+            format!("999999 1 {}\n", now() - STALE_CLAIM_SECS - 1),
+        )
+        .expect("writing a stale claim");
+        let plan = cache.eviction_plan(0);
+        assert_eq!(
+            names(&plan.entries),
+            ["key"],
+            "a stale claim protects nothing"
+        );
+
+        // A claim written a moment ago is live, whatever the process that wrote it.
+        std::fs::write(&marker, format!("999999 2 {}\n", now())).expect("writing a live claim");
+        let plan = cache.eviction_plan(0);
+        assert!(plan.entries.is_empty(), "{:?}", plan.entries);
+        assert_eq!(names(&plan.open), ["key"]);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_reader_who_arrives_after_the_plan_when_evicted_then_the_entry_is_skipped() {
+        let root = temp_cache("evict-raced");
+        let cache = Cache::new(root.clone());
+        store_one(&cache, "key", 100);
+        let plan = cache.eviction_plan(0);
+        assert_eq!(names(&plan.entries), ["key"]);
+
+        let reader = cache.segments("key").expect("opening").expect("an entry");
+        let outcome = cache.evict(&plan).expect("evicting");
+        assert_eq!(names(&outcome.skipped), ["key"]);
+        assert_eq!(outcome.removals(), 0);
+        assert!(cache.entry_dir("key").is_dir());
+        drop(reader);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_an_entry_with_a_source_tier_when_the_tier_covers_the_excess_then_the_render_stays() {
+        let (root, cache, tier) = tier_fixture("evict-tier", "shared");
+        let fields = Fields {
+            source_hash: "shared".into(),
+            ..fields_with_short_segments()
+        };
+        cache
+            .store("key", &render_of(SEGMENT_FRAMES), 12_000, &fields)
+            .expect("storing");
+        let usage = cache.usage();
+        assert_eq!(usage.source.entries, 1);
+        assert_eq!(usage.rendered.entries, 1);
+        assert!(usage.source.bytes > 0);
+
+        let cap = usage.total() - usage.source.bytes;
+        let plan = cache.eviction_plan(cap);
+        assert_eq!(names(&plan.tiers), ["source/shared"]);
+        assert!(
+            plan.entries.is_empty(),
+            "the tier was enough, so the render is kept: {:?}",
+            plan.entries
+        );
+
+        let outcome = cache.evict(&plan).expect("evicting");
+        assert_eq!(outcome.after, cap);
+        assert!(!tier.entry_dir("shared").exists());
+        assert_eq!(
+            cache
+                .load("key")
+                .expect("loading")
+                .expect("the render")
+                .meta
+                .frames,
+            SEGMENT_FRAMES
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_an_orphan_tier_with_no_render_when_evicted_then_it_goes_before_any_entry() {
+        let (root, cache, tier) = tier_fixture("evict-orphan-tier", "orphan");
+        store_one(&cache, "key", 100);
+        let usage = cache.usage();
+        assert_eq!(usage.source.entries, 1);
+
+        let plan = cache.eviction_plan(0);
+        assert_eq!(names(&plan.tiers), ["source/orphan"]);
+        assert_eq!(names(&plan.entries), ["key"], "the entry follows its tier");
+        cache.evict(&plan).expect("evicting");
+        assert!(!tier.entry_dir("orphan").exists());
+        assert!(!cache.entry_dir("key").exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_tier_a_reader_holds_when_evicted_then_the_tier_is_kept() {
+        let (root, cache, tier) = tier_fixture("evict-tier-open", "held");
+        let reader = crate::source::Tier::new(&root, SEGMENT_FRAMES)
+            .expect("a tier")
+            .build_or_reuse(&root.join("source.wav"), "held")
+            .expect("reusing the entry");
+
+        let plan = cache.eviction_plan(0);
+        assert!(plan.tiers.is_empty(), "{:?}", plan.tiers);
+        assert!(
+            plan.open
+                .iter()
+                .any(|removal| removal.name == "source/held"),
+            "{:?}",
+            plan.open
+        );
+        let outcome = cache.evict(&plan).expect("evicting");
+        assert_eq!(outcome.removals(), 0);
+        assert!(tier.entry_dir("held").is_dir());
+        drop(reader);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_staging_directory_a_render_is_writing_when_evicted_then_it_is_left_alone() {
+        let root = temp_cache("evict-staging-claim");
+        let cache = Cache::new(root.clone());
+        let staging = root.join("key.tmp");
+        std::fs::create_dir_all(&staging).expect("creating a staging directory");
+        std::fs::write(staging.join("seg-000000.flac.tmp"), vec![0u8; 128]).expect("writing");
+
+        // What a render holds while it fills the staging directory: the claim of the entry
+        // that directory publishes.
+        let writer = cache.hold_open(&staging);
+        let plan = cache.eviction_plan(u64::MAX);
+        assert!(plan.sweeps.is_empty(), "{:?}", plan.sweeps);
+        assert_eq!(names(&plan.open), ["key.tmp"]);
+        drop(writer);
+
+        let plan = cache.eviction_plan(u64::MAX);
+        assert_eq!(
+            names(&plan.sweeps),
+            ["key.tmp"],
+            "with the writer gone it goes"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_an_unknown_version_entry_and_a_staging_directory_when_evicted_then_both_are_swept_and_counted(
+    ) {
+        let root = temp_cache("evict-sweep");
+        let cache = Cache::new(root.clone());
+        store_one(&cache, "key", 100);
+        // An entry from the version before this one.
+        store_one(&cache, "old-entry", 100);
+        let mut old_meta = stored_meta(&cache, "old-entry");
+        old_meta.version = "flacify-cache-8".into();
+        store_meta(&cache, "old-entry", &old_meta);
+        // A staging directory a killed render left.
+        let staging = root.join("killed.tmp");
+        std::fs::create_dir_all(&staging).expect("creating a staging directory");
+        std::fs::write(staging.join("seg-000000.flac"), vec![0u8; 4_096]).expect("writing");
+
+        let usage = cache.usage();
+        assert_eq!(usage.unknown.entries, 1, "the other version is unreadable");
+        assert_eq!(usage.stale.entries, 1);
+
+        let plan = cache.eviction_plan(usage.total());
+        assert_eq!(names(&plan.sweeps), ["killed.tmp", "old-entry"]);
+        assert!(
+            plan.entries.is_empty(),
+            "under the cap, so nothing else goes"
+        );
+
+        let outcome = cache.evict(&plan).expect("evicting");
+        assert_eq!(outcome.swept.len(), 2);
+        assert!(outcome.freed > 0);
+        assert!(!staging.exists());
+        assert!(!cache.entry_dir("old-entry").exists());
+        let usage = cache.usage();
+        assert_eq!(usage.unknown.entries, 0);
+        assert_eq!(usage.stale.entries, 0);
+        assert_eq!(usage.rendered.entries, 1, "the readable entry stays");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_an_eviction_interrupted_after_the_rename_then_nothing_is_readable_and_the_next_sweep_removes_it(
+    ) {
+        let root = temp_cache("evict-interrupted");
+        let cache = Cache::new(root.clone());
+        store_one(&cache, "key", 100);
+        // What `remove_tree` leaves when the process dies between its rename and its delete.
+        let doomed = root.join(format!("key{EVICTING}{}", std::process::id()));
+        std::fs::rename(cache.entry_dir("key"), &doomed).expect("moving the entry aside");
+
+        assert!(
+            cache.load("key").expect("a miss, not an error").is_none(),
+            "a half-deleted entry is never read"
+        );
+        assert!(cache
+            .segments("key")
+            .expect("a miss, not an error")
+            .is_none());
+        assert!(cache
+            .find_segments(&fields_with_short_segments())
+            .expect("a miss, not an error")
+            .is_none());
+        let usage = cache.usage();
+        assert_eq!(usage.stale.entries, 1);
+        assert_eq!(usage.rendered.entries, 0);
+
+        let plan = cache.eviction_plan(0);
+        assert_eq!(
+            names(&plan.sweeps),
+            [format!("key{EVICTING}{}", std::process::id())]
+        );
+        cache.evict(&plan).expect("sweeping");
+        assert!(!doomed.exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_an_entry_with_a_file_its_manifest_does_not_name_when_measured_then_the_bytes_are_reported(
+    ) {
+        let root = temp_cache("usage-unaccounted");
+        let cache = Cache::new(root.clone());
+        store_one(&cache, "key", 100);
+        assert_eq!(cache.usage().unaccounted_bytes, 0);
+
+        let stray = cache.entry_dir("key").join("seg-000001.flac.tmp");
+        std::fs::write(&stray, vec![7u8; 1_000]).expect("writing a stray file");
+        let usage = cache.usage();
+        assert_eq!(usage.unaccounted_bytes, 1_000);
+        assert_eq!(usage.overstated_entries, 0);
+        assert_eq!(usage.rendered.entries, 1, "it is still one entry");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_manifest_that_names_more_than_its_files_hold_when_measured_then_it_is_reported() {
+        let root = temp_cache("usage-overstated");
+        let cache = Cache::new(root.clone());
+        store_one(&cache, "key", 100);
+        let mut meta = stored_meta(&cache, "key");
+        meta.segments[0].bytes += 10_000;
+        store_meta(&cache, "key", &meta);
+
+        let usage = cache.usage();
+        assert_eq!(usage.overstated_entries, 1);
+        assert_eq!(usage.unaccounted_bytes, 0);
         std::fs::remove_dir_all(root).ok();
     }
 }

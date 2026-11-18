@@ -54,6 +54,8 @@ cargo build --release
 ./target/release/flacify batch . --dry-run     # what would render, and why each file is skipped
 ./target/release/flacify devices               # capture and playback devices, with rates and channels
 ./target/release/flacify diagnose              # -> flacify-diagnose.txt
+./target/release/flacify cache                 # what the cache holds, by kind, against its 20 GB cap
+./target/release/flacify cache --evict         # evict least recently used entries until it fits
 ```
 
 `flacify ab` renders or loads the generated side once, plays 20 six-second excerpts in a

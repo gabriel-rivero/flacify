@@ -53,6 +53,14 @@ fn main() -> Result<()> {
             splice,
         } => commands::play::run(&file, smoke, splice),
         Command::Devices => commands::devices::run(),
+        Command::Batch { dir, dry_run } => commands::batch::run(&dir, dry_run),
+        Command::Ab {
+            file,
+            trials,
+            seed,
+            export,
+        } => commands::ab::run(&file, trials, seed, export.as_deref()),
+        Command::Cache { evict, cap_gb } => commands::cache::run(evict, cap_gb),
         Command::Diagnose { out } => {
             let path = diagnose::run(out)?;
             println!("wrote {}", path.display());

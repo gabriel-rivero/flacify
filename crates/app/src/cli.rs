@@ -57,6 +57,36 @@ pub(crate) enum Command {
     },
     /// List the capture and playback devices, with the rate and channels each defaults to.
     Devices,
+    /// Render every audio file under a folder, in order, skipping what is already done.
+    Batch {
+        /// Folder to walk. Every file symphonia can probe is a candidate.
+        dir: PathBuf,
+        /// List what would render and why it is skipped, without touching the model.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Blind A/B trials between the original and the generated high band, with a report.
+    Ab {
+        file: PathBuf,
+        /// Number of trials. Each one asks which of the two excerpts is the generated one.
+        #[arg(long, default_value_t = 20)]
+        trials: u32,
+        /// Replay seed. The same seed asks the same order with the same excerpts.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Where to write the report; defaults next to the file as `<name>.flacify-ab.md`.
+        #[arg(long)]
+        export: Option<PathBuf>,
+    },
+    /// Show the render cache's size, or evict entries until it fits the cap.
+    Cache {
+        /// Evict least-recently-used entries until the cache is under the cap.
+        #[arg(long)]
+        evict: bool,
+        /// Cap in gigabytes. Defaults to the configured 20.
+        #[arg(long)]
+        cap_gb: Option<f64>,
+    },
     /// Write a text file with versions, paths and install state for a bug report.
     Diagnose {
         /// Defaults to flacify-diagnose.txt in the current directory.

@@ -234,14 +234,15 @@ pub struct LivePolicy {
     pub resident_bytes: usize,
     /// Sustained RTF below 1.0.
     pub is_real_time: bool,
-    /// The buffer covers one worst-case call.
-    pub can_hold: bool,
+    /// A single worst-case call cannot drain more than the buffer holds.
+    pub is_worst_case_real_time: bool,
 }
 
 /// Decide what one preset costs on this machine.
 ///
 /// `device_buffer_frames` is the device's own buffer, which the UI adds to the latency
-/// it prints.
+/// it prints. `probe` must be measured at this preset's window: fixed per-call cost is
+/// a larger share of a short window.
 pub fn live_policy(preset: Preset, probe: &Probe, device_buffer_frames: usize) -> LivePolicy {
     let window_frames = preset.frames();
     let window_secs = frames_to_secs(window_frames);
@@ -266,7 +267,7 @@ pub fn live_policy(preset: Preset, probe: &Probe, device_buffer_frames: usize) -
         total_latency_secs: window_secs + buffer_secs + device_secs,
         resident_bytes: RING_SIDES * buffer_frames * CHANNELS * BYTES_PER_SAMPLE,
         is_real_time: rtf_sustained < 1.0,
-        can_hold: buffer_secs >= window_secs * rtf_p95,
+        is_worst_case_real_time: rtf_p95 < 1.0,
     }
 }
 
@@ -389,10 +390,16 @@ mod tests {
             "total",
             "resident",
             "rt",
-            "hold"
+            "worst"
         );
         for (preset, window_frames, buffer_frames, window_secs, resident_bytes) in expected {
             let policy = live_policy(preset, &M5_PROBE, DEVICE_FRAMES);
+            let real_time = if policy.is_real_time { "yes" } else { "no" };
+            let worst_case = if policy.is_worst_case_real_time {
+                "yes"
+            } else {
+                "no"
+            };
             println!(
                 "{:<8} {:>7} {:>7} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>10} {:>4} {:>5}",
                 policy.preset.label(),
@@ -403,8 +410,8 @@ mod tests {
                 policy.device_latency_secs,
                 policy.total_latency_secs,
                 policy.resident_bytes,
-                if policy.is_real_time { "yes" } else { "no" },
-                if policy.can_hold { "yes" } else { "no" },
+                real_time,
+                worst_case,
             );
             assert_eq!(policy.window_frames, window_frames);
             assert_eq!(policy.buffer_frames, buffer_frames);
@@ -414,7 +421,7 @@ mod tests {
             assert_close(policy.total_latency_secs, window_secs * 2.0 + device_secs);
             assert_eq!(policy.resident_bytes, resident_bytes);
             assert!(policy.is_real_time);
-            assert!(policy.can_hold);
+            assert!(policy.is_worst_case_real_time);
         }
     }
 
@@ -434,34 +441,35 @@ mod tests {
     }
 
     #[test]
-    fn given_a_cpu_class_probe_when_planned_then_it_is_not_real_time() {
-        // 3x real time cannot sustain playback, and the 1.25 safety factor makes the
-        // buffer 3.75 windows, so the worst-case call still fits. `can_hold` stays
-        // true, which is what the pinning test below records.
+    fn given_a_cpu_class_probe_when_planned_then_neither_check_passes() {
+        // 3x real time cannot sustain playback, and a p95 call drains three windows.
+        // The 1.25 safety factor makes the buffer 3.75 windows, which covers the
+        // drain but does not make playback keep up.
         let policy = live_policy(Preset::Eight, &Probe::from_rtf(3.0), DEVICE_FRAMES);
         assert!(!policy.is_real_time);
-        assert!(policy.can_hold);
+        assert!(!policy.is_worst_case_real_time);
         assert_close(policy.buffer_latency_secs, 5.12 * 3.0 * 1.25);
     }
 
     #[test]
-    fn given_a_fast_probe_when_planned_then_it_is_real_time_and_the_buffer_holds() {
+    fn given_a_fast_probe_when_planned_then_both_checks_pass() {
         let policy = live_policy(Preset::Four, &Probe::from_rtf(0.5), DEVICE_FRAMES);
         assert!(policy.is_real_time);
-        assert!(policy.can_hold);
+        assert!(policy.is_worst_case_real_time);
     }
 
     #[test]
-    fn given_any_measured_probe_when_planned_then_can_hold_is_true() {
-        // ceil(w * r * 1.25) is at least w * r, and the one-window floor adds more,
-        // so the buffer always covers the p95 call and `can_hold` guards nothing.
-        // Pinned so a formula change shows up here rather than in the UI.
-        for rtf in [0.05, 0.5, 0.8, 1.0, 3.0, 9.0] {
-            for preset in Preset::ALL {
-                let policy = live_policy(preset, &Probe::from_rtf(rtf), DEVICE_FRAMES);
-                assert!(policy.can_hold, "rtf {rtf} at {}", preset.label());
-            }
-        }
+    fn given_a_jittery_probe_when_planned_then_only_the_sustained_check_passes() {
+        // The average keeps up but a p95 call drains 1.4 windows, so the UI has to arm
+        // passthrough even though the sustained ratio says real time.
+        let probe = Probe {
+            rtf_p50: 0.70,
+            rtf_p95: 1.40,
+            rtf_sustained: 0.90,
+        };
+        let policy = live_policy(Preset::Two, &probe, DEVICE_FRAMES);
+        assert!(policy.is_real_time);
+        assert!(!policy.is_worst_case_real_time);
     }
 
     #[test]
@@ -496,9 +504,13 @@ mod tests {
     }
 
     #[test]
-    fn given_exactly_real_time_when_planned_then_it_is_not_real_time() {
-        assert!(!live_policy(Preset::Two, &Probe::from_rtf(1.0), 0).is_real_time);
-        assert!(live_policy(Preset::Two, &Probe::from_rtf(0.999), 0).is_real_time);
+    fn given_exactly_real_time_when_planned_then_neither_check_passes() {
+        let exactly = live_policy(Preset::Two, &Probe::from_rtf(1.0), 0);
+        assert!(!exactly.is_real_time);
+        assert!(!exactly.is_worst_case_real_time);
+        let under = live_policy(Preset::Two, &Probe::from_rtf(0.999), 0);
+        assert!(under.is_real_time);
+        assert!(under.is_worst_case_real_time);
     }
 
     #[test]
@@ -537,6 +549,7 @@ mod tests {
             assert!(policy.total_latency_secs.is_finite());
             assert_eq!(policy.buffer_frames, GRANULE);
             assert!(policy.is_real_time);
+            assert!(policy.is_worst_case_real_time);
         }
     }
 }

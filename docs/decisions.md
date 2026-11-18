@@ -1,6 +1,6 @@
 # Decisions
 
-Status: draft, 2026-11-12. One page per decision: context, decision, consequences.
+Status: current, 2026-11-18. One page per decision: context, decision, consequences.
 Reopen a decision by adding a superseding ADR, not by editing the old one.
 
 ---
@@ -302,6 +302,50 @@ nobody asked for a service.
   blocks its caller.
 - One worker means two renders never overlap. The cancellation token, not concurrency, is
   what makes a file switch quick.
+
+---
+
+## ADR-014 — One live pipeline for files, capture and the sink
+
+**Status:** accepted, v1.0. Plan: [`v1.0-plan.md`](v1.0-plan.md), decisions D1–D4, D11–D16.
+
+**Context:** the roadmap's v1.0 matrix has two cells — a bounded file path and a bounded
+capture path — but they differ only in who produces the audio. The player already has
+three file-shaped sources (`Whole`, `Progressive`, `Segmented`), each with its own
+answers about starvation, position and the A/B ramp, and a fourth hand-written variant
+would multiply that. At the same time the underrun policy has to change: a starved
+segmented fill holds the playhead and writes silence (`player.rs:358-364`), which is
+right for a missing cache segment and wrong for live audio, where silence is a gap.
+
+**Decision:**
+
+- `Source::Live` takes a `Feed`: the decoder for a file, the capture stream for the sink.
+  The mixer, ramp, A/B, level match and starvation policy are the same code for both.
+- Bounded wet and dry rings, with credit backpressure: the producer waits while the wet
+  ring holds more than the buffer budget, so memory is `2 × budget × channels`, not the
+  track length.
+- Starvation plays the dry side from the delay ring, increments a dropout counter, and
+  leaves A/B disabled with a stated reason until the buffer refills. Never a gap, never a
+  silent stall.
+- The live path is opt-in (`play --live`, `flacify sink`) in 1.0. The default first play
+  keeps the progressive path; making the bounded path the default is 1.1's change, after
+  the acceptance run has evidence.
+- The sink routes between named devices and requires the user's loopback. No driver is
+  bundled or linked; BlackHole is a documented prerequisite.
+- Window length is a render parameter, so it joins the cache key and the source tier's
+  identity. A preset that changes the frame grid must not error on an existing tier.
+
+**Consequences:**
+
+- One audio path to review instead of three-and-a-half; a change to the ramp or the
+  starvation policy is made once.
+- `Progressive` remains for the default path until 1.1, so the codebase is larger than the
+  end state for one release. The plan says so rather than hiding it.
+- A preset costs a fresh source tier and a fresh render, which is disk and time, and it is
+  the honest cost of changing the model window.
+- The macOS `.app` must carry `NSMicrophoneUsageDescription` or the sink dies at the TCC
+  prompt; the release workflow owns that plist.
+- No A/V sync claim: the sink is delayed by at least one window, always.
 
 ---
 

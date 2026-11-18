@@ -1,6 +1,6 @@
 # Vision
 
-Status: draft, 2026-11-12.
+Status: current, 2026-11-18.
 
 ## One sentence
 

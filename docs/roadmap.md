@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: draft, 2026-11-16. Estimates assume one developer at roughly 20 h/week, so
+Status: current for v1.0, 2026-11-18. Estimates assume one developer at roughly 20 h/week, so
 treat them as ±50% and as ordering, not commitments.
 
 ## The shape of it
@@ -203,14 +203,30 @@ each one.
 
 ## v1.0 — utility
 
-- Real-time mode: what the PoC does today, done with a policy object instead of a separate
-  code path — a bounded queue whose depth comes from the measured RTF, latency presets
-  0.64 / 1.28 / 2.56 / 5.12 s with the quality tradeoff in the UI, and an underrun policy
-  that emits passthrough and never a gap.
-- Optional live capture source (input device), which is the same code the system sink needs.
-- System-wide sink: virtual output device, "enhance everything" mode.
-- Batch: drop a folder, render to cache, progress, resume, skip list.
-- A blind A/B report you can export and share, which is the marketing asset.
+The first release where audio arrives while it is still happening, and the first one
+worth pointing at a library rather than a file. [`v1.0-plan.md`](v1.0-plan.md) is the
+working plan: decisions, risks and waves.
+
+- **`play --live [--window 1|2|4|8]`**: one live pipeline with two feeds (a file and a
+  capture stream), bounded wet/dry rings, credit backpressure, and passthrough with a
+  dropout counter on starvation. Latency presets are 0.64 / 1.28 / 2.56 / 5.12 s, each
+  labelled with the latency it costs. Opt-in: the default play of an uncached file keeps
+  the progressive path (D13).
+- **`flacify sink --from <loopback> --to <device>`**: macOS only, routing through
+  BlackHole or whatever loopback the user installed. No driver ships, nothing is bundled,
+  Windows is documented as unsupported (D4).
+- **`flacify batch <dir>`**: sorted walk, skip a complete entry, isolate failures, keep
+  going, resume after a kill, exit non-zero, skip list next to the cache.
+- **`flacify ab <file>`**: blind trials with randomised order and a fixed replay seed,
+  promotion disabled for the run, a report that states the measured level match.
+
+1.0 also closes what 0.4 left open: cache eviction and accounting (V4-7), the waveform and
+spectrum on the segment path (V4-9), and the 60-minute acceptance run (V4-10). It does
+not include bounded memory on the default first play or playhead-priority rendering;
+both wait for 1.1, and the release notes say so.
+
+The build work is single-sourcing the version, adding a macOS CI job, and packaging
+parameters — not adding platforms, which 0.3 and 0.4 already shipped.
 
 ## Gaps found building the prototype (2026-11-12)
 
@@ -426,10 +442,8 @@ the second has no trigger yet.
 
 | item | why it waits | what brings it back |
 |---|---|---|
-| The 60-minute acceptance run (V4-10) | The memory and seek numbers were measured on a synthetic entry; the end-to-end hour with zero-dropout counting and a 55:00 seek needs an hour of audio and a quiet machine. | the next release, or the first report of a dropout on a long track |
-| Cache eviction and accounting (V4-7) | Eviction needs a policy for two entry kinds (rendered and source) and a decision on whether a full-band load may skip the source tier. Nothing evicts today, so the cache grows with every render. | the cache directory passing a few GB, or a full disk |
-| Waveform and spectrum on the segment path (V4-9) | Those views read the whole-track buffers that segment playback removed, so cached playback draws neither. The peaks are already stored per second in the source manifest. | the next release's UI work |
-| Bounded memory on the first play (V4-8c) | The progressive path holds the decoded track and a frontier that never releases a published second: about 1.4 GB each per hour. Only a complete entry is bounded. | a 60-minute uncached first play, or any low-memory report |
+| Playhead-priority rendering and seek-during-render (V4-6 remainder) | The renderer walks segments in order, so a seek into an unrendered part of a track renders everything before it. `docs/v1.0-plan.md` D14 keeps it out of 1.0. | the first report of a long seek during a cold render, or 1.1 |
+| Bounded memory on the first play (V4-8c) | The progressive path holds the decoded track and a frontier that never releases a published second: about 1.4 GB each per hour. Only a complete entry is bounded. 1.0's bounded rings serve `--live`, not the default path (D13). | 1.1, after `--live` has evidence |
 | macOS signing and notarisation (E7-4) | Needs a paid Apple Developer certificate. The unsigned `.dmg` installs with right-click → Open, or `xattr -dr com.apple.quarantine`. Deferred 2026-11-17; it will be paid for eventually. | the certificate, or a release handed to anyone who will not read the README |
 | Windows and Linux code signing | Same shape: a certificate and a price, and SmartScreen/AV warnings do not block the install. | the certificate |
 | RAM/VRAM detection for the hardware gate | The CPU warning and passthrough cover the case that hurts (v0.3 exit). | a report of the app wedging a low-memory machine |

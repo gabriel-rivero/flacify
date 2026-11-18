@@ -1,6 +1,6 @@
 # Risks
 
-Status: draft, 2026-11-12. Likelihood and impact are H/M/L. "Trigger" is the signal
+Status: current, 2026-11-18. Likelihood and impact are H/M/L. "Trigger" is the signal
 that tells you it happened, which is more useful than the score.
 
 ## The five that decide whether this ships
@@ -60,7 +60,7 @@ artifact. Trigger: you catch yourself saying "it sounds better to me".
 | R10 | A/B desyncs and the comparison lies | M | H | fixed-depth backpressure, disable A/B when depth is short | toggle changes content position |
 | R11 | cache grows without bound | M | M | LRU cap, manifest, per-key sizes, show usage | disk complaints |
 | R12 | 3.3 GB download fails on flaky networks | H | M | resume, checksum, mirror, manual-file escape hatch | support threads about "download stuck" |
-| R13 | macOS notarisation blocks first launch | M | M | Developer ID at v0.5, test on a clean machine | Gatekeeper dialog |
+| R13 | macOS notarisation blocks first launch | M | M | deferred; unsigned `.dmg` with right-click → Open, documented per release | Gatekeeper dialog |
 | R14 | loudness matching pumps on dynamic music | M | M | BS.1770 momentary, 1 s smoothing, dynamic-track test | audible breathing on toggle |
 | R15 | stereo image shifts (channels enhanced independently) | M | M | evaluate mid/side; keep the stereo tensor joint through the model | narrow/wide A/B difference |
 | R16 | hallucination on transients and sibilance | M | M | bypass on full-band input; artifact metrics; per-genre corpus | "sounds metallic/smeared" |
@@ -68,6 +68,11 @@ artifact. Trigger: you catch yourself saying "it sounds better to me".
 | R18 | scope creep turns a demo into a media manager | H | M | the MVP cut table is a contract; new features go to `v2+` | playlists appear in the design |
 | R19 | Python tooling rots (torch/CUDA drift) | M | L | pin the export environment in a container | export stops reproducing |
 | R20 | solo-project bus factor | M | M | docs are the deliverable (this set), one-command `diagnose` | you cannot resume after 3 weeks away |
+| R21 | the model sounds wrong at 1–2 granules (v1.0 presets) | M | H | spike S1 measures each preset and the human listens before the UI offers it | 0.64 s clearly broken on two of the five tracks → drop that preset |
+| R22 | capture and output clocks drift (~30–100 ppm) | H | M | spike S2 measures 10 minutes and names the correction; a restart-on-drift fallback beats a click | drift > 50 ms after correction, or the correction is audible |
+| R23 | macOS TCC refuses the input device in an unsigned app | M | H | `NSMicrophoneUsageDescription` in the shipped plist; `flacify sink` from a terminal as the fallback | the prompt cannot be satisfied on a build we can produce |
+| R24 | parallel agents change `Mixer::fill` without a failing test | M | M | wave review rejects any such diff; the audio path has one owner at a time | a merged diff changes mix behaviour with no test that failed before it |
+| R25 | a window preset hard-errors the source tier | H | M | the tier is keyed by the frame grid, not just the file (v1.0 D11) | a second preset on the same file fails |
 
 ## Accepted risks
 

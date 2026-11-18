@@ -1,6 +1,6 @@
 # Architecture
 
-Status: draft, 2026-11-12. Written against the recommended option in each ADR
+Status: current for v1.0, 2026-11-18. Written against the recommended option in each ADR
 ([`decisions.md`](decisions.md)).
 
 ## Overview

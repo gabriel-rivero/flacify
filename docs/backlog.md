@@ -1,6 +1,6 @@
 # Backlog
 
-Status: draft, 2026-11-12. Issue drafts are written to be pasted into `gh issue
+Status: current, 2026-11-18. Issue drafts are written to be pasted into `gh issue
 create` as-is. Labels: `epic`, `spike`, `p0`, `dsp`, `audio`, `ui`, `platform`,
 `quality`, `legal`, `docs`.
 
@@ -77,12 +77,12 @@ doc line that would have been wrong. No issue closes on "works on my machine".
 | E5-5 | LRU eviction with a user cap, never evict the open file | cap respected; manifest survives |
 | E5-6 | Re-render only invalidated segments on parameter change | changing overlap re-renders 0 segments when it should |
 
-## E6 — Real-time mode (v0.4)
+## E6 — Real-time mode (v1.0, was labelled v0.4)
 
 | # | title | acceptance |
 |---|---|---|
 | E6-1 | Bounded queue policy with RTF-derived depth | no underrun at RTF 0.5, passthrough at 1.1 |
-| E6-2 | Latency presets, with the quality cost stated in the UI | each preset measured and labelled |
+| E6-2 | Latency presets, with the quality cost stated in the UI | each preset measured and labelled — S1 measures, the human gives the verdict |
 | E6-3 | Live capture source (`cpal` input) | 10 minutes of capture with no drift |
 | E6-4 | Device hot-swap and sleep/wake recovery | unplug a headset mid-play, recover in < 2 s |
 
@@ -107,6 +107,20 @@ doc line that would have been wrong. No issue closes on "works on my machine".
 | E8-4 | Blind A/B harness (randomised, level-matched) | produces a report you can attach to a release |
 | E8-5 | Bypass rule for full-band input | a FLAC source is passed through untouched |
 | E8-6 | Classify "already full-band" from the spectrum, not the cutoff | `high_band_ratio ≥ 0.01` above 21 kHz flags full-band; a 16 kHz-limited source measures 1e-6, so the threshold has four decades of headroom and `cutoff ≥ 24000` stops being the rule (it almost never fires on real music) |
+
+## E9 — Utility release (v1.0)
+
+Shapes and wave order are in [`v1.0-plan.md`](v1.0-plan.md); this is the issue list.
+
+| # | title | acceptance |
+|---|---|---|
+| E9-1 | `flacify sink --from <loopback> --to <device>` | 10 minutes from BlackHole to headphones, drift corrected, no click, A/B works, latency stated |
+| E9-2 | `flacify batch <dir>` | a 20-file folder renders once; a killed batch resumes without redoing a file; one unreadable file does not stop the rest |
+| E9-3 | `flacify ab <file>` blind harness | N trials, seed-replayable order, truth logged per trial, report states the measured level match and fails over 0.5 dB |
+| E9-4 | Cache eviction and accounting (was V4-7) | 20 GB cap, LRU by manifest `last_used`, the open entry never evicted, source tier before render, unknown versions swept |
+| E9-5 | Waveform and spectrum on the segment path (was V4-9) | a cache-hit play draws both from the source peaks and the resident segment, with no whole-track buffer |
+| E9-6 | Release plumbing | dry run on a branch produces 1.0.0 in every artifact name, the `.dmg` plist and the package metadata |
+| E9-7 | 60-minute acceptance (was V4-10) | zero dropouts, seek to 55:00 after the render, second play 0 s GPU, rows in `measurements.md` |
 
 ## E9 — Docs and demo
 

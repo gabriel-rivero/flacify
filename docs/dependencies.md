@@ -1,6 +1,6 @@
 # Dependencies
 
-Status: draft, 2026-11-12. Versions are deliberately unpinned; pin them in
+Status: current, 2026-11-18. Versions are deliberately unpinned; pin them in
 `Cargo.toml` at v0.1 and let `cargo update` move them.
 
 The rule: **the shipped binary must not contain Python.** If a dependency needs a
@@ -165,5 +165,11 @@ redistribute. Three mitigations, in order of preference:
    the product's future.
 3. If neither works, keep flacify a personal/OSS research tool with a clear notice,
    and do not ship a signed consumer build.
+
+**Status 2026-11-18:** mitigation 2 is unanswered — no issue has been filed and no reply
+exists. 1.0 ships under mitigation 1: weights downloaded at first run, never bundled,
+attributed in the release notes, unsigned, with a notice that the weights are the author's
+and are not covered by this project's MIT licence. Filing the issue is still the right
+move; it changes 1.1's options, not 1.0's.
 
 `cargo-deny` covers our crates; the model is a manual gate in the release checklist.

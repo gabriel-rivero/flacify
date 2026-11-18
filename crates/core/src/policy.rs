@@ -212,8 +212,6 @@ impl Preset {
 
 /// Headroom over the p95 render ratio, so one call slower than p95 still leaves audio.
 const BUFFER_SAFETY: f64 = 1.25;
-/// The live buffer is a wet ring and a dry ring, each holding the same span.
-const RING_SIDES: usize = 2;
 const CHANNELS: usize = 2;
 const BYTES_PER_SAMPLE: usize = 4;
 
@@ -222,7 +220,7 @@ const BYTES_PER_SAMPLE: usize = 4;
 pub struct LivePolicy {
     pub preset: Preset,
     pub window_frames: usize,
-    /// Frames in one side of the wet/dry ring pair.
+    /// Frames of buffer in the wet ring; the dry ring also carries the alignment delay.
     pub buffer_frames: usize,
     /// The window the model must see before it can emit, which floors the latency.
     pub model_latency_secs: f64,
@@ -230,7 +228,8 @@ pub struct LivePolicy {
     pub device_latency_secs: f64,
     /// Model plus buffer plus device: the number the UI prints.
     pub total_latency_secs: f64,
-    /// Wet and dry rings together.
+    /// Wet buffer, dry buffer and the dry side's alignment delay. The model's input
+    /// window is not counted.
     pub resident_bytes: usize,
     /// Sustained RTF below 1.0.
     pub is_real_time: bool,
@@ -256,6 +255,8 @@ pub fn live_policy(preset: Preset, probe: &Probe, device_buffer_frames: usize) -
     let buffer_frames = (worst_case_frames.ceil() as usize).max(window_frames);
     let buffer_secs = frames_to_secs(buffer_frames);
     let device_secs = frames_to_secs(device_buffer_frames);
+    // The dry side is delayed by the model window so it lines up with the wet side.
+    let dry_frames = buffer_frames + window_frames;
 
     LivePolicy {
         preset,
@@ -265,7 +266,7 @@ pub fn live_policy(preset: Preset, probe: &Probe, device_buffer_frames: usize) -
         buffer_latency_secs: buffer_secs,
         device_latency_secs: device_secs,
         total_latency_secs: window_secs + buffer_secs + device_secs,
-        resident_bytes: RING_SIDES * buffer_frames * CHANNELS * BYTES_PER_SAMPLE,
+        resident_bytes: (buffer_frames + dry_frames) * CHANNELS * BYTES_PER_SAMPLE,
         is_real_time: rtf_sustained < 1.0,
         is_worst_case_real_time: rtf_p95 < 1.0,
     }
@@ -373,10 +374,10 @@ mod tests {
             [Preset::One, Preset::Two, Preset::Four, Preset::Eight]
         );
         let expected = [
-            (Preset::One, 30_720usize, 30_720usize, 0.64, 491_520usize),
-            (Preset::Two, 61_440, 61_440, 1.28, 983_040),
-            (Preset::Four, 122_880, 122_880, 2.56, 1_966_080),
-            (Preset::Eight, 245_760, 245_760, 5.12, 3_932_160),
+            (Preset::One, 30_720usize, 30_720usize, 0.64, 737_280usize),
+            (Preset::Two, 61_440, 61_440, 1.28, 1_474_560),
+            (Preset::Four, 122_880, 122_880, 2.56, 2_949_120),
+            (Preset::Eight, 245_760, 245_760, 5.12, 5_898_240),
         ];
         let device_secs = DEVICE_FRAMES as f64 / SAMPLE_RATE as f64;
         println!(
@@ -473,10 +474,13 @@ mod tests {
     }
 
     #[test]
-    fn given_eight_granules_when_planned_then_resident_bytes_is_both_rings() {
+    fn given_eight_granules_when_planned_then_resident_bytes_is_both_rings_and_the_delay() {
         let policy = live_policy(Preset::Eight, &Probe::from_rtf(0.6), 0);
-        assert_eq!(policy.resident_bytes, 2 * policy.buffer_frames * 2 * 4);
-        assert_eq!(policy.resident_bytes, 3_932_160);
+        assert_eq!(
+            policy.resident_bytes,
+            (2 * policy.buffer_frames + policy.window_frames) * 2 * 4
+        );
+        assert_eq!(policy.resident_bytes, 5_898_240);
     }
 
     #[test]

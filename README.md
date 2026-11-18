@@ -49,6 +49,7 @@ cargo build --release
 ./target/release/flacify enhance song.mp3      # -> song.mp3.flacify.wav
 ./target/release/flacify play song.mp3         # window: space toggles, p plays, drag to seek, drop a file
 ./target/release/flacify play song.mp3 --smoke # headless audio-path check
+./target/release/flacify devices               # capture and playback devices, with rates and channels
 ./target/release/flacify diagnose              # -> flacify-diagnose.txt
 ```
 

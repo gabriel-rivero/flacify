@@ -1,8 +1,11 @@
 //! `flacify diagnose`: one text file with the facts an issue needs.
 //!
 //! It records versions, the data directory, whether the install is ready, which torch
-//! index was chosen, the cache size and the model files. Nothing is uploaded; the user
-//! decides where the file goes.
+//! index was chosen, the cache size, the device inventory and the model files. Nothing is
+//! uploaded; the user decides where the file goes.
+//!
+//! The counters are per process, so a fresh `flacify diagnose` reports zeros: what makes
+//! them useful is the same line in a pasted report when the app itself wrote it.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -10,6 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::cache::CACHE_VERSION;
+use crate::device;
 use crate::setup::{self, Paths};
 
 /// Write the report and return its path.
@@ -70,6 +74,26 @@ pub fn report(paths: &Paths) -> String {
             }
         }
     }
+
+    let _ = writeln!(text, "\ndevices");
+    match device::list() {
+        Ok(list) => {
+            for line in device::describe(&list).lines() {
+                let _ = writeln!(text, "  {line}");
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(text, "  unavailable: {error:#}");
+        }
+    }
+    let counters = device::counters();
+    let _ = writeln!(
+        text,
+        "  counters: {} stream errors, {} buffers over {} frames",
+        counters.stream_errors,
+        counters.buffer_overflows,
+        device::MAX_FRAMES
+    );
     text
 }
 
@@ -103,6 +127,8 @@ mod tests {
         assert!(text.contains("ready    false"), "{text}");
         assert!(text.contains("vae.pth missing"), "{text}");
         assert!(text.contains("0 entries"), "{text}");
+        assert!(text.contains("devices"), "{text}");
+        assert!(text.contains("counters: 0 stream errors"), "{text}");
         std::fs::remove_dir_all(root).ok();
     }
 

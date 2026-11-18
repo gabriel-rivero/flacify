@@ -48,6 +48,7 @@ fn main() -> Result<()> {
             smoke,
             splice,
         } => commands::play::run(&file, smoke, splice),
+        Command::Devices => commands::devices::run(),
         Command::Diagnose { out } => {
             let path = diagnose::run(out)?;
             println!("wrote {}", path.display());

@@ -55,6 +55,8 @@ pub(crate) enum Command {
         #[arg(long)]
         smoke: bool,
     },
+    /// List the capture and playback devices, with the rate and channels each defaults to.
+    Devices,
     /// Write a text file with versions, paths and install state for a bug report.
     Diagnose {
         /// Defaults to flacify-diagnose.txt in the current directory.

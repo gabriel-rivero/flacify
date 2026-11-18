@@ -54,6 +54,22 @@ pub(crate) enum Command {
         /// This is how a headless machine (and CI) checks the audio path.
         #[arg(long)]
         smoke: bool,
+        /// Play through the live path: bounded memory, the preset's window, and the
+        /// latency the buffer policy states. Needs a 48 kHz stereo output.
+        #[arg(long)]
+        live: bool,
+        /// Model window in granules: 1 (0.64 s), 2, 4 or 8 (5.12 s). Only used with
+        /// --live; the default is the trained window.
+        #[arg(long, default_value = "8", value_name = "1|2|4|8")]
+        window: String,
+        /// Sustained compute ratio the live buffer is sized from, in seconds per second
+        /// of audio. 0.8 is the end-to-end figure measured on the M5; the app's own
+        /// measurement replaces it with S3.
+        #[arg(long, default_value_t = 0.8)]
+        rtf: f64,
+        /// Seconds a --smoke run listens before it reports.
+        #[arg(long, default_value_t = 4.0)]
+        watch: f64,
     },
     /// List the capture and playback devices, with the rate and channels each defaults to.
     Devices,

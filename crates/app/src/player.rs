@@ -73,7 +73,6 @@ impl Controls {
     }
 
     /// Why the switch cannot be used, in the words the status line prints.
-    #[allow(dead_code)] // The live status line prints it (U1).
     pub fn enhanced_blocked(&self) -> Option<&'static str> {
         if !self.has_wet_side {
             return Some("the source has no generated side");
@@ -171,7 +170,6 @@ enum Source {
     Segmented(Arc<Reader>),
     /// A feed being read while it plays: bounded rings, passthrough when the wet side has
     /// not caught up, no known length.
-    #[allow(dead_code)] // Built by `play --live` (U1) and the sink (K1).
     Live(Arc<live::Live>),
 }
 
@@ -282,7 +280,6 @@ impl Mixer {
     ///
     /// The stream has no known length, so `controls.frames` is 0 and the end comes from the
     /// rings. The switch starts on the dry side; the user asks for the generated one.
-    #[allow(dead_code)] // Called by `play --live` (U1) and the sink (K1).
     pub fn live(source: Arc<live::Live>, sample_rate: u32) -> (Self, Arc<Controls>) {
         let channels = source.channels();
         let controls = Arc::new(Controls {

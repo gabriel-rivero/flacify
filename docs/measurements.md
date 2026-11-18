@@ -711,3 +711,48 @@ per-second RMS of every preset matches the dry file to the decibel.
 The open decision is a product one: offer all four presets with the tradeoff stated, or
 drop the short ones. A focused 18–26 s A/B of `nier-2g.wav` against `nier-8g.wav` is the
 test that settles it, and the human owns it.
+
+## Live file playback (U1), 2026-11-18
+
+`flacify play --live` streams one window at a time: the rings hold `2B + W + block` frames
+and nothing else, so an hour costs the same as a minute. M1 (the M5 Max), 2026-11-18, the
+resident worker the app spawns, the 60-minute fixture
+(`tools/fixtures/out/hour.mp3`, 192 kbps 48 kHz MP3, so the feed is already at 48 kHz;
+the 44.1 kHz path is pinned by a test against the whole-file resampler). A 60 s excerpt
+for the four-preset rows, 15 s of watching each; the acceptance row is ten minutes of the
+hour. The measured ratio is the pump's own timing per second of *played* audio.
+
+| preset | window | buffer | latency stated | measured RTF | dropouts in 15 s |
+|---|---|---|---|---|---|
+| 8 granules | 245 760 frames (5.12 s) | 245 760 (5.12 s) | 10.26 s | 0.79 | 0 |
+| 4 granules | 122 880 (2.56 s) | 122 880 (2.56 s) | 5.14 s | 0.84 | 0 |
+| 2 granules | 61 440 (1.28 s) | 61 440 (1.28 s) | 2.58 s | 0.76 | 0 |
+| 1 granule | 30 720 (0.64 s) | 30 720 (0.64 s) | 1.30 s | 0.82 | 0 |
+
+Throughput is flat across the presets (0.76–0.84), which is D19's claim measured through
+the app rather than through the worker: a preset buys latency, not speed. `--rtf`
+defaults to 0.8, the end-to-end figure these rows land on, and sizes the buffer until S3
+feeds it the app's own measurement.
+
+The ten-minute acceptance, `play <hour.mp3> --live --smoke --watch 600`:
+
+| metric | value |
+|---|---|
+| audio played | 600.00 s in 600.0 s of watching |
+| measured RTF | **0.75** over the last 147 blocks |
+| dropouts | **0** (0 starved frames) |
+| resident rings | 7 471 104 bytes, allocated once at start |
+| process RSS | 36.7 MB → 52.3 MB at startup, then **52.3 MB flat** for nine minutes |
+| switch | original; no automatic promotion on the live path |
+| machine | load average 3.7 mean, 10.7 peak, 18 cores, other applications running |
+
+The first ten-minute run, before the pump was changed to ask for the wet ring's room
+after the render instead of before it, played 600.1 s but starved **59 %** of its frames
+(17.0 M of 28.8 M): the compute and the playhead's drain took turns. That run is why the
+dry ring also carries one block over the window now, and both parts are pinned by tests.
+
+A second ten-minute run taken while the machine was busier (load average mean 8.6, peak
+41.4) is the failure case, and it behaves as D2 says: RTF **0.79**, **7 dropouts** over
+6.6 s of the 600 (1.1 %), the dry side played through each one, no gap and no silent
+stall, and the same flat RSS. A spike the producer cannot cover costs a dropout, not a
+stall, and the next block recovers it on its own.

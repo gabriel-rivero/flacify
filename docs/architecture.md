@@ -171,24 +171,36 @@ the same code for both. ADR-014 records the decision; this section records the m
 
 ```
 feed ──▶ dry ring (B + W) ──┐
-                            ├──▶ wet producer (model) ──▶ wet ring (B) ──┐
-                            │                                          ├──▶ callback
-                            └──────────── alignment delay W ───────────┘
+                            ├──▶ wet producer (model) ──▶ wet ring (B + block) ──┐
+                            │                                                   ├──▶ callback
+                            └──────────── alignment delay W ─────────────────────┘
 ```
 
 - `W` is the model window and `B` is the buffer `live_policy` derives from the measured
   RTF. The dry ring holds `B + W` because the dry side is delayed by one window: the
   wet side cannot exist earlier than that, and A/B must compare the same instant.
-- Resident audio is `(2B + W) × 2 channels × 4 bytes`. It is the rings only; the model's
-  own input window and the in-flight output block are not counted.
-- Credit backpressure: the producer blocks while the wet ring holds `B`. Nothing is
-  dropped and nothing grows; a slow model slows the producer instead of the memory.
+- One producer call renders a window and hands over one block of it, so the block is the
+  pipeline's step: `block = W - overlap` with `overlap = W / 5`, the trained window's own
+  1 s in 5.12 s. Keeping that share fixed across the presets is what keeps the compute
+  per played second flat (D19).
+- Resident audio is `(2B + W + block) × 2 channels × 4 bytes`. It is the rings only; the
+  model's own input window and the in-flight output block are not counted. The wet ring
+  carries one block over `B` so a whole-block write can land while the ring is otherwise
+  full; what the playhead can be behind is still `B`.
+- Credit backpressure: the producer blocks while the wet ring is `B` ahead of the
+  playhead. Nothing is dropped and nothing grows; a slow model slows the producer instead
+  of the memory.
+- The device starts only once the wet ring holds whole blocks that fill `B`, which is one
+  block at every preset. A call renders a window before it can hand over anything, so the
+  first call's own duration is the one dropout a careful start can prevent.
 - Starvation: when the wet side cannot cover the playhead, the callback emits the dry
   side, counts the frames, and `has_enhanced` goes false with a stated reason until the
   buffer refills. This is deliberately different from the segmented path, which holds
   the playhead and writes silence — right for a missing cache segment, wrong for live
   audio, where silence is a gap.
 - Latency is `W + B + device`, printed from `live_policy`, never implied by the preset.
+  The measured ratio is printed beside it, per second of *played* audio, so it is the
+  number to compare with 1.
 - A stream has no length, no content hash and no segments, so live audio is in memory
   only: nothing about it joins the cache.
 - A file feed has one clock. The sink has two — the capture device and the output device

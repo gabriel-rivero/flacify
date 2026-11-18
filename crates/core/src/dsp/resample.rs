@@ -15,6 +15,8 @@
 //! pushed: at most the last `post_roll()` outputs of everything pushed so far wait for
 //! the next push, and `finish()` resolves them against the end-of-input zeros.
 
+use std::borrow::Cow;
+
 use crate::error::{Error, Result};
 
 /// Ten lobes of the sinc per side, matching scipy's `half_len = 10 * max_rate`.
@@ -142,7 +144,13 @@ impl Resampler {
 
     /// Starts a pass over an input that arrives in chunks.
     pub fn chunked(&self) -> ChunkedResampler<'_> {
-        ChunkedResampler::new(self)
+        ChunkedResampler::new(Cow::Borrowed(self))
+    }
+
+    /// A chunked pass that owns the resampler, for a feed that starts once and then reads
+    /// for the life of the process (a live stream, whose setup cannot lend it out).
+    pub fn into_chunked(self) -> ChunkedResampler<'static> {
+        ChunkedResampler::new(Cow::Owned(self))
     }
 }
 
@@ -152,7 +160,7 @@ impl Resampler {
 /// the whole input, bit for bit.
 #[derive(Debug)]
 pub struct ChunkedResampler<'a> {
-    resampler: &'a Resampler,
+    resampler: Cow<'a, Resampler>,
     /// Input samples not yet dropped, oldest first, ending at the newest pushed sample.
     window: Vec<f64>,
     /// Input samples pushed so far.
@@ -162,7 +170,7 @@ pub struct ChunkedResampler<'a> {
 }
 
 impl<'a> ChunkedResampler<'a> {
-    fn new(resampler: &'a Resampler) -> Self {
+    fn new(resampler: Cow<'a, Resampler>) -> Self {
         Self {
             resampler,
             window: Vec::new(),
@@ -358,6 +366,33 @@ mod tests {
                 assert_eq!(bits(&out), bits(&whole), "{context}");
             }
         }
+    }
+
+    #[test]
+    fn given_an_owned_resampler_when_run_in_chunks_then_it_matches_the_borrowed_pass() {
+        // A live feed owns its resampler for the life of the stream, so the pass has to run
+        // without borrowing one from a caller that has already returned.
+        let r = Resampler::new(147, 160).unwrap();
+        let x = pseudo_random_signal(10_000);
+        let borrowed = {
+            let mut chunked = r.chunked();
+            let mut out = Vec::new();
+            for chunk in x.chunks(1_024) {
+                out.extend(chunked.process_chunk(chunk));
+            }
+            out.extend(chunked.finish());
+            out
+        };
+        let owned = {
+            let mut chunked = r.clone().into_chunked();
+            let mut out = Vec::new();
+            for chunk in x.chunks(1_024) {
+                out.extend(chunked.process_chunk(chunk));
+            }
+            out.extend(chunked.finish());
+            out
+        };
+        assert_eq!(bits(&borrowed), bits(&owned));
     }
 
     #[test]

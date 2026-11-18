@@ -16,14 +16,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use flacify_core::SAMPLE_RATE;
+use flacify_core::{live_policy, Preset, Probe, SAMPLE_RATE};
 use flacify_infer::python::WorkerConfig;
-use flacify_infer::WorkerSession;
+use flacify_infer::{Engine, WorkerSession};
 
 use crate::cache::{self, Cache};
 use crate::decode;
 use crate::device;
 use crate::frontier::Frontier;
+use crate::live;
 use crate::render;
 use crate::render_status::RenderStatus;
 use crate::segments;
@@ -77,6 +78,35 @@ pub fn needs_setup(error: &anyhow::Error) -> bool {
     error.downcast_ref::<NeedsSetup>().is_some()
 }
 
+/// The live stream a playback is playing: the policy its rings were sized from, and the
+/// source the panel and the status line read their counters from.
+pub struct LivePlayback {
+    pub policy: flacify_core::LivePolicy,
+    pub source: Arc<live::Live>,
+    /// The producer thread. Dropping it detaches; dropping the source stops it, and a run
+    /// that watched the stream to its end joins it to hear how it went.
+    pump: Option<live::Pump>,
+}
+
+impl LivePlayback {
+    /// Whether the producer has returned, whether or not it succeeded.
+    pub fn is_producer_finished(&self) -> bool {
+        self.pump.as_ref().is_some_and(live::Pump::is_finished)
+    }
+
+    /// Join a producer that has already returned, so its error is reported rather than
+    /// left detached. A producer still running is left alone: the window is still hearing it.
+    pub fn reap(&mut self) -> Result<()> {
+        if !self.is_producer_finished() {
+            return Ok(());
+        }
+        match self.pump.take() {
+            Some(pump) => pump.join(),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Everything one file owns. Dropping it is not enough to stop the render, because the
 /// render thread holds its own `Arc`s: call [`Playback::cancel`] first.
 pub struct Playback {
@@ -85,6 +115,8 @@ pub struct Playback {
     pub status: Option<Arc<RenderStatus>>,
     pub info: TrackInfo,
     pub path: PathBuf,
+    /// Present when this playback is a live stream rather than a file-shaped source.
+    pub live: Option<LivePlayback>,
     /// Present when a background renderer is running for this file.
     pub(crate) cancel: Option<Arc<AtomicBool>>,
 }
@@ -183,6 +215,7 @@ impl Session {
                     gain_db: 0.0,
                 },
                 path,
+                live: None,
                 cancel: None,
             });
         }
@@ -247,6 +280,7 @@ impl Session {
                     gain_db: streamed.gain_db,
                 },
                 path,
+                live: None,
                 cancel: None,
             });
         }
@@ -339,7 +373,76 @@ impl Session {
                 gain_db: 0.0,
             },
             path,
+            live: None,
             cancel: Some(cancel),
+        })
+    }
+
+    /// Open a file on the live path (`play --live`): a feed, the policy's rings, and the
+    /// real pipeline rendering one window at a time.
+    ///
+    /// Nothing here touches the cache and the track is never held whole: the analysis and
+    /// the feed both stream. The device is started only once the wet ring holds the whole
+    /// blocks that fill the policy's buffer, so the first callback cannot be the one that
+    /// starves.
+    pub fn open_live(&self, file: &Path, preset: Preset, probe: &Probe) -> Result<Playback> {
+        self.require_ready()?;
+        let FileInfo { path, name, tags } = FileInfo::of(file);
+        let analysis = live::analyse(file)?;
+        anyhow::ensure!(
+            !analysis.looks_full_band(),
+            "{} is already full-band ({:.4}% of the spectrum above 21 kHz), so live mode \
+             has nothing to generate",
+            file.display(),
+            analysis.high_band_ratio * 100.0
+        );
+
+        let policy = live_policy(preset, probe, device::PREFERRED_BUFFER_FRAMES as usize);
+        let block = live::block_frames(&policy);
+        let model = Arc::clone(&self.worker)
+            .model()
+            .context("starting the model worker")?;
+        let engine = Engine::new(model, 2, policy.window_frames, Some(analysis.cutoff_hz))?;
+        let mut renderer = live::Renderer::new(engine, policy.window_frames, block, live::SEED)?;
+        let feed = live::FileFeed::open(file)?;
+        let (source, pump) = live::Live::start(
+            Box::new(feed),
+            &policy,
+            Box::new(move |dry, wet| renderer.produce(dry, wet)),
+        )?;
+
+        let prebuffer = live::prebuffer_frames(&policy);
+        anyhow::ensure!(
+            source.wait_for_wet(0, prebuffer, live::PREBUFFER_TIMEOUT),
+            "the live buffer did not fill: {} of {prebuffer} frames were ready after {} s",
+            source.wet_ahead(0),
+            live::PREBUFFER_TIMEOUT.as_secs()
+        );
+        let device = self.worker.device().unwrap_or_else(|| "model".to_string());
+        let engine = device::AudioEngine::start_live(Arc::clone(&source))?;
+        Ok(Playback {
+            engine,
+            frontier: None,
+            status: None,
+            info: TrackInfo {
+                name,
+                title: tags.title,
+                artist: tags.artist,
+                cutoff_hz: analysis.cutoff_hz,
+                // A live stream has no length it can state up front; the panel shows the
+                // playhead alone for it.
+                audio_secs: 0.0,
+                device,
+                from_cache: false,
+                gain_db: 0.0,
+            },
+            path,
+            live: Some(LivePlayback {
+                policy,
+                source,
+                pump: Some(pump),
+            }),
+            cancel: None,
         })
     }
 
@@ -410,6 +513,7 @@ impl Session {
                     gain_db: if has_enhanced { gain_db } else { 0.0 },
                 },
                 path,
+                live: None,
                 cancel: None,
             });
         }
@@ -438,6 +542,7 @@ impl Session {
                     gain_db: 0.0,
                 },
                 path,
+                live: None,
                 cancel: None,
             });
         }
@@ -460,6 +565,7 @@ impl Session {
                 gain_db,
             },
             path,
+            live: None,
             cancel: None,
         })
     }

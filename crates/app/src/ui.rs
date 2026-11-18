@@ -15,7 +15,7 @@ use eframe::egui;
 use crate::device::{self, AudioEngine};
 use crate::frontier::Frontier;
 use crate::render_status::RenderStatus;
-use crate::session::{Playback, Session};
+use crate::session::{LivePlayback, Playback, Session};
 use crate::spectrum;
 
 /// What the window needs to know about the track, none of it expensive.
@@ -39,6 +39,8 @@ pub struct PlayerApp {
     frontier: Option<Arc<Frontier>>,
     /// Present only when this window is watching a background render.
     status: Option<Arc<RenderStatus>>,
+    /// Present only when this window is playing a live stream (`play --live`).
+    live: Option<LivePlayback>,
     info: TrackInfo,
     /// The file on screen, so an error names it and a reload knows what to ask for.
     path: PathBuf,
@@ -75,6 +77,7 @@ enum TransportSection {
     Playback,
     Progress,
     RenderStatus,
+    Live,
     Metadata,
     Disclaimer,
     StreamErrors,
@@ -84,7 +87,7 @@ enum TransportSection {
 
 /// The draw order. Add a variant here as well as to `TransportSection`; a list entry with
 /// no arm is a compile error, an arm with no list entry is a section that never draws.
-const TRANSPORT_SECTIONS: [TransportSection; 13] = [
+const TRANSPORT_SECTIONS: [TransportSection; 14] = [
     TransportSection::Heading,
     TransportSection::Toggle,
     TransportSection::Spectrum,
@@ -93,6 +96,7 @@ const TRANSPORT_SECTIONS: [TransportSection; 13] = [
     TransportSection::Playback,
     TransportSection::Progress,
     TransportSection::RenderStatus,
+    TransportSection::Live,
     TransportSection::Metadata,
     TransportSection::Disclaimer,
     TransportSection::StreamErrors,
@@ -110,14 +114,19 @@ impl PlayerApp {
             WAVEFORM_MAX_BARS,
         );
         // One second of slack before the switch is offered, so a toggle cannot land on
-        // the edge of what exists and fall back mid-ramp.
-        let promote_margin = engine.device_rate as usize;
+        // the edge of what exists and fall back mid-ramp. A live stream has no frontier to
+        // run ahead of: its own coverage is the only gate.
+        let promote_margin = match playback.live.is_some() {
+            true => 0,
+            false => engine.device_rate as usize,
+        };
         let prebuffer_frames = (engine.device_rate as usize).saturating_mul(2);
         Self {
             session,
             engine,
             frontier: playback.frontier,
             status: playback.status,
+            live: playback.live,
             info: playback.info,
             path: playback.path,
             cancel: playback.cancel,
@@ -151,9 +160,13 @@ impl PlayerApp {
         self.engine = playback.engine;
         self.frontier = playback.frontier;
         self.status = playback.status;
+        self.live = playback.live;
         self.info = playback.info;
         self.path = playback.path;
-        self.promote_margin = self.engine.device_rate as usize;
+        self.promote_margin = match self.live {
+            Some(_) => 0,
+            None => self.engine.device_rate as usize,
+        };
         self.prebuffer_frames = (self.engine.device_rate as usize).saturating_mul(2);
         let (waveform, bar_frames) = waveform_bars(
             &self.engine.display_original,
@@ -196,6 +209,7 @@ impl PlayerApp {
                 TransportSection::Playback => self.draw_playback(ui, prepared_frames),
                 TransportSection::Progress => self.draw_progress(ui),
                 TransportSection::RenderStatus => self.draw_render_status(ui, prepared_frames),
+                TransportSection::Live => self.draw_live(ui),
                 TransportSection::Metadata => self.draw_metadata(ui),
                 TransportSection::Disclaimer => self.draw_disclaimer(ui),
                 TransportSection::StreamErrors => self.draw_stream_errors(ui),
@@ -268,11 +282,26 @@ impl PlayerApp {
         let controls = Arc::clone(&self.engine.controls);
         let position = controls.position_secs(rate);
         let duration = self.info.audio_secs.max(0.001);
+        let is_live = self.live.is_some();
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             let playing = controls.is_playing();
             if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
                 controls.set_playing(!playing);
+            }
+            // A live stream has no length to count against and nothing already rendered, so
+            // it shows the playhead alone rather than a fraction of a track it never holds.
+            if is_live {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{:02}:{:02} · live",
+                        position as u64 / 60,
+                        position as u64 % 60
+                    ))
+                    .weak()
+                    .size(11.0),
+                );
+                return;
             }
             ui.label(
                 egui::RichText::new(format!(
@@ -383,6 +412,32 @@ impl PlayerApp {
         if let Some(error) = &self.error {
             ui.add_space(8.0);
             ui.colored_label(egui::Color32::from_rgb(220, 90, 90), error);
+        }
+    }
+
+    /// The live transport's own numbers: the preset that was chosen, what it costs in
+    /// latency, and whether the playhead has had to fall back to the dry side.
+    fn draw_live(&mut self, ui: &mut egui::Ui) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        let stats = live.source.stats();
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(live_line(
+                &live.policy,
+                stats.dropouts(),
+                stats.measured_rtf(),
+            ))
+            .weak()
+            .size(11.0),
+        );
+        if let Some(reason) = self.engine.controls.enhanced_blocked() {
+            ui.label(
+                egui::RichText::new(format!("A/B unavailable: {reason}"))
+                    .weak()
+                    .size(11.0),
+            );
         }
     }
 
@@ -667,6 +722,34 @@ fn is_cpu_device(device: &str) -> bool {
     device == "cpu"
 }
 
+/// The live line: the preset, what the latency is made of, and what has gone wrong so far.
+///
+/// The policy's total is the number D3 says to print: the preset alone is the model window,
+/// not the latency a listener hears.
+fn live_line(
+    policy: &flacify_core::LivePolicy,
+    dropouts: usize,
+    measured_rtf: Option<f64>,
+) -> String {
+    let measured = match measured_rtf {
+        Some(rtf) => format!(" · RTF {rtf:.2}"),
+        None => String::new(),
+    };
+    let unit = match policy.preset.granules() {
+        1 => "granule",
+        _ => "granules",
+    };
+    format!(
+        "live · preset {} {unit} · latency {:.2} s = window {:.2} + buffer {:.2} + device \
+         {:.2} · dropouts {dropouts}{measured}",
+        policy.preset.granules(),
+        policy.total_latency_secs,
+        policy.model_latency_secs,
+        policy.buffer_latency_secs,
+        policy.device_latency_secs,
+    )
+}
+
 /// Frequency at a fraction of the way across a log axis from 40 Hz to Nyquist.
 fn frequency_at(fraction: f32, sample_rate: f32) -> f32 {
     let nyquist = sample_rate / 2.0;
@@ -884,6 +967,7 @@ mod tests {
                 Playback,
                 Progress,
                 RenderStatus,
+                Live,
                 Metadata,
                 Disclaimer,
                 StreamErrors,
@@ -902,5 +986,30 @@ mod tests {
                 .count();
             assert_eq!(count, 1, "{section:?} is drawn {count} times");
         }
+    }
+
+    #[test]
+    fn given_a_policy_when_labelled_then_the_line_states_the_preset_latency_and_dropouts() {
+        let policy = flacify_core::live_policy(
+            flacify_core::Preset::Two,
+            &flacify_core::Probe::from_rtf(0.8),
+            1_024,
+        );
+        let line = live_line(&policy, 3, None);
+        assert!(line.contains("preset 2 granules"), "{line}");
+        assert!(line.contains("latency 2.58 s"), "{line}");
+        assert!(
+            line.contains("window 1.28 + buffer 1.28 + device 0.02"),
+            "{line}"
+        );
+        assert!(line.contains("dropouts 3"), "{line}");
+        assert!(
+            !line.contains("RTF"),
+            "no ratio before it is measured: {line}"
+        );
+
+        let measured = live_line(&policy, 0, Some(0.74));
+        assert!(measured.contains("dropouts 0"), "{measured}");
+        assert!(measured.ends_with("RTF 0.74"), "{measured}");
     }
 }

@@ -15,9 +15,6 @@ mod first_run;
 mod flac;
 mod frontier;
 mod limit;
-// `play --live` (U1) and `flacify sink` (K1) are the callers; until they land the mechanism
-// has none outside the tests.
-#[allow(dead_code)]
 mod live;
 mod loudness;
 mod player;
@@ -51,7 +48,21 @@ fn main() -> Result<()> {
             file,
             smoke,
             splice,
-        } => commands::play::run(&file, smoke, splice),
+            live,
+            window,
+            rtf,
+            watch,
+        } => commands::play::run(commands::play::Request {
+            file: &file,
+            smoke,
+            splice,
+            live: if live {
+                Some(commands::play::LiveOptions::parse(&window, rtf)?)
+            } else {
+                None
+            },
+            watch_secs: watch,
+        }),
         Command::Devices => commands::devices::run(),
         Command::Batch { dir, dry_run } => commands::batch::run(&dir, dry_run),
         Command::Ab {

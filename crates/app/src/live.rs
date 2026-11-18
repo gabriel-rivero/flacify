@@ -5,27 +5,54 @@
 //! for the wet side of the frames behind that block, which is where the model needs a
 //! window of lookahead; the wet side goes into a ring holding `buffer_frames`. The pump
 //! waits for room instead of dropping audio, so resident audio is
-//! `(2 × buffer + window) × channels × 4` bytes for the whole stream.
+//! `(2 × buffer + window + block) × channels × 4` bytes for the whole stream.
 //!
 //! [`Live::fill`] is the consumer, on the audio thread: it reads both rings at the
 //! playhead, mixes wet over dry through the mixer's ramp, plays the dry side wherever the
 //! wet side has not caught up, and counts those frames. No allocation, no lock, no
 //! blocking, no logging.
+//!
+//! One producer call renders a window and hands over one block of it, and the pump checks
+//! the wet ring's room after that call rather than before it, so the compute overlaps the
+//! playhead's drain. The dry ring therefore carries one block over the alignment delay:
+//! the block being rendered is already in it when the playhead reaches it.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use flacify_core::dsp::resample::{ChunkedResampler, Resampler};
 use flacify_core::policy::LivePolicy;
-use flacify_core::SAMPLE_RATE;
+use flacify_core::{Block, Pipeline, Upscaler, SAMPLE_RATE};
 
+use crate::decode::{self, Chunk};
 use crate::player::{mix_stretch, Ramp};
 
 /// Why the A/B switch is unavailable while the buffer is behind, in the words the status
 /// line prints.
 pub const STARVED_REASON: &str = "the live buffer has not caught up with the playhead";
+
+/// How long the pump waits for the buffer to fill before the device is allowed to start.
+pub const PREBUFFER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Live audio joins no cache and is never reproduced (D5), so the seed is a constant;
+/// every window still draws its own from the pipeline's lattice.
+pub const SEED: u64 = 0;
+
+/// The live path is 48 kHz stereo end to end, like the model.
+const CHANNELS: usize = 2;
+
+/// The overlap as a fraction of the model window. One fifth is the trained window's own
+/// 1 s in 5.12 s, so every preset crossfades over the same share of its context and the
+/// compute spent per played second stays flat across the four (D19).
+const OVERLAP_DIVISOR: usize = 5;
+
+/// Blocks the pump must have timed before the measured ratio is worth printing.
+const MIN_TIMED_BLOCKS: usize = 3;
+/// Timings kept for the rolling ratio: at least a second of audio at every preset.
+const TIMED_BLOCKS: usize = 8;
 
 /// The longest the pump sleeps before checking whether the mixer has gone away.
 const MAX_WAIT: Duration = Duration::from_millis(50);
@@ -62,14 +89,20 @@ pub struct Fill {
     pub starved_frames: usize,
 }
 
-/// The counters the live path publishes. The status line and `diagnose` read them without
-/// a lock, and the producer thread never touches them.
+/// The counters the live path publishes. The status line and the panel read them without
+/// a lock; the audio thread writes the starvation counters and the producer thread the
+/// timings.
 #[derive(Debug, Default)]
 pub struct Stats {
     starved_frames: AtomicUsize,
     dropouts: AtomicUsize,
     is_wet_covered: AtomicBool,
     is_starving: AtomicBool,
+    blocks: AtomicUsize,
+    /// Nanoseconds of compute per block, and the frames that block carried, oldest first
+    /// in the ring.
+    block_nanos: [AtomicU64; TIMED_BLOCKS],
+    carried_frames: [AtomicU64; TIMED_BLOCKS],
 }
 
 impl Stats {
@@ -105,6 +138,41 @@ impl Stats {
             self.is_starving.store(false, Ordering::Relaxed);
         }
     }
+
+    /// One block's compute time and how much audio it carried, published as it finishes.
+    fn record_block(&self, elapsed: Duration, frames: usize) {
+        let slot = self.blocks.fetch_add(1, Ordering::Relaxed) % TIMED_BLOCKS;
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.block_nanos[slot].store(nanos, Ordering::Relaxed);
+        self.carried_frames[slot].store(frames as u64, Ordering::Relaxed);
+    }
+
+    /// Blocks the pump has produced, which is how many timings exist.
+    pub fn blocks_rendered(&self) -> usize {
+        self.blocks.load(Ordering::Relaxed)
+    }
+
+    /// Seconds of compute per second of audio the path played, over the last blocks, or
+    /// `None` until [`MIN_TIMED_BLOCKS`] have finished.
+    ///
+    /// Per played second, not per second the model saw: a call renders a window and hands
+    /// over one block of it, so this is the ratio a listener's clock sees and the one that
+    /// has to stay under 1.
+    pub fn measured_rtf(&self) -> Option<f64> {
+        let blocks = self.blocks_rendered();
+        if blocks < MIN_TIMED_BLOCKS {
+            return None;
+        }
+        let kept = blocks.min(TIMED_BLOCKS);
+        let nanos: u128 = (0..kept)
+            .map(|slot| u128::from(self.block_nanos[slot].load(Ordering::Relaxed)))
+            .sum();
+        let frames: u128 = (0..kept)
+            .map(|slot| u128::from(self.carried_frames[slot].load(Ordering::Relaxed)))
+            .sum();
+        let audio_secs = frames as f64 / f64::from(SAMPLE_RATE);
+        Some(nanos as f64 / 1e9 / audio_secs)
+    }
 }
 
 /// One bounded ring of interleaved frames, addressed by absolute frame number.
@@ -131,10 +199,6 @@ impl Ring {
             channels,
             written: AtomicUsize::new(0),
         }
-    }
-
-    fn capacity(&self) -> usize {
-        self.capacity
     }
 
     fn bytes(&self) -> usize {
@@ -224,6 +288,8 @@ struct Rings {
     is_feed_finished: AtomicBool,
     /// Set when the last `Live` drops; the pump returns at its next check.
     is_stopping: AtomicBool,
+    /// What the panel and the status line read, including the pump's own timings.
+    stats: Arc<Stats>,
 }
 
 impl Rings {
@@ -234,9 +300,13 @@ impl Rings {
         window_frames: usize,
         block_frames: usize,
         channels: usize,
+        stats: Arc<Stats>,
     ) -> Self {
         Self {
-            dry: Ring::new(buffer_frames + window_frames, channels),
+            // The alignment delay, plus the block the pump is rendering: while it computes
+            // the playhead keeps draining the dry side, and that block has to be readable
+            // when the render ends or the pump would wait for the playhead instead.
+            dry: Ring::new(buffer_frames + window_frames + block_frames, channels),
             wet: Ring::new(buffer_frames, channels),
             channels,
             window_frames,
@@ -244,6 +314,7 @@ impl Rings {
             playhead: Arc::new(AtomicUsize::new(0)),
             is_feed_finished: AtomicBool::new(false),
             is_stopping: AtomicBool::new(false),
+            stats,
         }
     }
 
@@ -259,7 +330,6 @@ impl Rings {
 /// A live stream being played: the rings, and the counters the UI reads.
 pub struct Live {
     rings: Arc<Rings>,
-    stats: Arc<Stats>,
 }
 
 impl Live {
@@ -291,9 +361,9 @@ impl Live {
             policy.window_frames,
             block_frames(policy),
             channels,
+            Arc::new(Stats::default()),
         ));
         let live = Arc::new(Self {
-            stats: Arc::new(Stats::default()),
             rings: Arc::clone(&rings),
         });
         let pump = Pump::spawn(rings, feed, produce)?;
@@ -311,9 +381,9 @@ impl Live {
         self.rings.channels
     }
 
-    /// The counters the status line and `diagnose` print.
+    /// The counters the panel and the status line print.
     pub fn stats(&self) -> Arc<Stats> {
-        Arc::clone(&self.stats)
+        Arc::clone(&self.rings.stats)
     }
 
     /// Bytes the rings hold, fixed for the life of the stream. The pump stages one block
@@ -399,7 +469,9 @@ impl Live {
             frames: dry_frames,
             starved_frames: dry_frames - wet_frames,
         };
-        self.stats.record(fill.starved_frames, dry_frames == frames);
+        self.rings
+            .stats
+            .record(fill.starved_frames, dry_frames == frames);
         // The pump measures its credit against this number, so the frames this fill
         // consumed are published as it goes.
         if fill.frames > 0 {
@@ -417,10 +489,33 @@ impl Drop for Live {
     }
 }
 
-/// The block one [`WetProducer`] call produces: half the buffer, capped at the model
-/// window, so the next block has room while the playhead is still inside this one.
-fn block_frames(policy: &LivePolicy) -> usize {
-    (policy.buffer_frames / 2).clamp(1, policy.window_frames)
+/// The block one [`WetProducer`] call produces, which is also the pipeline's step.
+///
+/// A call renders a whole window and hands back `window - overlap` frames of it: the rest
+/// is the crossfade the next window lands in. The step is the pump's block, so one call
+/// emits exactly one block and the credit is measured in the same frames the pipeline
+/// advances by.
+pub fn block_frames(policy: &LivePolicy) -> usize {
+    let window = policy.window_frames.max(2);
+    let overlap = overlap_frames(window);
+    (window - overlap).max(1)
+}
+
+/// The crossfade the live path uses: one fifth of the window, inside the pipeline's clamp.
+pub fn overlap_frames(window: usize) -> usize {
+    let half = window / 2;
+    (window / OVERLAP_DIVISOR).min(half.saturating_sub(1))
+}
+
+/// Frames of wet audio the pump can have ready before the playhead moves.
+///
+/// The ring holds whole blocks, so this is the largest whole number of blocks that fits
+/// the policy's buffer. It has to cover the first call's own duration: a call renders a
+/// window before it can hand over its block, and the device starting mid-call is the one
+/// dropout a careful start can prevent.
+pub fn prebuffer_frames(policy: &LivePolicy) -> usize {
+    let block = block_frames(policy);
+    (policy.buffer_frames / block).max(1) * block
 }
 
 /// The producer thread. Dropping it detaches; [`Pump::join`] waits for the feed to end.
@@ -516,6 +611,12 @@ fn run(rings: &Rings, mut feed: Box<dyn Feed>, mut produce: WetProducer) -> Resu
         // At the end of the stream the slice shrinks, and its lookahead is the zero padding
         // so the last frames still get a wet side.
         let frames = if is_eof { filled.min(block) } else { block };
+        // The room is checked after the render, not before: a call takes as long as its
+        // window costs, and the playhead keeps draining through it. Waiting first would
+        // make the compute and the drain take turns instead of overlapping.
+        let started = Instant::now();
+        produce(&stage[..filled * channels], &mut wet[..frames * channels])?;
+        rings.stats.record_block(started.elapsed(), frames);
         if rings
             .wet
             .wait_for_room(produced + frames, &rings.playhead, &rings.is_stopping)
@@ -523,7 +624,6 @@ fn run(rings: &Rings, mut feed: Box<dyn Feed>, mut produce: WetProducer) -> Resu
         {
             return Ok(());
         }
-        produce(&stage[..filled * channels], &mut wet[..frames * channels])?;
         rings.wet.write(produced, &wet[..frames * channels]);
         produced += frames;
 
@@ -535,9 +635,275 @@ fn run(rings: &Rings, mut feed: Box<dyn Feed>, mut produce: WetProducer) -> Resu
     }
 }
 
+/// Renders the wet side of a live stream one block at a time from the dry slice the pump
+/// hands over.
+///
+/// The pipeline is the file path's, at the preset's window: the engine preprocesses and
+/// calls the model per window, and the overlap-add tail crossfades each window's last
+/// frames into the next. `overlap` is `window - block`, so one push of one block emits
+/// exactly one block and the pump's credit is also the pipeline's step.
+pub struct Renderer<U: Upscaler> {
+    pipeline: Pipeline<U>,
+    /// Wet frames emitted but not yet returned, interleaved.
+    pending: Vec<f32>,
+    /// Frames of `pending` already returned.
+    pending_start: usize,
+    /// Absolute frame of the next dry push, and of the next wet frame returned.
+    pushed: usize,
+    produced: usize,
+    is_finished: bool,
+}
+
+impl<U: Upscaler> Renderer<U> {
+    /// A renderer for `window_frames` whose output arrives `block_frames` at a time.
+    ///
+    /// `block_frames` must be the pump's, from the same policy: a block that is not the
+    /// pipeline's step would leave wet audio queued or short.
+    pub fn new(upscaler: U, window_frames: usize, block_frames: usize, seed: u64) -> Result<Self> {
+        anyhow::ensure!(
+            block_frames > 0 && block_frames <= window_frames,
+            "a live renderer needs a window and a block inside it: {window_frames} and \
+             {block_frames} frames"
+        );
+        let overlap = window_frames - block_frames;
+        let pipeline = Pipeline::new(upscaler, CHANNELS, window_frames, overlap, seed)?;
+        anyhow::ensure!(
+            pipeline.step() == block_frames,
+            "the pipeline steps {} frames but the pump's block is {block_frames}",
+            pipeline.step()
+        );
+        Ok(Self {
+            pipeline,
+            pending: Vec::with_capacity(4 * block_frames * CHANNELS),
+            pending_start: 0,
+            pushed: 0,
+            produced: 0,
+            is_finished: false,
+        })
+    }
+
+    /// Fill `wet` with the block of generated audio that lines up with `dry`.
+    ///
+    /// `dry` starts at the frame the last call ended on and carries the lookahead after the
+    /// block, exactly as [`WetProducer`] documents. Filling `wet` completely is the
+    /// contract; a slice the feed has ended inside is resolved against the pipeline's tail.
+    pub fn produce(&mut self, dry: &[f32], wet: &mut [f32]) -> Result<()> {
+        anyhow::ensure!(
+            wet.len() % CHANNELS == 0 && !wet.is_empty(),
+            "a live block is a whole number of stereo frames, not {} samples",
+            wet.len()
+        );
+        let frames = wet.len() / CHANNELS;
+        let overlap = self.pipeline.overlap();
+        let available_end = self.produced + dry.len() / CHANNELS;
+        let target_end = (self.produced + frames + overlap).min(available_end);
+        if target_end > self.pushed {
+            anyhow::ensure!(
+                !self.is_finished,
+                "the live renderer was handed more audio after its stream ended"
+            );
+            let start = (self.pushed - self.produced) * CHANNELS;
+            let end = (target_end - self.produced) * CHANNELS;
+            self.push(&dry[start..end])?;
+            self.pushed = target_end;
+        }
+        if self.pending_frames() < frames {
+            self.finish()?;
+        }
+        let available = self.pending_frames();
+        anyhow::ensure!(
+            available >= frames,
+            "the live renderer has {available} frames of wet audio for a {frames} frame block"
+        );
+        let start = self.pending_start * CHANNELS;
+        wet.copy_from_slice(&self.pending[start..start + frames * CHANNELS]);
+        self.pending_start += frames;
+        if self.pending_start * CHANNELS == self.pending.len() {
+            self.pending.clear();
+            self.pending_start = 0;
+        }
+        self.produced += frames;
+        Ok(())
+    }
+
+    /// Push one block of dry audio through the pipeline and queue what it emitted.
+    fn push(&mut self, dry_block: &[f32]) -> Result<()> {
+        let block = Block::from_interleaved(CHANNELS, dry_block)?;
+        let emitted = self.pipeline.push(&block)?;
+        self.queue(emitted);
+        Ok(())
+    }
+
+    /// End the stream: the pipeline resolves its held tail against silence.
+    fn finish(&mut self) -> Result<()> {
+        if self.is_finished {
+            return Ok(());
+        }
+        self.is_finished = true;
+        let emitted = self.pipeline.finish()?;
+        self.queue(emitted);
+        Ok(())
+    }
+
+    /// Append the emitted blocks to the queue, dropping the part already returned.
+    fn queue(&mut self, emitted: Vec<Block>) {
+        if self.pending_start > 0 {
+            self.pending.drain(..self.pending_start * CHANNELS);
+            self.pending_start = 0;
+        }
+        for block in emitted {
+            for frame in 0..block.frames() {
+                for channel in 0..CHANNELS {
+                    self.pending.push(block.channel(channel)[frame]);
+                }
+            }
+        }
+    }
+
+    fn pending_frames(&self) -> usize {
+        self.pending.len() / CHANNELS - self.pending_start
+    }
+
+    /// Frames of wet audio queued but not returned, which the renderer keeps one block wide.
+    #[cfg(test)]
+    fn queued_frames(&self) -> usize {
+        self.pending_frames()
+    }
+}
+
+/// The file the live path plays: packets decoded and resampled as the pump asks for them,
+/// so the track is never held whole. Both stages are the file path's.
+pub struct FileFeed {
+    stream: decode::AudioStream,
+    /// One pass per channel. A file already at 48 kHz gets the passthrough ratio.
+    resampler: Option<[ChunkedResampler<'static>; CHANNELS]>,
+    /// Interleaved frames converted but not yet handed to the pump.
+    pending: Vec<f32>,
+    pending_start: usize,
+    is_eof: bool,
+}
+
+impl FileFeed {
+    /// Decode `path` at 48 kHz stereo, a packet at a time.
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let stream = decode::AudioStream::open(path)?;
+        if stream.channels() > CHANNELS {
+            tracing::warn!(
+                channels = stream.channels(),
+                "downmix is not implemented; keeping the first two channels"
+            );
+        }
+        let rate = stream.sample_rate() as usize;
+        let left = Resampler::new(SAMPLE_RATE as usize, rate)?.into_chunked();
+        let right = Resampler::new(SAMPLE_RATE as usize, rate)?.into_chunked();
+        Ok(Self {
+            stream,
+            resampler: Some([left, right]),
+            pending: Vec::new(),
+            pending_start: 0,
+            is_eof: false,
+        })
+    }
+
+    /// Pull and convert the next packet, or resolve the resampler's tail at the end.
+    fn fill(&mut self) -> Result<()> {
+        let Some(chunk) = self.stream.next_chunk()? else {
+            self.is_eof = true;
+            if let Some([left, right]) = self.resampler.take() {
+                let (left, right) = (
+                    decode::to_f32(&left.finish()),
+                    decode::to_f32(&right.finish()),
+                );
+                for frame in 0..left.len().min(right.len()) {
+                    self.pending.push(left[frame]);
+                    self.pending.push(right[frame]);
+                }
+            }
+            return Ok(());
+        };
+        self.convert(&chunk)
+    }
+
+    /// Map one packet to 48 kHz stereo and queue it interleaved.
+    fn convert(&mut self, chunk: &Chunk) -> Result<()> {
+        let planes = decode::stereo_planes_of(self.stream.channels(), &chunk.planar, chunk.frames)?;
+        let [left, right] = self
+            .resampler
+            .as_mut()
+            .context("a packet arrived after the feed finished")?;
+        let left_out = left.process_chunk(&decode::to_f64(planes[0]));
+        let right_out = right.process_chunk(&decode::to_f64(planes[1]));
+        let (left_out, right_out) = (decode::to_f32(&left_out), decode::to_f32(&right_out));
+        debug_assert_eq!(left_out.len(), right_out.len(), "one pass per channel");
+        for frame in 0..left_out.len().min(right_out.len()) {
+            self.pending.push(left_out[frame]);
+            self.pending.push(right_out[frame]);
+        }
+        Ok(())
+    }
+}
+
+impl Feed for FileFeed {
+    fn channels(&self) -> usize {
+        CHANNELS
+    }
+
+    fn sample_rate(&self) -> u32 {
+        SAMPLE_RATE
+    }
+
+    fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+        let want = out.len() / CHANNELS;
+        let mut written = 0;
+        while written < want {
+            let available = self.pending.len() / CHANNELS - self.pending_start;
+            if available > 0 {
+                let count = available.min(want - written);
+                let from = self.pending_start * CHANNELS;
+                out[written * CHANNELS..(written + count) * CHANNELS]
+                    .copy_from_slice(&self.pending[from..from + count * CHANNELS]);
+                self.pending_start += count;
+                written += count;
+                continue;
+            }
+            self.pending.clear();
+            self.pending_start = 0;
+            if self.is_eof {
+                break;
+            }
+            self.fill()?;
+        }
+        Ok(written)
+    }
+}
+
+/// The band limit of a file, read through the same decode and resample the feed plays.
+///
+/// The whole file goes through the analyser once, in second-sized slices, so the verdict is
+/// the one a whole-track read gives and the track is still never held.
+pub fn analyse(path: &std::path::Path) -> Result<flacify_core::dsp::cutoff::Analysis> {
+    let mut feed = FileFeed::open(path)?;
+    let mut analyser = flacify_core::dsp::cutoff::chunked();
+    let mut buffer = vec![0.0f32; SAMPLE_RATE as usize * CHANNELS];
+    let mut left = Vec::with_capacity(SAMPLE_RATE as usize);
+    loop {
+        let read = feed.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        left.clear();
+        left.extend(buffer[..read * CHANNELS].iter().step_by(CHANNELS).copied());
+        analyser.push(&left)?;
+    }
+    analyser
+        .finish()
+        .with_context(|| format!("analysing {}", path.display()))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use flacify_core::upscaler::mocks::{Gain, Identity};
     use flacify_core::{live_policy, Preset, Probe};
 
     /// A policy with this machine's arithmetic out of the way: the buffer and window a test
@@ -648,9 +1014,10 @@ pub(crate) mod tests {
             Box::new(copy_dry),
         )
         .expect("a live stream");
+        let block = block_frames(&test_policy(BUFFER, WINDOW));
         assert_eq!(
             live.resident_bytes(),
-            (2 * BUFFER + WINDOW) * 2 * 4,
+            (2 * BUFFER + WINDOW + block) * 2 * 4,
             "an hour of audio costs the same bytes as a minute"
         );
         assert!(
@@ -672,7 +1039,7 @@ pub(crate) mod tests {
             }
             peak = peak.max(live.occupied(position));
             assert!(
-                live.occupied(position) <= 2 * BUFFER + WINDOW,
+                live.occupied(position) <= 2 * BUFFER + WINDOW + block,
                 "{} frames resident at {position}",
                 live.occupied(position)
             );
@@ -683,7 +1050,7 @@ pub(crate) mod tests {
         println!(
             "peak {peak} frames ({:.1} KiB) resident, bound {} frames, for one hour",
             peak as f64 * 2.0 * 4.0 / 1024.0,
-            2 * BUFFER + WINDOW
+            2 * BUFFER + WINDOW + block
         );
         pump.join().expect("the pump");
     }
@@ -741,9 +1108,8 @@ pub(crate) mod tests {
     #[test]
     fn given_a_starved_playhead_when_filled_then_the_dry_samples_play_and_are_counted() {
         // Hand-driven rings: no pump, so the wet side appears at a frame this test picks.
-        let rings = Rings::new(128, 32, 32, 2);
+        let rings = Rings::new(128, 32, 32, 2, Arc::new(Stats::default()));
         let live = Live {
-            stats: Arc::new(Stats::default()),
             rings: Arc::new(rings),
         };
         live.rings.dry.write(0, &dry_frames(0..96));
@@ -813,6 +1179,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn given_a_playhead_that_frees_half_a_block_per_render_when_pumped_then_it_renders_ahead_of_it()
+    {
+        // A render takes real time, and the playhead keeps draining through it. The room a
+        // block needs is asked for after the render, so a render can start while the
+        // playhead is short of it: at half a block per render, three blocks get through.
+        // Asking before the render stalls after one.
+        const WINDOW: usize = 1_024;
+        let policy = test_policy(820, WINDOW);
+        let block = block_frames(&policy);
+        let rings = Arc::new(Rings::new(
+            820,
+            WINDOW,
+            block,
+            CHANNELS,
+            Arc::new(Stats::default()),
+        ));
+        let playhead = Arc::clone(&rings.playhead);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let renders = Arc::clone(&calls);
+        let pump = Pump::spawn(
+            Arc::clone(&rings),
+            Box::new(RampFeed::new(20 * block)),
+            Box::new(move |dry: &[f32], wet: &mut [f32]| {
+                wet.copy_from_slice(&dry[..wet.len()]);
+                playhead.fetch_add(block / 2, Ordering::Release);
+                renders.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }),
+        )
+        .expect("a pump");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while calls.load(Ordering::Relaxed) < 3 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            3,
+            "the pump must render ahead of its room"
+        );
+        rings.stop();
+        pump.join().expect("the pump");
+    }
+
+    #[test]
     fn given_a_playhead_that_never_moves_when_the_ring_fills_then_the_pump_waits_for_credit() {
         // No consumer at all: the pump must stop at the bound rather than overwrite audio
         // the playhead has not read.
@@ -827,9 +1238,10 @@ pub(crate) mod tests {
 
         thread::sleep(Duration::from_millis(100));
         let pushed = live.rings.dry.written();
+        let block = block_frames(&test_policy(buffer, window));
         assert!(
-            pushed <= buffer + window,
-            "{pushed} frames pushed into a {buffer} frame buffer"
+            pushed <= buffer + window + block,
+            "{pushed} frames pushed into a {buffer} frame buffer with {window} of lookahead"
         );
         assert!(live.rings.wet.written() <= buffer);
         assert!(
@@ -846,5 +1258,356 @@ pub(crate) mod tests {
         );
         live.rings.stop();
         pump.join().expect("the pump");
+    }
+
+    /// The end-to-end figure `--live` starts from until the app measures its own (S3).
+    const LIVE_PROBE: Probe = Probe {
+        rtf_p50: 0.55,
+        rtf_p95: 0.70,
+        rtf_sustained: 0.78,
+    };
+
+    /// A small mono-ish signal, so a tolerance is a real check rather than a rounding test.
+    fn tone(frame: usize) -> f32 {
+        (frame as f32 * 0.01).sin() * 0.5
+    }
+
+    /// Interleaved stereo of [`tone`] for `frames`.
+    fn tone_track(frames: usize) -> Vec<f32> {
+        (0..frames)
+            .flat_map(|frame| [tone(frame), tone(frame + 1)])
+            .collect()
+    }
+
+    /// Drive a renderer the way the pump does: each call carries one block plus the window of
+    /// lookahead after it, and the last call carries what is left.
+    fn render(
+        dry: &[f32],
+        window: usize,
+        block: usize,
+        renderer: &mut Renderer<impl Upscaler>,
+    ) -> Vec<f32> {
+        let total = dry.len() / CHANNELS;
+        let mut wet = vec![0.0f32; block * CHANNELS];
+        let mut out = Vec::with_capacity(dry.len());
+        let mut produced = 0;
+        while produced < total {
+            let frames = block.min(total - produced);
+            let end = (produced + block + window).min(total);
+            renderer
+                .produce(
+                    &dry[produced * CHANNELS..end * CHANNELS],
+                    &mut wet[..frames * CHANNELS],
+                )
+                .expect("one block");
+            out.extend_from_slice(&wet[..frames * CHANNELS]);
+            produced += frames;
+        }
+        out
+    }
+
+    #[test]
+    fn given_the_four_presets_when_sized_then_the_block_keeps_the_pipeline_inside_its_clamp() {
+        for preset in Preset::ALL {
+            let policy = live_policy(preset, &LIVE_PROBE, 1_024);
+            let block = block_frames(&policy);
+            assert!(block > 0 && block <= policy.window_frames, "{block}");
+            assert!(block <= policy.buffer_frames, "{block}");
+            let overlap = policy.window_frames - block;
+            assert_eq!(overlap, overlap_frames(policy.window_frames));
+            assert!(
+                overlap <= policy.window_frames / 2,
+                "{} frames of overlap at {}",
+                policy.window_frames,
+                preset.label()
+            );
+            let _renderer = Renderer::new(Identity, policy.window_frames, block, SEED)
+                .expect("the preset's block is the pipeline's step");
+            // The prebuffer is whole blocks inside the buffer, and at least one block.
+            let prebuffer = prebuffer_frames(&policy);
+            assert_eq!(prebuffer % block, 0, "{prebuffer} of {block}");
+            assert!(prebuffer >= block && prebuffer <= policy.buffer_frames);
+            assert!(prebuffer <= policy.window_frames + block);
+        }
+    }
+
+    #[test]
+    fn given_a_block_that_is_not_the_pipelines_step_when_a_renderer_is_built_then_it_is_refused() {
+        let longer = Renderer::new(Identity, 1_024, 2_048, SEED);
+        assert!(longer.is_err(), "a block cannot be longer than the window");
+
+        // An overlap past the half-window clamp would make the step disagree with the
+        // pump's block, which queues or starves wet audio for the whole stream.
+        let clamped = Renderer::new(Identity, 1_024, 100, SEED)
+            .err()
+            .expect("the pipeline would step by 513");
+        assert!(format!("{clamped}").contains("513"), "{clamped}");
+    }
+
+    #[test]
+    fn given_a_buffer_that_is_not_whole_stereo_frames_when_produced_into_then_it_is_refused() {
+        let mut renderer = Renderer::new(Identity, 1_024, 820, SEED).expect("a renderer");
+        let dry = tone_track(2_000);
+        let error = renderer
+            .produce(&dry, &mut [0.0f32; 3])
+            .expect_err("three samples are not a block");
+        assert!(format!("{error}").contains("stereo"), "{error}");
+    }
+
+    #[test]
+    fn given_any_length_when_rendered_a_block_at_a_time_then_the_block_boundaries_lose_nothing() {
+        const WINDOW: usize = 4_096;
+        const BLOCK: usize = 2_049;
+        for frames in [1, 100, 2_048, 2_049, 4_999, 20_001] {
+            let dry = tone_track(frames);
+            let mut renderer = Renderer::new(Identity, WINDOW, BLOCK, SEED).expect("a renderer");
+            let out = render(&dry, WINDOW, BLOCK, &mut renderer);
+            assert_eq!(out.len(), dry.len(), "{frames} frames");
+            for (index, (got, want)) in out.iter().zip(dry.iter()).enumerate() {
+                assert!(
+                    (got - want).abs() < 1e-4,
+                    "sample {index} of {frames}: {got} for {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_long_stream_when_rendered_then_the_queued_wet_audio_stays_one_block_deep() {
+        // A queue that kept every emitted block would hold the whole track, which is the
+        // memory the live path exists to avoid.
+        const WINDOW: usize = 4_096;
+        const BLOCK: usize = 3_277;
+        let dry = tone_track(200 * BLOCK);
+        let mut renderer = Renderer::new(Identity, WINDOW, BLOCK, SEED).expect("a renderer");
+        let mut wet = vec![0.0f32; BLOCK * CHANNELS];
+        let mut peak = 0usize;
+        let mut produced = 0;
+        while produced < dry.len() / CHANNELS {
+            let frames = BLOCK.min(dry.len() / CHANNELS - produced);
+            let end = (produced + BLOCK + WINDOW).min(dry.len() / CHANNELS);
+            renderer
+                .produce(
+                    &dry[produced * CHANNELS..end * CHANNELS],
+                    &mut wet[..frames * CHANNELS],
+                )
+                .expect("one block");
+            peak = peak.max(renderer.queued_frames());
+            produced += frames;
+        }
+        assert!(peak <= 2 * BLOCK, "{peak} frames queued");
+        assert_eq!(produced, dry.len() / CHANNELS);
+    }
+
+    #[test]
+    fn given_a_gain_when_rendered_a_block_at_a_time_then_every_frame_carries_it() {
+        const WINDOW: usize = 4_096;
+        const BLOCK: usize = 2_049;
+        let dry = tone_track(3 * BLOCK);
+        let mut renderer = Renderer::new(Gain(2.0), WINDOW, BLOCK, SEED).expect("a renderer");
+        let out = render(&dry, WINDOW, BLOCK, &mut renderer);
+        for (index, (got, want)) in out.iter().zip(dry.iter()).enumerate() {
+            assert!(
+                (got - 2.0 * want).abs() < 1e-3,
+                "sample {index}: {got} for {}",
+                2.0 * want
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_finished_renderer_when_handed_more_audio_then_it_refuses_instead_of_misaligning() {
+        const WINDOW: usize = 4_096;
+        const BLOCK: usize = 2_049;
+        let dry = tone_track(3 * BLOCK);
+        let mut renderer = Renderer::new(Identity, WINDOW, BLOCK, SEED).expect("a renderer");
+        render(&dry, WINDOW, BLOCK, &mut renderer);
+
+        let mut wet = vec![0.0f32; BLOCK * CHANNELS];
+        let more = tone_track(2 * BLOCK + WINDOW);
+        let error = renderer
+            .produce(&more, &mut wet)
+            .expect_err("the stream already ended");
+        assert!(format!("{error}").contains("ended"), "{error}");
+    }
+
+    #[test]
+    fn given_two_blocks_when_measured_then_there_is_no_ratio_and_three_give_one() {
+        let stats = Stats::default();
+        let block = SAMPLE_RATE as usize;
+        stats.record_block(Duration::from_millis(700), block);
+        stats.record_block(Duration::from_millis(700), block);
+        assert_eq!(stats.blocks_rendered(), 2);
+        assert_eq!(stats.measured_rtf(), None, "two windows are not enough");
+
+        stats.record_block(Duration::from_millis(700), block);
+        let rtf = stats.measured_rtf().expect("three blocks are enough");
+        assert!((rtf - 0.7).abs() < 1e-6, "{rtf}");
+    }
+
+    #[test]
+    fn given_more_blocks_than_timings_kept_when_measured_then_it_rolls_over_the_last_eight() {
+        let stats = Stats::default();
+        let block = SAMPLE_RATE as usize;
+        for _ in 0..TIMED_BLOCKS {
+            stats.record_block(Duration::from_millis(100), block);
+        }
+        // Replace the oldest timing and the ratio follows the ring, not the whole run.
+        stats.record_block(Duration::from_millis(900), block);
+        let rtf = stats.measured_rtf().expect("a ratio");
+        let expected = (7.0 * 0.1 + 0.9) / TIMED_BLOCKS as f64;
+        assert!((rtf - expected).abs() < 1e-6, "{rtf} for {expected}");
+    }
+
+    #[test]
+    fn given_a_real_renderer_when_the_pump_drives_it_then_every_frame_arrives_aligned() {
+        const WINDOW: usize = 4_096;
+        let policy = test_policy(2 * WINDOW, WINDOW);
+        let block = block_frames(&policy);
+        let frames = 20 * block;
+        let mut renderer = Renderer::new(Identity, WINDOW, block, SEED).expect("a renderer");
+        let (live, pump) = Live::start(
+            Box::new(RampFeed::new(frames)),
+            &policy,
+            Box::new(move |dry, wet| renderer.produce(dry, wet)),
+        )
+        .expect("a live stream");
+        assert!(
+            live.wait_for_wet(0, prebuffer_frames(&policy), Duration::from_secs(10)),
+            "the prebuffer fills"
+        );
+
+        let mut ramp = Ramp::new(true, SAMPLE_RATE);
+        let mut out = vec![0.0f32; 1_024 * CHANNELS];
+        let mut position = 0;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !live.is_finished(position) {
+            assert!(Instant::now() < deadline, "the stream never ended");
+            let fill = live.fill(&mut ramp, 1.0, position, &mut out);
+            if fill.frames == 0 {
+                thread::yield_now();
+                continue;
+            }
+            for offset in 0..fill.frames {
+                let frame = position + offset;
+                let want = dry_sample(frame, 0);
+                let got = out[offset * CHANNELS];
+                assert!(
+                    (got - want).abs() <= 1e-5 * want.abs() + 1e-3,
+                    "frame {frame}: {got} for {want}"
+                );
+            }
+            position += fill.frames;
+        }
+        assert_eq!(position, frames, "every frame must play");
+        assert!(
+            live.stats().blocks_rendered() >= 3,
+            "{} windows",
+            live.stats().blocks_rendered()
+        );
+        pump.join().expect("the pump");
+    }
+
+    #[test]
+    fn given_a_48_khz_file_when_read_through_the_feed_then_every_sample_arrives_unchanged() {
+        let root = crate::live::tests::temp_root("feed-48k");
+        let path = root.join("source.wav");
+        let frames = 12_345;
+        let left: Vec<f32> = (0..frames).map(tone).collect();
+        let right: Vec<f32> = (0..frames).map(|frame| tone(frame + 7)).collect();
+        let planar: Vec<f32> = left.iter().chain(right.iter()).copied().collect();
+        crate::wav::write(&path, SAMPLE_RATE, 2, &planar).expect("writing the wav");
+        let expected: Vec<f32> = (0..frames)
+            .flat_map(|frame| [left[frame], right[frame]])
+            .collect();
+
+        let mut feed = FileFeed::open(&path).expect("a feed");
+        let mut buffer = vec![0.0f32; 1_000 * CHANNELS];
+        let mut out = Vec::new();
+        loop {
+            let read = feed.read(&mut buffer).expect("reading the feed");
+            if read == 0 {
+                break;
+            }
+            out.extend_from_slice(&buffer[..read * CHANNELS]);
+        }
+        assert_eq!(out.len(), expected.len(), "every frame arrives once");
+        for (index, (got, want)) in out.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(got.to_bits(), want.to_bits(), "sample {index}");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_44_khz_file_when_read_through_the_feed_then_it_matches_the_whole_file_path() {
+        let root = crate::live::tests::temp_root("feed-44k");
+        let path = root.join("source.wav");
+        let frames = 20_000;
+        let left: Vec<f32> = (0..frames).map(tone).collect();
+        let planar: Vec<f32> = left.iter().chain(left.iter()).copied().collect();
+        crate::wav::write(&path, 44_100, 2, &planar).expect("writing the wav");
+
+        let decoded = decode::decode(&path).expect("decoding the wav");
+        let whole = decode::to_stereo_48k(&decoded).expect("the whole-file mapping");
+        let frames = whole.len() / 2;
+        let expected: Vec<f32> = (0..frames)
+            .flat_map(|frame| [whole[frame], whole[frames + frame]])
+            .collect();
+
+        let mut feed = FileFeed::open(&path).expect("a feed");
+        let mut buffer = vec![0.0f32; 1_003 * CHANNELS];
+        let mut streamed = Vec::new();
+        loop {
+            let read = feed.read(&mut buffer).expect("reading the feed");
+            if read == 0 {
+                break;
+            }
+            streamed.extend_from_slice(&buffer[..read * CHANNELS]);
+        }
+        assert_eq!(
+            streamed.len(),
+            expected.len(),
+            "the chunked pass is the whole pass"
+        );
+        for (index, (got, want)) in streamed.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(got.to_bits(), want.to_bits(), "sample {index}");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_file_when_analysed_for_live_then_the_cutoff_is_the_whole_file_verdict() {
+        let root = crate::live::tests::temp_root("analyse");
+        let path = root.join("source.wav");
+        let frames = 3 * 48_000;
+        let samples: Vec<f32> = (0..frames)
+            .map(|frame| {
+                let time = frame as f32 / 48_000.0;
+                (std::f32::consts::TAU * 440.0 * time).sin() * 0.3
+                    + (std::f32::consts::TAU * 12_000.0 * time).sin() * 0.2
+            })
+            .collect();
+        let planar: Vec<f32> = samples.iter().chain(samples.iter()).copied().collect();
+        crate::wav::write(&path, 48_000, 2, &planar).expect("writing the wav");
+
+        let whole = crate::render::load_in_memory(&path).expect("the whole-file analysis");
+        let live = analyse(&path).expect("the live analysis");
+        assert_eq!(live.cutoff_hz, whole.analysis.cutoff_hz);
+        assert_eq!(live.high_band_ratio, whole.analysis.high_band_ratio);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A unique data directory in the temp directory, deleted by the test that made it.
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "flacify-live-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("creating the test directory");
+        root
     }
 }

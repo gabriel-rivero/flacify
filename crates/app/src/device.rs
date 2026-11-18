@@ -23,13 +23,16 @@ use cpal::Sample as _;
 use flacify_core::dsp::resample::Resampler;
 
 use crate::frontier::Frontier;
+use crate::live;
 use crate::player::{Controls, Mixer};
 use crate::segments::Reader;
 
 /// Bigger than any buffer a device asked us for in practice; the callback clamps to it
 /// rather than allocating, and counts the buffers that do not fit.
 pub const MAX_FRAMES: usize = 16_384;
-const PREFERRED_BUFFER_FRAMES: u32 = 1024;
+/// The device buffer playback asks for first. The live policy adds it to the latency it
+/// prints; S3 replaces that estimate with the device's own figure.
+pub const PREFERRED_BUFFER_FRAMES: u32 = 1024;
 
 /// A device and the configuration it defaults to, as much as a human needs to pick it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -395,6 +398,20 @@ impl AudioEngine {
             );
         }
         let (mixer, controls) = Mixer::segmented(reader, output.rate);
+        output.start(mixer, controls)
+    }
+
+    /// Play a live feed: the rings are the source, so nothing is resampled per chunk and
+    /// the device must take 48 kHz stereo.
+    pub fn start_live(source: Arc<live::Live>) -> Result<Self> {
+        let output = Output::open_named(None)?;
+        if output.rate != flacify_core::SAMPLE_RATE || output.channels != 2 {
+            anyhow::bail!(
+                "{}",
+                streaming_refusal("live playback", &output.name, output.rate, output.channels)
+            );
+        }
+        let (mixer, controls) = Mixer::live(source, output.rate);
         output.start(mixer, controls)
     }
 }
@@ -1101,6 +1118,10 @@ mod tests {
         assert_eq!(
             streaming_refusal("segment playback", "Built-in Output", 44_100, 1),
             "segment playback needs a 48 kHz stereo device; \"Built-in Output\" is 44100 Hz with 1 channel"
+        );
+        assert_eq!(
+            streaming_refusal("live playback", "Built-in Output", 44_100, 2),
+            "live playback needs a 48 kHz stereo device; \"Built-in Output\" is 44100 Hz with 2 channels"
         );
     }
 

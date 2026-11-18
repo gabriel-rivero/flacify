@@ -6,6 +6,7 @@
 //! for the life of the app so a second file does not load it again.
 
 mod ab;
+mod batch;
 mod cache;
 mod cli;
 mod commands;

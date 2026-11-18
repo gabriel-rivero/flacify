@@ -52,6 +52,7 @@ pub fn report(paths: &Paths) -> String {
         "cache    {CACHE_VERSION}, {}",
         cache_summary(&paths.cache_dir())
     );
+    let _ = writeln!(text, "batch    {}", batch_report(&paths.cache_dir()));
 
     let _ = writeln!(text, "\nsteps");
     for step in setup::plan() {
@@ -112,6 +113,16 @@ fn cache_summary(root: &Path) -> String {
     format!("{count} entries, {:.0} MB", bytes as f64 / 1e6)
 }
 
+/// Where the last `flacify batch` run left its failures and skips, or that there is none.
+fn batch_report(cache_root: &Path) -> String {
+    let path = crate::batch::report_path(cache_root);
+    if path.is_file() {
+        format!("last run {}", path.display())
+    } else {
+        "no run yet".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,8 +138,27 @@ mod tests {
         assert!(text.contains("ready    false"), "{text}");
         assert!(text.contains("vae.pth missing"), "{text}");
         assert!(text.contains("0 entries"), "{text}");
+        assert!(text.contains("batch    no run yet"), "{text}");
         assert!(text.contains("devices"), "{text}");
         assert!(text.contains("counters: 0 stream errors"), "{text}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_batch_report_beside_the_cache_when_reported_then_it_names_the_file() {
+        let root =
+            std::env::temp_dir().join(format!("flacify-diagnose-batch-{}", std::process::id()));
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&cache).expect("creating the cache");
+        let paths = Paths::at(root.clone());
+        let written = crate::batch::report_path(&cache);
+        std::fs::write(&written, "# flacify batch\n").expect("writing the report");
+
+        let text = report(&paths);
+        assert!(
+            text.contains(&format!("batch    last run {}", written.display())),
+            "{text}"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

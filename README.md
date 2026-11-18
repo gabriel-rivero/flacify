@@ -50,6 +50,8 @@ cargo build --release
 ./target/release/flacify play song.mp3         # window: space toggles, p plays, drag to seek, drop a file
 ./target/release/flacify play song.mp3 --smoke # headless audio-path check
 ./target/release/flacify ab song.mp3           # blind A/B trials -> song.mp3.flacify-ab.md
+./target/release/flacify batch ~/Music         # render a folder; skips cached files, writes batch-last.md
+./target/release/flacify batch . --dry-run     # what would render, and why each file is skipped
 ./target/release/flacify devices               # capture and playback devices, with rates and channels
 ./target/release/flacify diagnose              # -> flacify-diagnose.txt
 ```

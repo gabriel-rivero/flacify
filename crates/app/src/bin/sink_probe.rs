@@ -40,6 +40,7 @@ fn main() -> Result<(), String> {
     let mut seconds = 600.0f64;
     let mut log: Option<std::path::PathBuf> = None;
     let mut silent = false;
+    let mut play: Option<std::path::PathBuf> = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--from" => from = Some(args.next().ok_or("--from wants a device name")?),
@@ -48,6 +49,7 @@ fn main() -> Result<(), String> {
             // Two different devices drift against each other whether or not anything is
             // playing, so a clock measurement does not have to make a sound.
             "--silent" => silent = true,
+            "--play" => play = Some(args.next().ok_or("--play wants a wav path")?.into()),
             "--seconds" => {
                 seconds = args
                     .next()
@@ -58,43 +60,90 @@ fn main() -> Result<(), String> {
             other => return Err(format!("unknown flag {other}")),
         }
     }
-    let from = from.ok_or("--from is required")?;
     let to = to.ok_or("--to is required")?;
+    let is_feeder = play.is_some();
 
     let host = cpal::default_host();
-    let input_device = find(&host, &from, true)?;
+    // A feeder only plays, so it needs no capture device and no microphone permission.
+    let from = match (from, is_feeder) {
+        (Some(from), _) => from,
+        (None, true) => to.clone(),
+        (None, false) => return Err("--from is required".to_string()),
+    };
+    let input_device = if is_feeder {
+        None
+    } else {
+        Some(find(&host, &from, true)?)
+    };
     let output_device = find(&host, &to, false)?;
     out!(report, "from      \"{from}\" (capture)");
     out!(report, "to        \"{to}\" (playback)");
 
-    let input_config = input_device
-        .default_input_config()
-        .map_err(|error| format!("\"{from}\" input configuration: {error}"))?;
+    let input_config = match &input_device {
+        Some(device) => Some(
+            device
+                .default_input_config()
+                .map_err(|error| format!("\"{from}\" input configuration: {error}"))?,
+        ),
+        None => None,
+    };
     let output_config = output_device
         .default_output_config()
         .map_err(|error| format!("\"{to}\" output configuration: {error}"))?;
-    let rate = input_config.sample_rate();
-    // The sink needs stereo, but the probe also reads a mono microphone: it exists to
-    // answer "may this process capture at all", and a mono device answers that fine.
     if output_config.channels() != 2 {
         return Err(format!(
             "playback must be stereo; \"{to}\" is {} channels",
             output_config.channels()
         ));
     }
-    let in_channels = input_config.channels() as usize;
-    out!(
-        report,
-        "format    in {} Hz x{} ch ({:?}), out {} Hz x{} ch",
-        rate,
-        input_config.channels(),
-        input_config.sample_format(),
-        output_config.sample_rate(),
-        output_config.channels()
-    );
+    // The sink needs stereo, but the probe also reads a mono microphone: it exists to
+    // answer "may this process capture at all", and a mono device answers that fine.
+    let rate = match &input_config {
+        Some(config) => config.sample_rate(),
+        None => output_config.sample_rate(),
+    };
+    let in_channels = input_config
+        .as_ref()
+        .map(|config| config.channels() as usize)
+        .unwrap_or(2);
+    match &input_config {
+        Some(config) => out!(
+            report,
+            "format    in {} Hz x{} ch ({:?}), out {} Hz x{} ch",
+            config.sample_rate(),
+            config.channels(),
+            config.sample_format(),
+            output_config.sample_rate(),
+            output_config.channels()
+        ),
+        None => out!(
+            report,
+            "format    playing only, out {} Hz x{} ch",
+            output_config.sample_rate(),
+            output_config.channels()
+        ),
+    }
     if output_config.sample_rate() != rate {
         return Err("the two devices report different rates; set both to 48 kHz".to_string());
     }
+
+    // A feeder for the sink: ffmpeg's AudioToolbox output will not start on this macOS,
+    // and something has to put music into the loopback.
+    let audio: Option<Arc<Vec<f32>>> = match &play {
+        Some(path) => Some(Arc::new(read_wav(path)?)),
+        None => None,
+    };
+    if let Some(samples) = &audio {
+        out!(
+            report,
+            "playing   {} frames from {}",
+            samples.len() / 2,
+            play.as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+        );
+    }
+    let cursor = Arc::new(AtomicU64::new(0));
 
     let running = Arc::new(AtomicBool::new(true));
     let in_frames = Arc::new(AtomicU64::new(0));
@@ -102,47 +151,53 @@ fn main() -> Result<(), String> {
     let drops = Arc::new(AtomicU64::new(0));
     let peak = Arc::new(AtomicU64::new(0));
 
-    let input_stream = {
-        let in_frames = Arc::clone(&in_frames);
-        let drops = Arc::clone(&drops);
-        let peak = Arc::clone(&peak);
-        let mut last: Option<f32> = None;
-        // One period at 440 Hz is 109 samples, so neighbouring samples differ by less
-        // than this. A dropped block shows up as a jump several times larger.
-        let jump = (2.0 * std::f32::consts::PI * TONE_HZ / rate as f32).sin() * AMPLITUDE * 4.0;
-        input_device
-            .build_input_stream(
-                &input_config.clone().into(),
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let mut block_peak: f32 = 0.0;
-                    for frame in data.chunks(in_channels) {
-                        let sample = frame[0];
-                        if let Some(previous) = last {
-                            if (sample - previous).abs() > jump {
-                                drops.fetch_add(1, Ordering::Relaxed);
+    let input_stream: Option<cpal::Stream> = match (&input_device, &input_config) {
+        (None, _) => None,
+        (Some(device), Some(config)) => Some({
+            let in_frames = Arc::clone(&in_frames);
+            let drops = Arc::clone(&drops);
+            let peak = Arc::clone(&peak);
+            let mut last: Option<f32> = None;
+            // One period at 440 Hz is 109 samples, so neighbouring samples differ by less
+            // than this. A dropped block shows up as a jump several times larger.
+            let jump = (2.0 * std::f32::consts::PI * TONE_HZ / rate as f32).sin() * AMPLITUDE * 4.0;
+            device
+                .build_input_stream(
+                    &config.clone().into(),
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        let mut block_peak: f32 = 0.0;
+                        for frame in data.chunks(in_channels) {
+                            let sample = frame[0];
+                            if let Some(previous) = last {
+                                if (sample - previous).abs() > jump {
+                                    drops.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
+                            last = Some(sample);
+                            block_peak = block_peak.max(sample.abs());
                         }
-                        last = Some(sample);
-                        block_peak = block_peak.max(sample.abs());
-                    }
-                    peak.fetch_max(block_peak.to_bits() as u64, Ordering::Relaxed);
-                    in_frames.fetch_add((data.len() / in_channels) as u64, Ordering::Relaxed);
-                },
-                |error| eprintln!("input stream error: {error}"),
-                None,
-            )
-            .map_err(|error| {
-                format!(
-                    "opening \"{from}\" for capture: {error}\n\
+                        peak.fetch_max(block_peak.to_bits() as u64, Ordering::Relaxed);
+                        in_frames.fetch_add((data.len() / in_channels) as u64, Ordering::Relaxed);
+                    },
+                    |error| eprintln!("input stream error: {error}"),
+                    None,
+                )
+                .map_err(|error| {
+                    format!(
+                        "opening \"{from}\" for capture: {error}\n\
                      If this is a permissions failure, macOS refused the microphone to this \
                      process; a signed .app needs NSMicrophoneUsageDescription."
-                )
-            })?
+                    )
+                })?
+        }),
+        (Some(_), None) => None,
     };
 
     let output_stream = {
         let out_frames = Arc::clone(&out_frames);
         let running = Arc::clone(&running);
+        let audio = audio.clone();
+        let cursor = Arc::clone(&cursor);
         let mut phase = 0.0f32;
         let step = 2.0 * std::f32::consts::PI * TONE_HZ / rate as f32;
         output_device
@@ -154,12 +209,29 @@ fn main() -> Result<(), String> {
                         out_frames.fetch_add((data.len() / 2) as u64, Ordering::Relaxed);
                         return;
                     }
-                    for frame in data.chunks_mut(2) {
-                        let sample = phase.sin() * AMPLITUDE;
-                        frame.fill(sample);
-                        phase += step;
-                        if phase > std::f32::consts::TAU {
-                            phase -= std::f32::consts::TAU;
+                    match &audio {
+                        Some(samples) => {
+                            let mut at = cursor.load(Ordering::Relaxed) as usize;
+                            for frame in data.chunks_mut(2) {
+                                if at + 1 < samples.len() {
+                                    frame[0] = samples[at];
+                                    frame[1] = samples[at + 1];
+                                    at += 2;
+                                } else {
+                                    frame.fill(0.0);
+                                }
+                            }
+                            cursor.store(at as u64, Ordering::Relaxed);
+                        }
+                        None => {
+                            for frame in data.chunks_mut(2) {
+                                let sample = phase.sin() * AMPLITUDE;
+                                frame.fill(sample);
+                                phase += step;
+                                if phase > std::f32::consts::TAU {
+                                    phase -= std::f32::consts::TAU;
+                                }
+                            }
                         }
                     }
                     out_frames.fetch_add((data.len() / 2) as u64, Ordering::Relaxed);
@@ -170,9 +242,11 @@ fn main() -> Result<(), String> {
             .map_err(|error| format!("opening \"{to}\" for playback: {error}"))?
     };
 
-    input_stream
-        .play()
-        .map_err(|error| format!("starting capture: {error}"))?;
+    if let Some(stream) = &input_stream {
+        stream
+            .play()
+            .map_err(|error| format!("starting capture: {error}"))?;
+    }
     output_stream
         .play()
         .map_err(|error| format!("starting playback: {error}"))?;
@@ -222,6 +296,18 @@ fn main() -> Result<(), String> {
         "played    {played} frames ({:.0} expected)",
         expected
     );
+    if is_feeder {
+        out!(
+            report,
+            "fed       {played} frames into \"{to}\" in {:.1} s",
+            elapsed.as_secs_f64()
+        );
+        if let Some(path) = log {
+            std::fs::write(&path, report.join("\n") + "\n")
+                .map_err(|error| format!("writing {}: {error}", path.display()))?;
+        }
+        return Ok(());
+    }
     out!(
         report,
         "captured  {captured} frames ({:.0} expected), {:.1} dBFS peak{}",
@@ -252,6 +338,29 @@ fn main() -> Result<(), String> {
             .map_err(|error| format!("writing {}: {error}", path.display()))?;
     }
     Ok(())
+}
+
+/// One 48 kHz stereo WAV, read whole: a feeder holds the whole file anyway.
+fn read_wav(path: &std::path::Path) -> Result<Vec<f32>, String> {
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|error| format!("opening {}: {error}", path.display()))?;
+    let spec = reader.spec();
+    if spec.sample_rate != 48_000 || spec.channels != 2 {
+        return Err(format!(
+            "{} is {} Hz x{} ch; the loopback is 48 kHz stereo",
+            path.display(),
+            spec.sample_rate,
+            spec.channels
+        ));
+    }
+    let samples: Result<Vec<f32>, _> = match spec.sample_format {
+        hound::SampleFormat::Int => reader
+            .samples::<i16>()
+            .map(|sample| sample.map(|value| f32::from(value) / 32_768.0))
+            .collect(),
+        hound::SampleFormat::Float => reader.samples::<f32>().collect(),
+    };
+    samples.map_err(|error| format!("reading {}: {error}", path.display()))
 }
 
 fn ppm(frames: u64, elapsed: Duration, rate: u32) -> f64 {

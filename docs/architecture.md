@@ -203,6 +203,7 @@ feed ──▶ dry ring (B + W) ──┐
   number to compare with 1.
 - A stream has no length, no content hash and no segments, so live audio is in memory
   only: nothing about it joins the cache.
+- Capture can succeed and deliver nothing: on macOS an unpermitted process opens the device and reads exact zeros, with no error. The sink treats digital silence as its own state and names the permission, because "it is playing" and "it is capturing" look identical otherwise.
 - A file feed has one clock. The sink has two — the capture device and the output device
   drift by tens of ppm — so the sink owns a rate correction; the spike measures which
   one, and a restart-on-drift is the fallback that beats a click.

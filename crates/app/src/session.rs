@@ -513,7 +513,7 @@ impl Session {
             .model()
             .context("starting the model worker")?;
 
-        let mut feed = sink::CaptureFeed::open(from)?;
+        let mut feed = sink::CaptureFeed::open(from, sink::ring_capacity(policy.window_frames))?;
         let captured_from = feed.name().to_string();
         let cutoff_hz = sink::measure_cutoff(&mut feed, &captured_from)?;
         let stats = feed.stats();
@@ -564,7 +564,7 @@ impl Session {
                 to,
                 fallback,
                 cutoff_hz,
-                ring_capacity_frames: sink::RING_FRAMES,
+                ring_capacity_frames: sink::ring_capacity(policy.window_frames),
                 latency_secs: policy.total_latency_secs + ring_secs,
                 stats,
                 stop,

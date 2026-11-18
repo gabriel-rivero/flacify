@@ -3,12 +3,14 @@
 A desktop player that reconstructs the high frequencies an MP3 threw away, and lets
 you hear the difference on a single keystroke.
 
-Status: **prototype, playable on macOS, Linux and Windows.** `flacify setup` installs the
-Python sidecar and the model, `flacify enhance` renders a file, and `flacify play` opens a
-window with an instant A/B switch. The Rust side owns decode, analysis, the windowing
-pipeline, the seed schedule and the mixer; the model runs in a Python process the app
-installs and owns (ADR-010), because ONNX Runtime measured 30 to 60x slower than PyTorch on
-the same Apple Silicon (ADR-002). The working reference implementation is the Python PoC,
+Status: **1.0**, playable on macOS, Linux and Windows. `flacify setup` installs the
+Python sidecar and the model, `flacify enhance` renders a file, `flacify play` opens a
+window with an instant A/B switch, and `flacify play --live` renders a file while it plays
+from bounded memory. `flacify sink` does the same for system audio on macOS. The Rust side
+owns decode, analysis, the windowing pipeline, the seed schedule and the mixer; the model
+runs in a Python process the app installs and owns (ADR-010), because ONNX Runtime measured
+30 to 60x slower than PyTorch on the same Apple Silicon (ADR-002). The working reference
+implementation is the Python PoC,
 [`gabriel-rivero/flashsr-stream`](https://github.com/gabriel-rivero/flashsr-stream).
 
 `play` no longer waits for a whole render: it starts the original as soon as the device

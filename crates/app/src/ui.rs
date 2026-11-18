@@ -1525,7 +1525,7 @@ mod tests {
             to: "External Headphones".to_string(),
             fallback: fallback.map(str::to_string),
             cutoff_hz: 15_200,
-            ring_capacity_frames: crate::sink::RING_FRAMES,
+            ring_capacity_frames: crate::sink::MIN_RING_FRAMES,
             latency_secs: 2.78,
             stats,
             stop: Arc::new(AtomicBool::new(false)),
@@ -1556,7 +1556,7 @@ mod tests {
     fn given_a_capture_of_digital_silence_when_labelled_then_the_panel_says_capture_silent() {
         let route = sink_route(None);
         let silent = vec![0.0f32; crate::sink::SILENT_FRAMES * 2];
-        let ring = crate::live::Ring::new(crate::sink::RING_FRAMES, 2);
+        let ring = crate::live::Ring::new(crate::sink::MIN_RING_FRAMES, 2);
         let head = std::sync::atomic::AtomicUsize::new(0);
         crate::sink::write_capture(&ring, &head, &route.stats, &silent);
 

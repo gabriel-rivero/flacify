@@ -27,11 +27,25 @@ use crate::live::{self, Feed};
 /// The live path is 48 kHz stereo end to end, and so is the ring.
 const CHANNELS: usize = 2;
 
-/// Frames the capture ring holds: 400 ms, twice the fill the loop steers to.
-pub const RING_FRAMES: usize = 19_200;
+/// The smallest capture ring: 400 ms.
+pub const MIN_RING_FRAMES: usize = 19_200;
 
-/// The fill the loop steers to: half the ring, so a resync has equal room both ways.
-pub const TARGET_FILL_FRAMES: usize = RING_FRAMES / 2;
+/// The capture ring's capacity for a model window.
+///
+/// A capture callback cannot be blocked, so the ring has to absorb the whole model call
+/// that keeps its consumer away: one window, floored at 400 ms. A ring sized to the
+/// steering target alone overflowed on every 5.12 s window and dropped 230 s of a
+/// ten-minute run.
+pub fn ring_capacity(window_frames: usize) -> usize {
+    window_frames.max(MIN_RING_FRAMES)
+}
+
+/// The fill the loop steers to: 200 ms, independent of the ring's capacity, so a larger
+/// ring is headroom for one slow call and not added latency.
+pub const TARGET_FILL_FRAMES: usize = 9_600;
+
+/// How far a resync jumps: 100 ms, fixed, so a bigger ring does not mean a bigger jump.
+pub const RESYNC_JUMP_FRAMES: usize = 4_800;
 
 /// The crossfade a resync splices the jump over: 10 ms, long enough to hide the step and
 /// short enough that the ring does not have to hold much for it.
@@ -214,9 +228,9 @@ pub enum Resync {
 
 /// The resync a saturated loop at an edge asks for, or `None` while the fill is inside.
 ///
-/// The edges are a quarter ring from either end, and the jump is a quarter ring, so either
-/// answer puts the fill back on its target: `RING_FRAMES / 4` is 100 ms. A repeat also needs a writer that is still
-/// moving: repeating a ring whose capture has stopped would loop a few milliseconds
+/// The edges are one jump from either end, and the jump is fixed at 100 ms, so a bigger
+/// ring is headroom and not a bigger correction. A repeat also needs a writer that is
+/// still moving: repeating a ring whose capture has stopped would loop a few milliseconds
 /// forever instead of letting the playhead starve, which is the caller's to count.
 pub fn resync_for(
     fill: usize,
@@ -224,14 +238,15 @@ pub fn resync_for(
     ppm: f64,
     is_writer_moving: bool,
 ) -> Option<Resync> {
-    if ppm >= MAX_CORRECTION_PPM && fill * 4 >= capacity * 3 {
-        return Some(Resync::Skip(capacity / 4));
+    let is_flooding = ppm >= MAX_CORRECTION_PPM && fill + RESYNC_JUMP_FRAMES >= capacity;
+    if is_flooding {
+        return Some(Resync::Skip(RESYNC_JUMP_FRAMES));
     }
-    let is_draining = ppm <= -MAX_CORRECTION_PPM && fill * 4 <= capacity;
+    let is_draining = ppm <= -MAX_CORRECTION_PPM && fill <= RESYNC_JUMP_FRAMES;
     if !is_draining || !is_writer_moving || fill < MIN_REPEAT_FRAMES {
         return None;
     }
-    Some(Resync::Repeat((capacity / 4).min(fill)))
+    Some(Resync::Repeat(RESYNC_JUMP_FRAMES.min(fill)))
 }
 
 /// The fill a read at `position` sees: captured frames it has not consumed yet.
@@ -462,9 +477,9 @@ impl CaptureFeed {
     /// The caller resolves the name; a name that resolves to no device is an error here
     /// too, because recording the built-in microphone because a loopback was misspelled is
     /// not the stream the user asked for.
-    pub(crate) fn open(name: &str) -> Result<Self> {
+    pub(crate) fn open(name: &str, capacity: usize) -> Result<Self> {
         let input = Input::open_named(Some(name))?;
-        let ring = Arc::new(live::Ring::new(RING_FRAMES, CHANNELS));
+        let ring = Arc::new(live::Ring::new(capacity, CHANNELS));
         let head = Arc::new(AtomicUsize::new(0));
         let stats = Arc::new(SinkStats::default());
         let is_stopping = Arc::new(AtomicBool::new(false));
@@ -661,7 +676,11 @@ mod tests {
 
     impl Sim {
         fn new() -> Self {
-            let ring = Arc::new(live::Ring::new(RING_FRAMES, CHANNELS));
+            Self::with_capacity(MIN_RING_FRAMES)
+        }
+
+        fn with_capacity(capacity: usize) -> Self {
+            let ring = Arc::new(live::Ring::new(capacity, CHANNELS));
             let head = Arc::new(AtomicUsize::new(0));
             let stats = Arc::new(SinkStats::default());
             let reader = Reader::new(Arc::clone(&ring), Arc::clone(&head), Arc::clone(&stats));
@@ -827,9 +846,35 @@ mod tests {
     }
 
     #[test]
+    fn given_a_window_when_the_capture_ring_is_sized_then_it_absorbs_one_model_call() {
+        // A capture callback cannot be blocked, so the ring must hold what the consumer
+        // cannot read while the model runs: one window. A ring sized to the steering
+        // target (400 ms) overflowed on every 5.12 s window and dropped 230 s of a
+        // ten-minute run.
+        assert_eq!(ring_capacity(245_760), 245_760);
+        assert_eq!(ring_capacity(10_000), MIN_RING_FRAMES);
+        assert_eq!(ring_capacity(30_720), 30_720);
+        assert!(TARGET_FILL_FRAMES * 2 <= ring_capacity(245_760));
+    }
+
+    #[test]
+    fn given_a_model_call_longer_than_the_target_when_captured_then_nothing_is_dropped() {
+        // The consumer is away for one 5.12 s window; the writer keeps producing at real
+        // time. With the old 400 ms ring this dropped the difference.
+        let mut sim = Sim::with_capacity(ring_capacity(245_760));
+        sim.produce(245_760, 0.0);
+        assert_eq!(
+            sim.stats.dropped_frames(),
+            0,
+            "a whole window of capture must fit the ring"
+        );
+        assert!(sim.fill() <= ring_capacity(245_760));
+    }
+
+    #[test]
     fn given_a_full_or_empty_ring_when_corrected_then_the_clamp_holds() {
         assert_eq!(
-            correction_for(RING_FRAMES, TARGET_FILL_FRAMES),
+            correction_for(MIN_RING_FRAMES, TARGET_FILL_FRAMES),
             MAX_CORRECTION_PPM
         );
         assert_eq!(correction_for(0, TARGET_FILL_FRAMES), -MAX_CORRECTION_PPM);
@@ -837,7 +882,7 @@ mod tests {
 
     #[test]
     fn given_a_saturated_loop_at_an_edge_when_asked_then_it_resyncs_the_other_way() {
-        let capacity = RING_FRAMES;
+        let capacity = MIN_RING_FRAMES;
         assert_eq!(
             resync_for(capacity * 3 / 4, capacity, MAX_CORRECTION_PPM, true),
             Some(Resync::Skip(capacity / 4))
@@ -856,21 +901,35 @@ mod tests {
     fn given_a_stopped_capture_at_the_low_edge_when_asked_then_it_is_left_to_starve() {
         // A stopped capture is not drift: repeating it would loop a few milliseconds
         // forever instead of letting the playhead run dry, which is the caller's to count.
-        assert_eq!(resync_for(0, RING_FRAMES, -MAX_CORRECTION_PPM, true), None);
         assert_eq!(
-            resync_for(RING_FRAMES / 4, RING_FRAMES, -MAX_CORRECTION_PPM, false),
+            resync_for(0, MIN_RING_FRAMES, -MAX_CORRECTION_PPM, true),
+            None
+        );
+        assert_eq!(
+            resync_for(
+                MIN_RING_FRAMES / 4,
+                MIN_RING_FRAMES,
+                -MAX_CORRECTION_PPM,
+                false
+            ),
             None
         );
         assert_eq!(
             resync_for(
                 MIN_REPEAT_FRAMES - 1,
-                RING_FRAMES,
+                MIN_RING_FRAMES,
                 -MAX_CORRECTION_PPM,
                 true
             ),
             None
         );
-        assert!(resync_for(MIN_REPEAT_FRAMES, RING_FRAMES, -MAX_CORRECTION_PPM, true).is_some());
+        assert!(resync_for(
+            MIN_REPEAT_FRAMES,
+            MIN_RING_FRAMES,
+            -MAX_CORRECTION_PPM,
+            true
+        )
+        .is_some());
     }
 
     #[test]
@@ -883,8 +942,8 @@ mod tests {
         );
         assert_eq!(run.frames, minutes * 60 * SAMPLE_RATE as usize);
         assert!(
-            run.min_fill > RING_FRAMES / 4 && run.max_fill < RING_FRAMES * 3 / 4,
-            "the fill ran {}..{} frames of a {RING_FRAMES} frame ring",
+            run.min_fill > MIN_RING_FRAMES / 4 && run.max_fill < MIN_RING_FRAMES * 3 / 4,
+            "the fill ran {}..{} frames of a {MIN_RING_FRAMES} frame ring",
             run.min_fill,
             run.max_fill
         );
@@ -926,8 +985,8 @@ mod tests {
             run.max_step
         );
         assert!(
-            run.max_fill < RING_FRAMES,
-            "the fill reached {} frames of {RING_FRAMES}",
+            run.max_fill < MIN_RING_FRAMES,
+            "the fill reached {} frames of {MIN_RING_FRAMES}",
             run.max_fill
         );
     }
@@ -981,7 +1040,7 @@ mod tests {
 
     #[test]
     fn given_a_capture_that_stops_when_the_feed_is_read_then_it_ends_rather_than_pads() {
-        let ring = Arc::new(live::Ring::new(RING_FRAMES, CHANNELS));
+        let ring = Arc::new(live::Ring::new(MIN_RING_FRAMES, CHANNELS));
         let head = Arc::new(AtomicUsize::new(0));
         let stats = Arc::new(SinkStats::default());
         let mut feed = CaptureFeed::without_device(ring, head, stats);
@@ -999,7 +1058,7 @@ mod tests {
 
     #[test]
     fn given_a_capture_that_fails_mid_stream_when_read_then_the_frames_it_had_are_played() {
-        let ring = Arc::new(live::Ring::new(RING_FRAMES, CHANNELS));
+        let ring = Arc::new(live::Ring::new(MIN_RING_FRAMES, CHANNELS));
         let head = Arc::new(AtomicUsize::new(0));
         let stats = Arc::new(SinkStats::default());
         let mut feed =
@@ -1126,17 +1185,17 @@ mod tests {
     fn given_a_capture_of_digital_silence_when_read_then_the_state_says_silent() {
         // Five seconds of zeros is the state, and one block with signal ends it: the sink
         // can never report a running capture while it is being handed silence.
-        let ring = Arc::new(live::Ring::new(RING_FRAMES, CHANNELS));
+        let ring = Arc::new(live::Ring::new(MIN_RING_FRAMES, CHANNELS));
         let head = Arc::new(AtomicUsize::new(0));
         let stats = SinkStats::default();
         assert_eq!(stats.capture_state(), CaptureState::Signal);
         assert!(!stats.has_carried_signal());
 
-        let silent = vec![0.0f32; RING_FRAMES * CHANNELS];
+        let silent = vec![0.0f32; MIN_RING_FRAMES * CHANNELS];
         let mut written = 0;
         while written < SILENT_FRAMES {
             write_capture(&ring, &head, &stats, &silent);
-            written += RING_FRAMES;
+            written += MIN_RING_FRAMES;
         }
         assert_eq!(stats.silent_frames(), SILENT_FRAMES);
         assert_eq!(stats.capture_state(), CaptureState::Silent);
@@ -1180,14 +1239,14 @@ mod tests {
         const BUFFER: usize = 2_048;
         const WINDOW: usize = 1_024;
         let policy = test_policy(BUFFER, WINDOW);
-        let ring = Arc::new(live::Ring::new(RING_FRAMES, CHANNELS));
+        let ring = Arc::new(live::Ring::new(MIN_RING_FRAMES, CHANNELS));
         let head = Arc::new(AtomicUsize::new(0));
         let stats = Arc::new(SinkStats::default());
         // Four hundred milliseconds of capture and then nothing: the pump reads what the
         // ring holds and waits on a device that has stopped.
         // A constant, so a starved frame is told from a covered one without tracking which
         // capture frame the trim happens to be reading.
-        let captured = vec![0.5f32; RING_FRAMES * CHANNELS];
+        let captured = vec![0.5f32; MIN_RING_FRAMES * CHANNELS];
         write_capture(&ring, &head, &stats, &captured);
         let feed =
             CaptureFeed::without_device(Arc::clone(&ring), Arc::clone(&head), Arc::clone(&stats));

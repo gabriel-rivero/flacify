@@ -183,7 +183,10 @@ fn report(playback: &mut Playback, watch_secs: f64) -> Result<()> {
         "band      cutoff {} Hz, measured on the first second of capture",
         route.cutoff_hz
     );
-    println!("capture   {}", capture_line(&sink_stats));
+    println!(
+        "capture   {}",
+        capture_line(&sink_stats, route.ring_capacity_frames)
+    );
     if sink_stats.capture_state() == CaptureState::Silent {
         println!("silent    {}", sink::SILENT_HINT);
     }
@@ -252,7 +255,7 @@ fn report(playback: &mut Playback, watch_secs: f64) -> Result<()> {
 
 /// The capture line: the state first, because a silent capture makes every other number on
 /// the report meaningless.
-fn capture_line(stats: &SinkStats) -> String {
+fn capture_line(stats: &SinkStats, capacity: usize) -> String {
     let state = match stats.capture_state() {
         CaptureState::Signal => "signal",
         CaptureState::Silent => "silent",
@@ -260,7 +263,7 @@ fn capture_line(stats: &SinkStats) -> String {
     format!(
         "{state} · fill {} of {} frames, correction {:+.0} ppm (peak {:.0}), {} dropped",
         stats.fill_frames(),
-        sink::RING_FRAMES,
+        capacity,
         stats.correction_ppm(),
         stats.peak_correction_ppm(),
         stats.dropped_frames()
@@ -360,17 +363,17 @@ mod tests {
     #[test]
     fn given_a_capture_that_never_carried_signal_when_reported_then_it_says_silent() {
         let stats = SinkStats::default();
-        let line = capture_line(&stats);
+        let line = capture_line(&stats, crate::sink::MIN_RING_FRAMES);
         assert!(line.starts_with("signal"), "{line}");
 
         // Five seconds of zeros, as a refused microphone permission delivers.
         let silent = vec![0.0f32; crate::sink::SILENT_FRAMES * 2];
-        let ring = crate::live::Ring::new(crate::sink::RING_FRAMES, 2);
+        let ring = crate::live::Ring::new(crate::sink::MIN_RING_FRAMES, 2);
         let head = std::sync::atomic::AtomicUsize::new(0);
         crate::sink::write_capture(&ring, &head, &stats, &silent);
         assert_eq!(stats.capture_state(), CaptureState::Silent);
         assert!(!stats.has_carried_signal());
-        let line = capture_line(&stats);
+        let line = capture_line(&stats, crate::sink::MIN_RING_FRAMES);
         assert!(line.starts_with("silent"), "{line}");
         assert!(
             sink::SILENT_HINT.contains("Microphone"),

@@ -265,6 +265,11 @@ fn report(playback: &Playback, started: Instant, watch_secs: f64) -> Result<()> 
         frames as f64 / f64::from(engine.device_rate),
         watch
     );
+    println!(
+        "dropouts  {} frames of silence ({:.3} s) from segment misses",
+        engine.controls.underrun_frames(),
+        engine.controls.underrun_frames() as f64 / f64::from(engine.device_rate)
+    );
     println!("model     {}", info.device);
     println!(
         "generated {:.1} s ready of {:.1} s",

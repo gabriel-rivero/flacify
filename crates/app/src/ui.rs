@@ -327,6 +327,17 @@ impl PlayerApp {
                 .weak()
                 .size(11.0),
             );
+            let dropouts = controls.underrun_frames();
+            if dropouts > 0 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "dropouts: {:.1} s",
+                        dropouts as f64 / f64::from(rate)
+                    ))
+                    .weak()
+                    .size(11.0),
+                );
+            }
         });
     }
 

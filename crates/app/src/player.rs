@@ -13,7 +13,7 @@
 //!
 //! Nothing here allocates, locks or logs: `fill` is called from the audio callback.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::frontier::{Frontier, CHUNK_FRAMES};
@@ -47,9 +47,21 @@ pub struct Controls {
     pub auto_promote: AtomicBool,
     /// True after that promotion has happened, so toggling back sticks.
     pub promoted: AtomicBool,
+    /// Frames a segment-backed play asked for and could not fill, i.e. the audible cost
+    /// of a segment miss. The live path counts its own starvation in [`live::Stats`].
+    underrun_frames: AtomicU64,
 }
 
 impl Controls {
+    /// Frames of silence written because a segment had not arrived.
+    pub fn underrun_frames(&self) -> u64 {
+        self.underrun_frames.load(Ordering::Relaxed)
+    }
+
+    fn add_underrun(&self, frames: usize) {
+        self.underrun_frames
+            .fetch_add(frames as u64, Ordering::Relaxed);
+    }
     /// Keep the A/B switch on the original until the user asks for it.
     ///
     /// A blind test needs the enhanced side not to appear on its own, and `promote_if_ready`
@@ -203,6 +215,7 @@ impl Mixer {
             stats: None,
             auto_promote: AtomicBool::new(false),
             promoted: AtomicBool::new(has_enhanced),
+            underrun_frames: AtomicU64::new(0),
         });
         let mixer = Self {
             source: Source::Whole {
@@ -239,6 +252,7 @@ impl Mixer {
             stats: None,
             auto_promote: AtomicBool::new(true),
             promoted: AtomicBool::new(false),
+            underrun_frames: AtomicU64::new(0),
         });
         let mixer = Self {
             source: Source::Progressive {
@@ -265,6 +279,7 @@ impl Mixer {
             stats: None,
             auto_promote: AtomicBool::new(false),
             promoted: AtomicBool::new(has_enhanced),
+            underrun_frames: AtomicU64::new(0),
         });
         let mixer = Self {
             source: Source::Segmented(reader),
@@ -291,6 +306,7 @@ impl Mixer {
             stats: Some(source.stats()),
             auto_promote: AtomicBool::new(false),
             promoted: AtomicBool::new(false),
+            underrun_frames: AtomicU64::new(0),
         });
         let mixer = Self {
             source: Source::Live(source),
@@ -456,6 +472,10 @@ impl Mixer {
                     reader.request(position);
                     let guard = reader.segment_at(position);
                     let Some(segment) = guard.as_ref() else {
+                        // Nothing to play yet, so the rest of this buffer is silence. The
+                        // playhead does not advance, and the frames are counted because
+                        // this is the one path where a miss is audible.
+                        self.controls.add_underrun(frames - written);
                         out[written * channels..].fill(0.0);
                         break;
                     };
@@ -750,6 +770,7 @@ mod tests {
         let mut out = vec![1.0f32; 1_000 * 2];
         warm_up(&mut mixer, &mut out);
         out.fill(1.0);
+        let starved_before = controls.underrun_frames();
         let (written, allocated) = crate::alloc_counter::measure(|| mixer.fill(&mut out));
         assert_eq!(written, 0, "the fill must hold rather than block");
         assert_eq!(allocated, 0, "the callback must not allocate");
@@ -758,6 +779,11 @@ mod tests {
             controls.position_frames(),
             7 * SEGMENT,
             "the playhead must not advance over frames it could not read"
+        );
+        assert_eq!(
+            controls.underrun_frames() - starved_before,
+            1_000,
+            "the frames this buffer went short are the measure A1 quotes"
         );
     }
 

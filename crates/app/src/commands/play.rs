@@ -98,8 +98,8 @@ fn report(playback: &Playback, started: Instant) -> Result<()> {
         first_audio.as_secs_f64()
     );
     println!(
-        "device    {} Hz x {} ch",
-        engine.device_rate, engine.device_channels
+        "device    \"{}\" {} Hz x {} ch",
+        engine.device_name, engine.device_rate, engine.device_channels
     );
     println!(
         "played    {frames} frames ({:.2} s of audio) in {:.0} s of watching",

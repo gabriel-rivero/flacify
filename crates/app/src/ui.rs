@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use crate::device::AudioEngine;
+use crate::device::{self, AudioEngine};
 use crate::frontier::Frontier;
 use crate::render_status::RenderStatus;
 use crate::session::{Playback, Session};
@@ -269,10 +269,11 @@ impl PlayerApp {
         };
         ui.label(
             egui::RichText::new(format!(
-                "{} · cutoff {} Hz · {} · out {} Hz × {} ch{}",
+                "{} · cutoff {} Hz · {} · out \"{}\" {} Hz × {} ch{}",
                 self.info.device,
                 self.info.cutoff_hz,
                 source,
+                self.engine.device_name,
                 rate,
                 self.engine.device_channels,
                 matched
@@ -286,16 +287,9 @@ impl PlayerApp {
                 .size(11.0),
         );
 
-        let errors = self
-            .engine
-            .stream_errors
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if errors > 0 {
-            ui.label(
-                egui::RichText::new(format!("device stream errors: {errors}"))
-                    .weak()
-                    .size(11.0),
-            );
+        if let Some(warning) = device::stream_warning(&self.engine.device_name, device::counters())
+        {
+            ui.label(egui::RichText::new(warning).weak().size(11.0));
         }
 
         // The hardware gate: say it rather than let the switch silently never unlock.

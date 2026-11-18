@@ -54,6 +54,7 @@ fn main() -> Result<()> {
             window,
             rtf,
             watch,
+            seek,
         } => commands::play::run(commands::play::Request {
             file: &file,
             smoke,
@@ -64,6 +65,7 @@ fn main() -> Result<()> {
                 None
             },
             watch_secs: watch,
+            seek_secs: seek,
         }),
         Command::Devices => commands::devices::run(),
         Command::Batch { dir, dry_run } => commands::batch::run(&dir, dry_run),

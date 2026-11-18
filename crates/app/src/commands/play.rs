@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use flacify_core::{Preset, Probe, SAMPLE_RATE};
@@ -22,6 +22,8 @@ pub(crate) struct Request<'a> {
     pub live: Option<LiveOptions>,
     /// Seconds a smoke run listens before it reports.
     pub watch_secs: f64,
+    /// Where to start, when `--seek` was given.
+    pub seek_secs: Option<f64>,
 }
 
 /// The two numbers `--live` needs before a policy exists: which window, and what the
@@ -86,10 +88,14 @@ pub(crate) fn run(request: Request<'_>) -> Result<()> {
         return ui::run(ui::PlayerApp::new(session, playback))
             .map_err(|error| anyhow::anyhow!("{error}"));
     }
+    let seek = request.seek_secs.map(|seconds| {
+        let rate = playback.engine.device_rate;
+        seek_to(&playback, seconds, rate)
+    });
     let result = if playback.live.is_some() {
         report_live(&mut playback, request.watch_secs)
     } else {
-        report(&playback, started, request.watch_secs)
+        report(&playback, started, request.watch_secs, seek)
     };
     playback.cancel();
     result
@@ -208,7 +214,67 @@ fn secs(frames: usize) -> String {
 /// the generated signal and the frontier stays ahead from there (it runs at about 1.28x
 /// realtime once the model is loaded). A patience budget catches the slow machine that
 /// never gets there: it starts on the original and the automatic promotion does the rest.
-fn report(playback: &Playback, started: Instant, watch_secs: f64) -> Result<()> {
+/// What a `--seek` cost, in the terms the acceptance run records.
+struct SeekOutcome {
+    target_secs: f64,
+    waited_secs: f64,
+    starved_frames: u64,
+    landed: bool,
+}
+
+/// The line a seek prints, separated so the landed and starved cases are testable.
+fn seek_line(seek: &SeekOutcome, rate: u32) -> String {
+    format!(
+        "seek      to {:.1} s {} after {:.2} s, starved {} frames ({:.3} s)",
+        seek.target_secs,
+        if seek.landed {
+            "landed"
+        } else {
+            "did not land"
+        },
+        seek.waited_secs,
+        seek.starved_frames,
+        seek.starved_frames as f64 / f64::from(rate)
+    )
+}
+
+/// Move the playhead and wait for audio to resume there.
+///
+/// A seek into an unrendered segment holds the playhead and plays silence until the
+/// prefetch catches up, so waiting for the position to reach the target is exactly the
+/// measurement: how long the listener hears nothing, and how much of it was counted.
+fn seek_to(playback: &Playback, seconds: f64, rate: u32) -> SeekOutcome {
+    let target = (seconds.max(0.0) * f64::from(rate)) as usize;
+    let starved_before = playback.engine.controls.underrun_frames();
+    let started = Instant::now();
+    playback.engine.controls.seek_frames(target);
+    let deadline = Duration::from_secs(10);
+    let mut landed = false;
+    while started.elapsed() < deadline {
+        if playback.engine.controls.position_frames() >= target {
+            landed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    SeekOutcome {
+        target_secs: seconds.max(0.0),
+        waited_secs: started.elapsed().as_secs_f64(),
+        starved_frames: playback
+            .engine
+            .controls
+            .underrun_frames()
+            .saturating_sub(starved_before),
+        landed,
+    }
+}
+
+fn report(
+    playback: &Playback,
+    started: Instant,
+    watch_secs: f64,
+    seek: Option<SeekOutcome>,
+) -> Result<()> {
     let engine = &playback.engine;
     let info = &playback.info;
     let rate = engine.device_rate as usize;
@@ -270,6 +336,9 @@ fn report(playback: &Playback, started: Instant, watch_secs: f64) -> Result<()> 
         engine.controls.underrun_frames(),
         engine.controls.underrun_frames() as f64 / f64::from(engine.device_rate)
     );
+    if let Some(seek) = seek {
+        println!("{}", seek_line(&seek, engine.device_rate));
+    }
     println!("model     {}", info.device);
     println!(
         "generated {:.1} s ready of {:.1} s",
@@ -314,7 +383,36 @@ mod tests {
             splice,
             live,
             watch_secs: 4.0,
+            seek_secs: None,
         }
+    }
+
+    #[test]
+    fn given_a_seek_that_landed_when_reported_then_it_states_the_wait_and_the_silence() {
+        let seek = SeekOutcome {
+            target_secs: 3300.0,
+            waited_secs: 0.184,
+            starved_frames: 4_800,
+            landed: true,
+        };
+        let line = seek_line(&seek, 48_000);
+        assert!(line.contains("to 3300.0 s landed after 0.18 s"), "{line}");
+        assert!(line.contains("starved 4800 frames (0.100 s)"), "{line}");
+    }
+
+    #[test]
+    fn given_a_seek_that_never_landed_when_reported_then_it_says_so() {
+        let seek = SeekOutcome {
+            target_secs: 55.0,
+            waited_secs: 10.0,
+            starved_frames: 480_000,
+            landed: false,
+        };
+        let line = seek_line(&seek, 48_000);
+        assert!(
+            line.starts_with("seek      to 55.0 s did not land"),
+            "{line}"
+        );
     }
 
     #[test]

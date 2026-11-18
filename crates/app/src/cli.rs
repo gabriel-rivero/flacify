@@ -71,6 +71,10 @@ pub(crate) enum Command {
         /// Seconds a --smoke run listens before it reports.
         #[arg(long, default_value_t = 4.0)]
         watch: f64,
+        /// Start at this many seconds instead of the beginning. The smoke report says how
+        /// long the seek took and what it starved, which is the acceptance run's check.
+        #[arg(long)]
+        seek: Option<f64>,
     },
     /// List the capture and playback devices, with the rate and channels each defaults to.
     Devices,

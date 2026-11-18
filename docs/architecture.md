@@ -186,7 +186,8 @@ feed ──▶ dry ring (B + W) ──┐
 - Resident audio is `(2B + W + block) × 2 channels × 4 bytes`. It is the rings only; the
   model's own input window and the in-flight output block are not counted. The wet ring
   carries one block over `B` so a whole-block write can land while the ring is otherwise
-  full; what the playhead can be behind is still `B`.
+  full; what the playhead can be behind is still `B`. The sink adds its own capture ring in
+  front of the dry ring: 400 ms, 153 600 bytes, steered to half full.
 - Credit backpressure: the producer blocks while the wet ring is `B` ahead of the
   playhead. Nothing is dropped and nothing grows; a slow model slows the producer instead
   of the memory.
@@ -204,8 +205,18 @@ feed ──▶ dry ring (B + W) ──┐
 - A stream has no length, no content hash and no segments, so live audio is in memory
   only: nothing about it joins the cache.
 - A file feed has one clock. The sink has two — the capture device and the output device
-  drift by tens of ppm — so the sink owns a rate correction; the spike measures which
-  one, and a restart-on-drift is the fallback that beats a click.
+  drift by tens of ppm — so the sink corrects the rate instead of restarting: the capture
+  ring is read through a Catmull-Rom interpolator whose ratio is a proportional controller
+  on the ring's fill, `ppm = 2 × (fill − target)` clamped to ±1000 ppm, with the target at
+  half of the 400 ms ring. The plant is first order, so the loop settles without overshoot:
+  a 10 s time constant, and 50 ppm of drift held at 25 frames of error. When the correction
+  saturates and the fill reaches a quarter-ring edge, the read drops or repeats a quarter
+  ring (100 ms) under a 10 ms crossfade and counts a resync, because a deliberate resync
+  beats a click or a latency that grows until the ring tears.
+- A capture that delivers 5 s of digital silence is a state of its own, not quiet audio.
+  macOS never refuses the input device for a missing Microphone permission; it opens it and
+  returns zeros, so the permission is named rather than guessed at, and the sink refuses to
+  start on that state.
 - In 1.0 this path is opt-in (`play --live`, `flacify sink`). The default first play of
   an uncached file stays on the progressive path until 1.1.
 

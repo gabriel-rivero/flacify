@@ -8,3 +8,4 @@ pub(crate) mod enhance;
 pub(crate) mod play;
 pub(crate) mod probe;
 pub(crate) mod setup;
+pub(crate) mod sink;

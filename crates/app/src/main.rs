@@ -25,6 +25,7 @@ mod render_status;
 mod segments;
 mod session;
 mod setup;
+mod sink;
 mod source;
 mod spectrum;
 mod splice;
@@ -66,6 +67,20 @@ fn main() -> Result<()> {
             watch_secs: watch,
         }),
         Command::Devices => commands::devices::run(),
+        Command::Sink {
+            from,
+            to,
+            window,
+            rtf,
+            smoke,
+            watch,
+        } => commands::sink::run(commands::sink::Request {
+            from: &from,
+            to: &to,
+            live: commands::play::LiveOptions::parse(&window, rtf)?,
+            smoke,
+            watch_secs: watch,
+        }),
         Command::Batch { dir, dry_run } => commands::batch::run(&dir, dry_run),
         Command::Ab {
             file,

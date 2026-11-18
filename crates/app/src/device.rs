@@ -68,13 +68,13 @@ pub enum Resolution {
 
 /// Which side of the device the caller is asking about.
 #[derive(Clone, Copy, Debug)]
-enum Direction {
+pub(crate) enum Direction {
     Input,
     Output,
 }
 
 impl Direction {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Direction::Input => "input",
             Direction::Output => "output",
@@ -139,8 +139,13 @@ fn device_names(available: &[DeviceInfo]) -> Vec<String> {
     available.iter().map(|info| info.name.clone()).collect()
 }
 
-/// The error for a name that matched nothing, or matched more than one thing.
-fn missing_message(direction: Direction, requested: &str, available: &[String]) -> String {
+/// The error for a name that matched nothing, or matched more than one thing. Public
+/// inside the crate so a command that must not fall back can reuse the wording.
+pub(crate) fn missing_message(
+    direction: Direction,
+    requested: &str,
+    available: &[String],
+) -> String {
     let kind = direction.label();
     let listed = if available.is_empty() {
         "(none)".to_string()
@@ -404,7 +409,14 @@ impl AudioEngine {
     /// Play a live feed: the rings are the source, so nothing is resampled per chunk and
     /// the device must take 48 kHz stereo.
     pub fn start_live(source: Arc<live::Live>) -> Result<Self> {
-        let output = Output::open_named(None)?;
+        Self::start_live_on(source, None)
+    }
+
+    /// Play a live feed on the named output, or on the default when the name resolves to
+    /// nothing: the sink names its output, and a miss plays through the default rather than
+    /// silent. The caller states the reason it fell back.
+    pub fn start_live_on(source: Arc<live::Live>, requested: Option<&str>) -> Result<Self> {
+        let output = Output::open_named(requested)?;
         if output.rate != flacify_core::SAMPLE_RATE || output.channels != 2 {
             anyhow::bail!(
                 "{}",
@@ -628,9 +640,8 @@ pub fn progressive_supported() -> bool {
 /// A capture device and the configuration it defaults to.
 ///
 /// `build_input_stream` starts capture; the caller keeps the stream and drops it to stop.
-/// The sink (K1) is the first caller: nothing in 0.4 opens a capture device, so this is
-/// built ahead of its consumer on purpose.
-#[allow(dead_code)]
+/// The sink is the caller: capture is never resampled, and a device that cannot do 48 kHz
+/// stereo is refused here rather than converted twice.
 pub struct Input {
     device: cpal::Device,
     config: cpal::StreamConfig,
@@ -644,7 +655,7 @@ pub struct Input {
 impl Input {
     /// The named device, or the default. Live mode feeds 48 kHz stereo into the rings, so a
     /// device that cannot do that is refused here with its actual format rather than
-    /// resampled (K1 owns that decision).
+    /// resampled: the sink's correction is a rate trim, not a format converter.
     pub fn open_named(requested: Option<&str>) -> Result<Self> {
         let host = cpal::default_host();
         let device = match choose(&host, Direction::Input, requested)? {
@@ -676,44 +687,54 @@ impl Input {
     }
 
     /// Start capture at the device's default configuration: interleaved f32 blocks reach
-    /// `on_block` until the returned stream is dropped. Blocks are converted into one
-    /// buffer that only grows when a bigger block arrives.
-    pub fn build_input_stream<F>(&self, on_block: F) -> Result<cpal::Stream>
+    /// `on_block` until the returned stream is dropped, and `on_error` is called when the
+    /// stream fails. The conversion buffer is allocated here, once: the callback neither
+    /// allocates nor grows it, and a block longer than [`MAX_FRAMES`] is truncated and
+    /// counted instead of reallocated.
+    pub fn build_input_stream<F, E>(&self, on_block: F, on_error: E) -> Result<cpal::Stream>
     where
         F: FnMut(&[f32]) + Send + 'static,
+        E: FnMut() + Send + 'static,
     {
         match self.format {
-            cpal::SampleFormat::I8 => self.build::<i8, F>(on_block),
-            cpal::SampleFormat::I16 => self.build::<i16, F>(on_block),
-            cpal::SampleFormat::I32 => self.build::<i32, F>(on_block),
-            cpal::SampleFormat::I64 => self.build::<i64, F>(on_block),
-            cpal::SampleFormat::U8 => self.build::<u8, F>(on_block),
-            cpal::SampleFormat::U16 => self.build::<u16, F>(on_block),
-            cpal::SampleFormat::U32 => self.build::<u32, F>(on_block),
-            cpal::SampleFormat::U64 => self.build::<u64, F>(on_block),
-            cpal::SampleFormat::F32 => self.build::<f32, F>(on_block),
-            cpal::SampleFormat::F64 => self.build::<f64, F>(on_block),
+            cpal::SampleFormat::I8 => self.build::<i8, F, E>(on_block, on_error),
+            cpal::SampleFormat::I16 => self.build::<i16, F, E>(on_block, on_error),
+            cpal::SampleFormat::I32 => self.build::<i32, F, E>(on_block, on_error),
+            cpal::SampleFormat::I64 => self.build::<i64, F, E>(on_block, on_error),
+            cpal::SampleFormat::U8 => self.build::<u8, F, E>(on_block, on_error),
+            cpal::SampleFormat::U16 => self.build::<u16, F, E>(on_block, on_error),
+            cpal::SampleFormat::U32 => self.build::<u32, F, E>(on_block, on_error),
+            cpal::SampleFormat::U64 => self.build::<u64, F, E>(on_block, on_error),
+            cpal::SampleFormat::F32 => self.build::<f32, F, E>(on_block, on_error),
+            cpal::SampleFormat::F64 => self.build::<f64, F, E>(on_block, on_error),
             other => anyhow::bail!("the input device wants {other}, which is not wired up yet"),
         }
     }
 
-    fn build<T, F>(&self, mut on_block: F) -> Result<cpal::Stream>
+    fn build<T, F, E>(&self, mut on_block: F, mut on_error: E) -> Result<cpal::Stream>
     where
         T: cpal::SizedSample,
         f32: cpal::FromSample<T>,
         F: FnMut(&[f32]) + Send + 'static,
+        E: FnMut() + Send + 'static,
     {
-        let mut block: Vec<f32> = Vec::new();
+        let mut block = vec![0.0f32; MAX_FRAMES * self.channels];
         let stream = self.device.build_input_stream(
             &self.config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
-                block.clear();
-                block.extend(data.iter().map(|sample| f32::from_sample(*sample)));
-                on_block(&block);
+                let len = data.len().min(block.len());
+                for (sample, converted) in data[..len].iter().zip(block[..len].iter_mut()) {
+                    *converted = f32::from_sample(*sample);
+                }
+                if len < data.len() {
+                    BUFFER_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+                }
+                on_block(&block[..len]);
             },
-            |error| {
+            move |error| {
                 STREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(%error, "input stream error");
+                on_error();
             },
             None,
         )?;

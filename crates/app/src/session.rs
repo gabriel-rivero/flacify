@@ -29,6 +29,7 @@ use crate::render;
 use crate::render_status::RenderStatus;
 use crate::segments;
 use crate::setup;
+use crate::sink::{self, SinkStats};
 use crate::source;
 use crate::ui::TrackInfo;
 
@@ -114,6 +115,27 @@ pub struct SegmentView {
     pub peaks: Vec<source::SecondPeaks>,
 }
 
+/// The sink's route and its clock correction, for the panel and the status line.
+pub struct SinkRoute {
+    /// The capture device, as the host spells it.
+    pub from: String,
+    /// The output device that plays: the named one, or the default that replaced it.
+    pub to: String,
+    /// Why the output is not the device that was named, when it is not.
+    pub fallback: Option<String>,
+    /// The band the preprocessor was built for, measured on the first second of capture.
+    pub cutoff_hz: u32,
+    /// Frames the capture ring holds; the panel compares its fill against this.
+    pub ring_capacity_frames: usize,
+    /// Model window plus buffer plus device plus the capture ring's fill.
+    pub latency_secs: f64,
+    /// What the correction and the ring have had to do.
+    pub stats: Arc<SinkStats>,
+    /// Set to end the capture feed at its next read, so dropping playback does not leave a
+    /// thread waiting on a device.
+    pub(crate) stop: Arc<AtomicBool>,
+}
+
 /// Everything one file owns. Dropping it is not enough to stop the render, because the
 /// render thread holds its own `Arc`s: call [`Playback::cancel`] first.
 pub struct Playback {
@@ -124,6 +146,8 @@ pub struct Playback {
     pub path: PathBuf,
     /// Present when this playback is a live stream rather than a file-shaped source.
     pub live: Option<LivePlayback>,
+    /// Present when the live stream is the sink: the route, and the drift correction.
+    pub sink: Option<SinkRoute>,
     /// Present when the track plays from segments: the waveform and spectrum draw from
     /// this instead of a whole-track buffer.
     pub segments: Option<SegmentView>,
@@ -132,11 +156,15 @@ pub struct Playback {
 }
 
 impl Playback {
-    /// Stop this file's renderer. The thread returns at the next window boundary, which
-    /// is the finest cancellation the protocol allows.
+    /// Stop this file's renderer, or the sink's capture. The renderer returns at the next
+    /// window boundary, which is the finest cancellation the protocol allows; the capture
+    /// feed returns from its next read.
     pub fn cancel(&mut self) {
         if let Some(cancel) = self.cancel.take() {
             cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(sink) = &self.sink {
+            sink.stop.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -226,6 +254,7 @@ impl Session {
                 },
                 path,
                 live: None,
+                sink: None,
                 segments: None,
                 cancel: None,
             });
@@ -292,6 +321,7 @@ impl Session {
                 },
                 path,
                 live: None,
+                sink: None,
                 segments: None,
                 cancel: None,
             });
@@ -386,6 +416,7 @@ impl Session {
             },
             path,
             live: None,
+            sink: None,
             segments: None,
             cancel: Some(cancel),
         })
@@ -454,6 +485,89 @@ impl Session {
                 policy,
                 source,
                 pump: Some(pump),
+            }),
+            sink: None,
+            segments: None,
+            cancel: None,
+        })
+    }
+
+    /// Open the sink (`flacify sink`): capture one device, enhance it, play it on another.
+    ///
+    /// `from` is the resolved capture device and `to` the resolved output, or `None` for
+    /// the default when the named one did not resolve; `fallback` says why, for the panel.
+    /// The model comes up before capture starts, because a load that takes ten seconds
+    /// would otherwise drop the first ten seconds into a ring nobody is reading.
+    pub fn open_sink(
+        &self,
+        from: &str,
+        to: Option<&str>,
+        fallback: Option<String>,
+        preset: Preset,
+        probe: &Probe,
+    ) -> Result<Playback> {
+        self.require_ready()?;
+        let policy = live_policy(preset, probe, device::PREFERRED_BUFFER_FRAMES as usize);
+        let block = live::block_frames(&policy);
+        let model = Arc::clone(&self.worker)
+            .model()
+            .context("starting the model worker")?;
+
+        let mut feed = sink::CaptureFeed::open(from)?;
+        let captured_from = feed.name().to_string();
+        let cutoff_hz = sink::measure_cutoff(&mut feed, &captured_from)?;
+        let stats = feed.stats();
+        let stop = feed.stopper();
+        let engine = Engine::new(model, 2, policy.window_frames, Some(cutoff_hz))?;
+        let mut renderer = live::Renderer::new(engine, policy.window_frames, block, live::SEED)?;
+        let (source, pump) = live::Live::start(
+            Box::new(feed),
+            &policy,
+            Box::new(move |dry, wet| renderer.produce(dry, wet)),
+        )?;
+
+        let prebuffer = live::prebuffer_frames(&policy);
+        anyhow::ensure!(
+            source.wait_for_wet(0, prebuffer, live::PREBUFFER_TIMEOUT),
+            "the live buffer did not fill: {} of {prebuffer} frames were ready after {} s",
+            source.wet_ahead(0),
+            live::PREBUFFER_TIMEOUT.as_secs()
+        );
+        let device_label = self.worker.device().unwrap_or_else(|| "model".to_string());
+        let engine = device::AudioEngine::start_live_on(Arc::clone(&source), to)?;
+        let to = engine.device_name.clone();
+        let ring_secs = sink::TARGET_FILL_FRAMES as f64 / f64::from(SAMPLE_RATE);
+        Ok(Playback {
+            engine,
+            frontier: None,
+            status: None,
+            info: TrackInfo {
+                name: format!("{captured_from} → {to}"),
+                title: Some("live capture".to_string()),
+                artist: None,
+                cutoff_hz,
+                // A stream has no length it can state up front; the panel shows the
+                // playhead alone for it.
+                audio_secs: 0.0,
+                device: device_label,
+                from_cache: false,
+                gain_db: 0.0,
+            },
+            path: PathBuf::from(&captured_from),
+            live: Some(LivePlayback {
+                policy,
+                source,
+                pump: Some(pump),
+            }),
+            sink: Some(SinkRoute {
+                from: captured_from,
+                to,
+                fallback,
+                cutoff_hz,
+                ring_capacity_frames: sink::RING_FRAMES,
+                latency_secs: policy.total_latency_secs + ring_secs,
+                stats,
+                stop,
             }),
             segments: None,
             cancel: None,
@@ -528,6 +642,7 @@ impl Session {
                 },
                 path,
                 live: None,
+                sink: None,
                 segments: None,
                 cancel: None,
             });
@@ -559,6 +674,7 @@ impl Session {
                 },
                 path,
                 live: None,
+                sink: None,
                 segments: Some(SegmentView { reader, peaks }),
                 cancel: None,
             });
@@ -584,6 +700,7 @@ impl Session {
             },
             path,
             live: None,
+            sink: None,
             segments: Some(SegmentView { reader, peaks }),
             cancel: None,
         })

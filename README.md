@@ -49,9 +49,17 @@ cargo build --release
 ./target/release/flacify enhance song.mp3      # -> song.mp3.flacify.wav
 ./target/release/flacify play song.mp3         # window: space toggles, p plays, drag to seek, drop a file
 ./target/release/flacify play song.mp3 --smoke # headless audio-path check
+./target/release/flacify ab song.mp3           # blind A/B trials -> song.mp3.flacify-ab.md
 ./target/release/flacify devices               # capture and playback devices, with rates and channels
 ./target/release/flacify diagnose              # -> flacify-diagnose.txt
 ```
+
+`flacify ab` renders or loads the generated side once, plays 20 six-second excerpts in a
+seeded order, and asks which of the two was the generated one. The seed is in the report,
+so the run can be replayed. The report states the measured level match, and the command
+exits non-zero if any excerpt's two sides differ by more than 0.5 dB: an unmatched pair
+measures loudness, not the model. The score is a listening test, so the operator's answers
+are the evidence, not the program's.
 
 Measured on an M5 Max: a 30.7 s clip renders in 34.1 s (including the 8 s worker start)
 and plays back at 48 kHz with the switch enabled. The generated band gains +24.6 dB at

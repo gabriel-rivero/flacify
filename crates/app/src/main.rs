@@ -5,6 +5,7 @@
 //! sidecar the app installs and owns (ADR-010), and [`session`] keeps that sidecar alive
 //! for the life of the app so a second file does not load it again.
 
+mod ab;
 mod cache;
 mod cli;
 mod commands;

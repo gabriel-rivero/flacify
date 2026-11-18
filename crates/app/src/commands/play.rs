@@ -125,7 +125,7 @@ fn report(playback: &Playback, started: Instant) -> Result<()> {
     }
     println!(
         "switch    {}",
-        if !engine.controls.has_enhanced {
+        if !engine.controls.has_enhanced() {
             "none (full-band source)"
         } else if engine.controls.is_enhanced() {
             "generated"

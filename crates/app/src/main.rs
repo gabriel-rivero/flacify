@@ -15,6 +15,10 @@ mod first_run;
 mod flac;
 mod frontier;
 mod limit;
+// `play --live` (U1) and `flacify sink` (K1) are the callers; until they land the mechanism
+// has none outside the tests.
+#[allow(dead_code)]
+mod live;
 mod loudness;
 mod player;
 mod render;

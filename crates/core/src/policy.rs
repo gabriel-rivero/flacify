@@ -5,6 +5,11 @@
 //! reason "buffer enough for the song" does not work: above real time a buffer can
 //! only cover part of a track, and filling that part costs exactly as long as the
 //! part it covers.
+//!
+//! The live path asks the same probe a second question, which is what a window
+//! costs in latency, memory and headroom while the playhead is already running.
+
+use crate::{GRANULE, SAMPLE_RATE};
 
 /// Sustained timings from the hardware probe.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -155,6 +160,121 @@ fn duration_label(secs: f64) -> String {
     }
 }
 
+/// The model windows the live path offers, counted in granules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Preset {
+    One,
+    Two,
+    Four,
+    Eight,
+}
+
+impl Preset {
+    /// Every preset, shortest window first.
+    pub const ALL: [Preset; 4] = [Preset::One, Preset::Two, Preset::Four, Preset::Eight];
+
+    /// How many granules of 0.64 s the window holds.
+    pub fn granules(self) -> usize {
+        match self {
+            Preset::One => 1,
+            Preset::Two => 2,
+            Preset::Four => 4,
+            Preset::Eight => 8,
+        }
+    }
+
+    /// The model window in frames.
+    pub fn frames(self) -> usize {
+        self.granules() * GRANULE
+    }
+
+    /// The window as the UI states it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Preset::One => "0.64 s",
+            Preset::Two => "1.28 s",
+            Preset::Four => "2.56 s",
+            Preset::Eight => "5.12 s",
+        }
+    }
+
+    /// Read a preset from a `--window` argument.
+    pub fn parse(text: &str) -> Option<Preset> {
+        match text {
+            "1" => Some(Preset::One),
+            "2" => Some(Preset::Two),
+            "4" => Some(Preset::Four),
+            "8" => Some(Preset::Eight),
+            _ => None,
+        }
+    }
+}
+
+/// Headroom over the p95 render ratio, so one call slower than p95 still leaves audio.
+const BUFFER_SAFETY: f64 = 1.25;
+/// The live buffer is a wet ring and a dry ring, each holding the same span.
+const RING_SIDES: usize = 2;
+const CHANNELS: usize = 2;
+const BYTES_PER_SAMPLE: usize = 4;
+
+/// What one window of live playback costs on this machine.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LivePolicy {
+    pub preset: Preset,
+    pub window_frames: usize,
+    /// Frames in one side of the wet/dry ring pair.
+    pub buffer_frames: usize,
+    /// The window the model must see before it can emit, which floors the latency.
+    pub model_latency_secs: f64,
+    pub buffer_latency_secs: f64,
+    pub device_latency_secs: f64,
+    /// Model plus buffer plus device: the number the UI prints.
+    pub total_latency_secs: f64,
+    /// Wet and dry rings together.
+    pub resident_bytes: usize,
+    /// Sustained RTF below 1.0.
+    pub is_real_time: bool,
+    /// A single worst-case call cannot drain more than the buffer holds.
+    pub is_worst_case_real_time: bool,
+}
+
+/// Decide what one preset costs on this machine.
+///
+/// `device_buffer_frames` is the device's own buffer, which the UI adds to the latency
+/// it prints. `probe` must be measured at this preset's window: fixed per-call cost is
+/// a larger share of a short window.
+pub fn live_policy(preset: Preset, probe: &Probe, device_buffer_frames: usize) -> LivePolicy {
+    let window_frames = preset.frames();
+    let window_secs = frames_to_secs(window_frames);
+    let rtf_p95 = probe.rtf_p95.max(1e-6);
+    let rtf_sustained = probe.rtf_sustained.max(1e-6);
+
+    // One call drains the ring by a window's worth times the render ratio, so the
+    // buffer covers the p95 call and not the median one. Floored at one window so a
+    // slow first call cannot starve playback immediately.
+    let worst_case_frames = window_frames as f64 * rtf_p95 * BUFFER_SAFETY;
+    let buffer_frames = (worst_case_frames.ceil() as usize).max(window_frames);
+    let buffer_secs = frames_to_secs(buffer_frames);
+    let device_secs = frames_to_secs(device_buffer_frames);
+
+    LivePolicy {
+        preset,
+        window_frames,
+        buffer_frames,
+        model_latency_secs: window_secs,
+        buffer_latency_secs: buffer_secs,
+        device_latency_secs: device_secs,
+        total_latency_secs: window_secs + buffer_secs + device_secs,
+        resident_bytes: RING_SIDES * buffer_frames * CHANNELS * BYTES_PER_SAMPLE,
+        is_real_time: rtf_sustained < 1.0,
+        is_worst_case_real_time: rtf_p95 < 1.0,
+    }
+}
+
+fn frames_to_secs(frames: usize) -> f64 {
+    frames as f64 / SAMPLE_RATE as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +347,209 @@ mod tests {
         let plan = plan(&Probe::from_rtf(1.5), 5.12, None);
         assert_eq!(plan.mode, Mode::PreRender);
         assert!(plan.estimated_wait_secs.unwrap() > 0.0);
+    }
+
+    /// What the M5 measures on the file path: faster than real time, with some jitter.
+    const M5_PROBE: Probe = Probe {
+        rtf_p50: 0.55,
+        rtf_p95: 0.70,
+        rtf_sustained: 0.78,
+    };
+    const DEVICE_FRAMES: usize = 512;
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn given_a_fixed_probe_when_tabled_then_every_number_is_pinned() {
+        // p95 below 0.8 keeps the safety factor under the one-window floor, so the
+        // buffer and the window are equal at every preset.
+        assert_eq!(
+            Preset::ALL,
+            [Preset::One, Preset::Two, Preset::Four, Preset::Eight]
+        );
+        let expected = [
+            (Preset::One, 30_720usize, 30_720usize, 0.64, 491_520usize),
+            (Preset::Two, 61_440, 61_440, 1.28, 983_040),
+            (Preset::Four, 122_880, 122_880, 2.56, 1_966_080),
+            (Preset::Eight, 245_760, 245_760, 5.12, 3_932_160),
+        ];
+        let device_secs = DEVICE_FRAMES as f64 / SAMPLE_RATE as f64;
+        println!(
+            "{:<8} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>10} {:>4} {:>5}",
+            "preset",
+            "window",
+            "buffer",
+            "model",
+            "buffer",
+            "device",
+            "total",
+            "resident",
+            "rt",
+            "worst"
+        );
+        for (preset, window_frames, buffer_frames, window_secs, resident_bytes) in expected {
+            let policy = live_policy(preset, &M5_PROBE, DEVICE_FRAMES);
+            let real_time = if policy.is_real_time { "yes" } else { "no" };
+            let worst_case = if policy.is_worst_case_real_time {
+                "yes"
+            } else {
+                "no"
+            };
+            println!(
+                "{:<8} {:>7} {:>7} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>10} {:>4} {:>5}",
+                policy.preset.label(),
+                policy.window_frames,
+                policy.buffer_frames,
+                policy.model_latency_secs,
+                policy.buffer_latency_secs,
+                policy.device_latency_secs,
+                policy.total_latency_secs,
+                policy.resident_bytes,
+                real_time,
+                worst_case,
+            );
+            assert_eq!(policy.window_frames, window_frames);
+            assert_eq!(policy.buffer_frames, buffer_frames);
+            assert_close(policy.model_latency_secs, window_secs);
+            assert_close(policy.buffer_latency_secs, window_secs);
+            assert_close(policy.device_latency_secs, device_secs);
+            assert_close(policy.total_latency_secs, window_secs * 2.0 + device_secs);
+            assert_eq!(policy.resident_bytes, resident_bytes);
+            assert!(policy.is_real_time);
+            assert!(policy.is_worst_case_real_time);
+        }
+    }
+
+    #[test]
+    fn given_the_four_presets_when_planned_then_latency_rises_with_the_window() {
+        let mut previous = 0.0;
+        for preset in Preset::ALL {
+            let policy = live_policy(preset, &M5_PROBE, DEVICE_FRAMES);
+            assert!(
+                policy.total_latency_secs > previous,
+                "{} did not raise the latency: {}",
+                preset.label(),
+                policy.total_latency_secs
+            );
+            previous = policy.total_latency_secs;
+        }
+    }
+
+    #[test]
+    fn given_a_cpu_class_probe_when_planned_then_neither_check_passes() {
+        // 3x real time cannot sustain playback, and a p95 call drains three windows.
+        // The 1.25 safety factor makes the buffer 3.75 windows, which covers the
+        // drain but does not make playback keep up.
+        let policy = live_policy(Preset::Eight, &Probe::from_rtf(3.0), DEVICE_FRAMES);
+        assert!(!policy.is_real_time);
+        assert!(!policy.is_worst_case_real_time);
+        assert_close(policy.buffer_latency_secs, 5.12 * 3.0 * 1.25);
+    }
+
+    #[test]
+    fn given_a_fast_probe_when_planned_then_both_checks_pass() {
+        let policy = live_policy(Preset::Four, &Probe::from_rtf(0.5), DEVICE_FRAMES);
+        assert!(policy.is_real_time);
+        assert!(policy.is_worst_case_real_time);
+    }
+
+    #[test]
+    fn given_a_jittery_probe_when_planned_then_only_the_sustained_check_passes() {
+        // The average keeps up but a p95 call drains 1.4 windows, so the UI has to arm
+        // passthrough even though the sustained ratio says real time.
+        let probe = Probe {
+            rtf_p50: 0.70,
+            rtf_p95: 1.40,
+            rtf_sustained: 0.90,
+        };
+        let policy = live_policy(Preset::Two, &probe, DEVICE_FRAMES);
+        assert!(policy.is_real_time);
+        assert!(!policy.is_worst_case_real_time);
+    }
+
+    #[test]
+    fn given_eight_granules_when_planned_then_resident_bytes_is_both_rings() {
+        let policy = live_policy(Preset::Eight, &Probe::from_rtf(0.6), 0);
+        assert_eq!(policy.resident_bytes, 2 * policy.buffer_frames * 2 * 4);
+        assert_eq!(policy.resident_bytes, 3_932_160);
+    }
+
+    #[test]
+    fn given_a_window_argument_when_parsed_then_only_the_four_presets_are_accepted() {
+        for preset in Preset::ALL {
+            assert_eq!(Preset::parse(&preset.granules().to_string()), Some(preset));
+        }
+        for text in ["3", "0", "eight", "", " 8", "6", "1.28"] {
+            assert_eq!(Preset::parse(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn given_a_slow_but_real_time_probe_when_planned_then_the_buffer_rounds_up() {
+        // 30_720 * 0.813 * 1.25 = 31_219.2, so the buffer is 31_220 frames and not the
+        // one-window floor. This is where the ceil, not the floor, sets the depth.
+        let probe = Probe {
+            rtf_p50: 0.70,
+            rtf_p95: 0.813,
+            rtf_sustained: 0.78,
+        };
+        let policy = live_policy(Preset::One, &probe, 0);
+        assert_eq!(policy.buffer_frames, 31_220);
+        assert!(policy.buffer_frames > policy.window_frames);
+    }
+
+    #[test]
+    fn given_exactly_real_time_when_planned_then_neither_check_passes() {
+        let exactly = live_policy(Preset::Two, &Probe::from_rtf(1.0), 0);
+        assert!(!exactly.is_real_time);
+        assert!(!exactly.is_worst_case_real_time);
+        let under = live_policy(Preset::Two, &Probe::from_rtf(0.999), 0);
+        assert!(under.is_real_time);
+        assert!(under.is_worst_case_real_time);
+    }
+
+    #[test]
+    fn given_a_larger_device_buffer_when_planned_then_the_total_rises_by_that_much() {
+        let without = live_policy(Preset::Two, &M5_PROBE, 0);
+        let with = live_policy(Preset::Two, &M5_PROBE, 4_800);
+        assert_close(with.device_latency_secs, 0.1);
+        assert_close(with.total_latency_secs - without.total_latency_secs, 0.1);
+    }
+
+    #[test]
+    fn given_each_preset_when_measured_then_the_window_is_its_granules() {
+        let expected = [
+            (Preset::One, 1),
+            (Preset::Two, 2),
+            (Preset::Four, 4),
+            (Preset::Eight, 8),
+        ];
+        for (preset, granules) in expected {
+            assert_eq!(preset.granules(), granules);
+            assert_eq!(preset.frames(), granules * 30_720);
+            assert_eq!(preset.frames(), granules * GRANULE);
+            let policy = live_policy(preset, &M5_PROBE, DEVICE_FRAMES);
+            assert_eq!(policy.window_frames, granules * GRANULE);
+            assert_eq!(
+                preset.label(),
+                format!("{:.2} s", policy.model_latency_secs)
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_zero_or_nan_probe_when_planned_then_the_numbers_stay_finite() {
+        for probe in [Probe::from_rtf(0.0), Probe::from_rtf(f64::NAN)] {
+            let policy = live_policy(Preset::One, &probe, DEVICE_FRAMES);
+            assert!(policy.total_latency_secs.is_finite());
+            assert_eq!(policy.buffer_frames, GRANULE);
+            assert!(policy.is_real_time);
+            assert!(policy.is_worst_case_real_time);
+        }
     }
 }

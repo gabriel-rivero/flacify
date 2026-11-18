@@ -680,3 +680,34 @@ the 61 440 samples that rule produces is rejected with
 checks it against HELLO's count for the trained window before its first call. A preset
 therefore needs that derivation, or a per-window HELLO, in the client as well as in the
 pipeline (D6, D11).
+
+### Listening verdict, and what it found (2026-11-18)
+
+The human listened to the ten files once, without a detailed comparison: **2 granules
+had audible noise on the NieR track; 1, 4 and 8 granules were acceptable.** That is not
+a verdict per preset, and it is not yet enough to drop one, but it is a real complaint
+and it has a measurable shape:
+
+| track | preset | mean spectral flatness 14–22 kHz | 2g vs 8g at 19–25 s |
+|---|---|---|---|
+| NieR | 1 granule | 0.058 | — |
+| NieR | 2 granules | 0.050 | 2g 0.10–0.16, 8g 0.001–0.011 |
+| NieR | 4 granules | 0.065 | — |
+| NieR | 8 granules | 0.029 | — |
+
+Spectral flatness runs from 0 (tonal) to 1 (noise) in the band the model generates, per
+second. The 2-granule complaint lands at 19–25 s, where its added band measures 0.10–0.16
+against 0.001–0.011 at 8 granules: the model is filling the top octave with noise rather
+than with harmonics or air, in a passage where the dry level is unchanged (−15 to −21
+dBFS across all four presets). The same measurement says 1 granule is no cleaner
+elsewhere (flatness peaks at 0.256 around 20 s), so the effect is "short windows get
+noisy in some passages", not "2 granules is uniquely broken".
+
+Two things this is not. It is not a seam: sample-to-sample difference at each preset's
+overlap-add step is 0.81–1.15× the difference elsewhere, i.e. indistinguishable, because
+`tools/bench_windows.py` applies the app's crossfade. And it is not a level change: the
+per-second RMS of every preset matches the dry file to the decibel.
+
+The open decision is a product one: offer all four presets with the tradeoff stated, or
+drop the short ones. A focused 18–26 s A/B of `nier-2g.wav` against `nier-8g.wav` is the
+test that settles it, and the human owns it.

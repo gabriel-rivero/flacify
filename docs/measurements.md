@@ -615,3 +615,68 @@ mixer does, M5 Max, release profile:
 
 The first play of an uncached track still holds the decoded track and the frontier, so this
 figure applies to an entry that is complete.
+
+## Window presets (S1), 2026-11-18
+
+The sidecar takes `channels, frames` per request and derives the latent grid for that
+window (`tools/worker.py:109-113`), so 1, 2, 4 and 8 granules are an input it accepts
+today. What was unknown is what each window costs and whether the short ones still sound
+right. The cost is measured here; the listening verdict is the human's, and the files are
+in `tools/out/s1/` with a `README.txt`.
+
+M1 (Apple M5 Max, 32-core GPU, 36 GB, macOS 27.2.1, Python 3.12, torch 2.15.0, MPS),
+2026-11-18, the resident worker the app spawns, one worker across every preset and both
+tracks. Five timed calls per row after one warmup call at that window size, on the first
+30 s of "Weight of the World" (NieR, 192 kbps 44.1 kHz MP3) and "PROI PROI" (Star Rail,
+126 kbps 44.1 kHz MP3), decoded and resampled to 48 kHz stereo. The table is the last of
+three runs of the same command; the spread between them is a bullet below.
+`tools/bench_windows.py` produced it and `tools/out/s1/report.json`.
+
+| track | preset | frames | compute s/call p50 | compute p95 | RTF p50 | RTF p95 | output bytes/call | listening verdict |
+|---|---|---|---|---|---|---|---|---|
+| NieR | 1 granule | 30 720 | 0.41 | 0.42 | 0.64 | 0.66 | 245 760 | pending |
+| NieR | 2 granules | 61 440 | 1.06 | 1.10 | 0.83 | 0.86 | 491 520 | pending |
+| NieR | 4 granules | 122 880 | 1.94 | 2.00 | 0.76 | 0.78 | 983 040 | pending |
+| NieR | 8 granules | 245 760 | 3.74 | 3.83 | 0.73 | 0.75 | 1 966 080 | pending |
+| PROI PROI | 1 granule | 30 720 | 0.51 | 0.63 | 0.80 | 0.98 | 245 760 | pending |
+| PROI PROI | 2 granules | 61 440 | 0.99 | 1.04 | 0.77 | 0.81 | 491 520 | pending |
+| PROI PROI | 4 granules | 122 880 | 1.72 | 1.79 | 0.67 | 0.70 | 983 040 | pending |
+| PROI PROI | 8 granules | 245 760 | 3.57 | 3.65 | 0.70 | 0.71 | 1 966 080 | pending |
+
+What the rows say, before anyone listens:
+
+- **A preset buys latency, not throughput.** RTF p50 sits between 0.62 and 0.80 in 22 of
+  the 24 rows measured over three runs; the other two are 0.83 and 0.95, both at short
+  windows. What does move with the preset is the cost of one call: 3.2 to 3.7 s at 8
+  granules against 0.41 to 0.61 s at 1, so the eightfold shorter window buys a five- to
+  ninefold cheaper call without changing the per-second rate.
+- **The run-to-run spread is the size of the effect being measured.** Three runs of the
+  same command on an otherwise idle machine: the NieR 8-granule p50 was 3.24, 3.48 and
+  3.74 s, the NieR 1-granule p50 0.41, 0.44 and 0.61 s, and RTF p50 across all 24 rows
+  ranged 0.62 to 0.95. Treat ±15 % as the noise floor before reading one preset as faster
+  or slower than another.
+- **IPC is nil.** Round trip is within 20 ms of the worker's own compute time in every
+  row, under 4 % of a 1-granule call.
+- **The first call at a new window size costs 0.5 to 3.7 s** and is not in the table. It
+  tracks the window length (0.58 s at 1 granule, 3.67 s at 8), which fits a VAE encoder
+  pass over the window to derive its latent shape rather than one-off kernel compilation;
+  rows on the second track are cheaper because the resident worker has the shape cached.
+- **Worker load was 6.5 to 22.5 s across six starts** on this machine, same command,
+  nothing else running. The rows above start after the load, and a latency claim that
+  folded a 22 s start in would be wrong.
+- **Peak worker RSS as `ps` reports it was 217 to 1344 MB** across the runs, which is not
+  the model's resident cost (3.3 GB of weights; MPS allocations are largely invisible to
+  `ps`, as above).
+
+**A preset cannot run through the client that exists today.** `ResidentModel::noise_len`
+(`crates/infer/src/session.rs:167-173`) answers `channels * frames` for any window that is
+not the trained 245 760, but the worker sizes its noise from the VAE's latent grid, one
+frame per 3 840 samples. Verified against the running worker: a 30 720-frame request with
+the 61 440 samples that rule produces is rejected with
+
+    ValueError: noise_len 61440 does not match the graph's latent grid (2, 16, 8, 32)
+
+`tools/bench_windows.py` derives the count (`channels * 16 * 32 * frames / 3840`) and
+checks it against HELLO's count for the trained window before its first call. A preset
+therefore needs that derivation, or a per-window HELLO, in the client as well as in the
+pipeline (D6, D11).

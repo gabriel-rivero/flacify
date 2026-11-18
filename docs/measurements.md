@@ -790,3 +790,29 @@ of CPU for an hour-long track. Reading it from the entry took first audio from 7
 0.33 s and user CPU from 62.24 s to 0.12 s. The startup starvation those 78 s produced
 was also being counted as dropouts; a miss before the first sample is now reported once,
 as time to first audio, not twice.
+
+## Clock drift between two devices (S2), 2026-11-18
+
+M1 (Apple M5 Max), `cargo run --release --bin sink_probe` inside `Flacify.app` launched
+through LaunchServices (a shell-launched process gets digital silence from CoreAudio; see
+R23 in `risks.md`). Capture from "BlackHole 2ch", playback to "External Headphones",
+silent output, 600 s, `--silent`.
+
+| what | value |
+|---|---|
+| capture clock vs system clock | −5.1 ppm |
+| playback clock vs system clock | +48.7 ppm |
+| **relative drift** | **−53.8 ppm** |
+| over 600 s | 32 ms |
+| over an hour | 194 ms |
+| discontinuities in the captured stream | 0 |
+
+The measured drift sits almost exactly where the controller was proved: the simulated
++50 ppm case held 52 ppm of correction with **0 resyncs**, and the ring is 200 ms against
+a clamp of 1000 ppm. A crystal pair 20× worse than this one would still resync rather than
+click, which is the fallback `resync_for` implements.
+
+Two caveats, stated rather than implied. This is one device pair on one machine; a USB
+interface with its own clock is the case to check if a user reports it. And the capture
+stream was silent, so this measures the two clocks rather than audio through them — which
+is all the drift question needs, since the sample counts are what drift moves.

@@ -60,6 +60,42 @@ jobs:
           test -f tools/fixtures/out/manifest.json
           cargo test --workspace --all-targets
 
+  macos:
+    name: build and test (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The shipped platform. This job exists because the release workflow builds the
+      # .app without running a single test, and the app crate is the one that links
+      # cpal and eframe and is only ever compiled here on a developer's machine.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install fixture generator dependencies
+        run: python3 -m pip install --quiet numpy scipy
+
+      - name: Generate scipy fixtures
+        run: python3 tools/fixtures/gen.py
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: |
+          test -f tools/fixtures/out/manifest.json
+          cargo test --workspace --all-targets
+
   python-tools:
     name: spike tooling parses
     runs-on: ubuntu-latest

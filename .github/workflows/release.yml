@@ -3,13 +3,46 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # A dry run builds every artifact under the version you name, without publishing.
+  # Use it from the Actions tab on a branch before the tag exists.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build (must equal the workspace version in Cargo.toml)
+        required: true
+        default: "1.0.0"
 
 permissions:
   contents: write
 
 jobs:
+  version:
+    name: version is single-sourced
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.read.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        name: Read Cargo.toml and check it against the tag
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$VERSION" || { echo "no workspace version in Cargo.toml"; exit 1; }
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            test "${{ inputs.version }}" = "$VERSION" || {
+              echo "dry run asked for ${{ inputs.version }}, Cargo.toml says $VERSION"
+              exit 1
+            }
+          elif [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml $VERSION"
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "releasing $VERSION"
+
   windows:
     name: windows (exe + installer)
+    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +65,7 @@ jobs:
           ) | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $iscc) { $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source }
           if (-not $iscc) { throw "ISCC.exe not found after installing Inno Setup" }
-          & $iscc packaging\flacify.iss
+          & $iscc "/DMyAppVersion=${{ needs.version.outputs.value }}" packaging\flacify.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v4
@@ -44,6 +77,7 @@ jobs:
 
   macos:
     name: macos (app + dmg)
+    needs: version
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +88,8 @@ jobs:
         run: cargo build --release --bin flacify
 
       - name: Bundle the app and make the dmg
+        env:
+          VERSION: ${{ needs.version.outputs.value }}
         run: |
           APP=target/release/Flacify.app
           mkdir -p "$APP/Contents/MacOS"
@@ -66,15 +102,18 @@ jobs:
             <key>CFBundleName</key><string>flacify</string>
             <key>CFBundleDisplayName</key><string>flacify</string>
             <key>CFBundleIdentifier</key><string>com.gabrielrivero.flacify</string>
-            <key>CFBundleVersion</key><string>0.4.0</string>
-            <key>CFBundleShortVersionString</key><string>0.4.0</string>
+            <key>CFBundleVersion</key><string>__VERSION__</string>
+            <key>CFBundleShortVersionString</key><string>__VERSION__</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleExecutable</key><string>flacify</string>
             <key>LSMinimumSystemVersion</key><string>11.0</string>
             <key>NSHighResolutionCapable</key><true/>
+            <key>NSMicrophoneUsageDescription</key><string>flacify captures the audio you route to it, enhances it, and sends it to the output device you chose.</string>
           </dict>
           </plist>
           PLIST
+          sed -i '' "s/__VERSION__/${VERSION}/g" "$APP/Contents/Info.plist"
+          grep -q "<string>${VERSION}</string>" "$APP/Contents/Info.plist" || { echo "plist did not take $VERSION"; exit 1; }
           chmod +x "$APP/Contents/MacOS/flacify"
           hdiutil create -volname flacify -srcfolder "$APP" -ov -format UDZO target/release/flacify.dmg
 
@@ -85,6 +124,7 @@ jobs:
 
   linux:
     name: linux (deb)
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -102,8 +142,9 @@ jobs:
         run: cargo build --release --bin flacify
 
       - name: Build the .deb and the tarball the Arch package installs
+        env:
+          VERSION: ${{ needs.version.outputs.value }}
         run: |
-          VERSION=0.4.0
           ROOT=target/deb
           rm -rf "$ROOT"
           mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/share/applications"
@@ -131,12 +172,12 @@ jobs:
         with:
           name: linux
           path: |
-            target/release/flacify_0.4.0_amd64.deb
-            target/release/flacify-0.4.0-x86_64.tar.gz
+            target/release/flacify_${{ needs.version.outputs.value }}_amd64.deb
+            target/release/flacify-${{ needs.version.outputs.value }}-x86_64.tar.gz
 
   arch:
     name: arch (pacman package)
-    needs: [linux]
+    needs: [version, linux]
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
@@ -157,7 +198,7 @@ jobs:
 
       - name: Build the package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ needs.version.outputs.value }}"
           TARBALL="artifacts/flacify-${VERSION}-x86_64.tar.gz"
           test -f "$TARBALL"
           SUM=$(sha256sum "$TARBALL" | cut -d" " -f1)
@@ -177,7 +218,9 @@ jobs:
 
   publish:
     name: publish the release
-    needs: [windows, macos, linux, arch]
+    needs: [version, windows, macos, linux, arch]
+    # A manual run builds and uploads artifacts only; publishing is the tag's job.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -190,22 +233,35 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           body: |
-            flacify 0.4.0: the cache is a set of FLAC segments, and playback reads them.
+            flacify ${{ needs.version.outputs.value }}: audio arrives while it is still happening.
 
             - **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) or the raw `flacify.exe`.
             - **macOS:** `flacify.dmg` with `Flacify.app`. Nothing is signed yet; right-click, then Open,
               or run `xattr -dr com.apple.quarantine /Applications/Flacify.app`.
-            - **Linux:** `flacify_0.4.0_amd64.deb` for Debian and Ubuntu, or
-              `flacify-bin-0.4.0-1-x86_64.pkg.tar.zst` for Arch (`pacman -U`).
+            - **Linux:** `flacify_${{ needs.version.outputs.value }}_amd64.deb` for Debian and Ubuntu, or
+              `flacify-bin-${{ needs.version.outputs.value }}-1-x86_64.pkg.tar.zst` for Arch (`pacman -U`).
 
-            A render is now written as 24-bit FLAC segments, each written and readable as soon
-            as it finishes, so an interrupted render resumes instead of starting over. A track
-            with a complete cache entry plays from three resident segments: 66 MB for an hour
-            of audio instead of 1.38 GB per buffer, and seeking is a segment read. The first
-            play of an uncached track still holds the whole track in memory, and cached
-            playback draws no waveform or spectrum until the UI work lands.
+            **Live mode** (`flacify play --live`) renders while it plays, from bounded rings instead of
+            a whole track in memory, at a latency preset of 0.64, 1.28, 2.56 or 5.12 seconds. When the
+            model falls behind, the playhead keeps going on the original and the status line counts
+            the dropouts; it never stalls and never goes silent.
 
-            `flacify enhance in.mp3 -o out.flac` writes 24-bit FLAC as well as WAV. The first
-            `flacify play` still opens a setup screen and downloads the Python sidecar, wheels
-            and weights (about 6.9 GB with CUDA, 4.2 GB without); a full-band file or a cached
-            render plays without the model.
+            **`flacify sink`** (macOS) is the system-wide version: `flacify sink --from "BlackHole 2ch"
+            --to "External Headphones"` enhances whatever you route through a loopback device. It needs
+            a loopback device you install yourself; BlackHole is the documented one, and no driver is
+            bundled or redistributed. Windows loopback capture is not supported in this release.
+
+            **`flacify batch <dir>`** renders a folder, skipping entries that are already complete,
+            resuming after a kill, isolating a bad file instead of stopping, and writing a skip list.
+            The cache now has a 20 GB default cap with LRU eviction, shown by `flacify diagnose`.
+
+            **`flacify ab <file>`** runs blind trials with a randomised order you can replay from a
+            seed, and exports the report this release's evidence came from.
+
+            The default `flacify play` of a track that has never been rendered still holds the whole
+            track in memory while it renders; `--live` is the bounded path in this release, and making
+            it the default is the next one. Cached playback now draws the waveform and the spectrum.
+
+            The weights are the FlashSR author's and carry no stated licence. The app downloads them
+            at first run, bundles and redistributes nothing, and this project's MIT licence covers its
+            own code only. A full-band file or an already-cached render plays without the model.

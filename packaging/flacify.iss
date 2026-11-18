@@ -3,11 +3,18 @@
 ; It installs the app binary and the licence into %LOCALAPPDATA%\flacify\bin, with a Start
 ; Menu entry and an optional desktop shortcut. The Python sidecar and the weights are
 ; installed by the app on first run, so this installer is small and needs no admin.
+;
+; The release workflow passes the version as /DMyAppVersion=<version>, read from
+; Cargo.toml, so this file never carries a release number of its own.
+
+#ifndef MyAppVersion
+  #define MyAppVersion "0.0.0"
+#endif
 
 [Setup]
 AppId={{6F3B6C2E-9C1A-4F1B-9E3D-2A7C5B8D4E10}
 AppName=flacify
-AppVersion=0.4.0
+AppVersion={#MyAppVersion}
 AppPublisher=Gabriel Rivero
 DefaultDirName={localappdata}\flacify\bin
 DefaultGroupName=flacify

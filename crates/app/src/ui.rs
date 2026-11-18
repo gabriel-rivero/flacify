@@ -63,6 +63,43 @@ pub struct PlayerApp {
 /// No more waveform bars than this; a pixel is narrower than a bar worth drawing.
 const WAVEFORM_MAX_BARS: usize = 512;
 
+/// The parts of the window, in the order they draw. The match in `draw_transport` is
+/// exhaustive, so a new variant does not compile until its drawing exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportSection {
+    Heading,
+    Toggle,
+    Spectrum,
+    Waveform,
+    KeyHint,
+    Playback,
+    Progress,
+    RenderStatus,
+    Metadata,
+    Disclaimer,
+    StreamErrors,
+    CpuWarning,
+    Error,
+}
+
+/// The draw order. Add a variant here as well as to `TransportSection`; a list entry with
+/// no arm is a compile error, an arm with no list entry is a section that never draws.
+const TRANSPORT_SECTIONS: [TransportSection; 13] = [
+    TransportSection::Heading,
+    TransportSection::Toggle,
+    TransportSection::Spectrum,
+    TransportSection::Waveform,
+    TransportSection::KeyHint,
+    TransportSection::Playback,
+    TransportSection::Progress,
+    TransportSection::RenderStatus,
+    TransportSection::Metadata,
+    TransportSection::Disclaimer,
+    TransportSection::StreamErrors,
+    TransportSection::CpuWarning,
+    TransportSection::Error,
+];
+
 impl PlayerApp {
     pub fn new(session: Session, playback: Playback) -> Self {
         let engine = playback.engine;
@@ -147,12 +184,29 @@ impl PlayerApp {
                 self.info.device = device;
             }
         }
-        let rate = self.engine.device_rate;
-        let controls = Arc::clone(&self.engine.controls);
-        let position = controls.position_secs(rate);
-        let duration = self.info.audio_secs.max(0.001);
+        // One read of the frontier, so two sections cannot disagree about this frame.
         let prepared_frames = self.ready_frames();
+        for section in TRANSPORT_SECTIONS {
+            match section {
+                TransportSection::Heading => self.draw_heading(ui),
+                TransportSection::Toggle => self.draw_toggle(ui, prepared_frames),
+                TransportSection::Spectrum => self.draw_spectrum(ui),
+                TransportSection::Waveform => self.draw_waveform(ui),
+                TransportSection::KeyHint => self.draw_key_hint(ui),
+                TransportSection::Playback => self.draw_playback(ui, prepared_frames),
+                TransportSection::Progress => self.draw_progress(ui),
+                TransportSection::RenderStatus => self.draw_render_status(ui, prepared_frames),
+                TransportSection::Metadata => self.draw_metadata(ui),
+                TransportSection::Disclaimer => self.draw_disclaimer(ui),
+                TransportSection::StreamErrors => self.draw_stream_errors(ui),
+                TransportSection::CpuWarning => self.draw_cpu_warning(ui),
+                TransportSection::Error => self.draw_error(ui),
+            }
+        }
+    }
 
+    /// The track, and who made it.
+    fn draw_heading(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         let heading = self
             .info
@@ -164,8 +218,12 @@ impl PlayerApp {
             ui.label(egui::RichText::new(artist).size(12.0).weak());
         }
         ui.add_space(8.0);
+    }
 
-        // The switch. Enabled only where generated audio exists.
+    /// The switch. Enabled only where generated audio exists.
+    fn draw_toggle(&mut self, ui: &mut egui::Ui, prepared_frames: usize) {
+        let rate = self.engine.device_rate;
+        let controls = Arc::clone(&self.engine.controls);
         let generated_here =
             prepared_frames >= controls.position_frames() + self.promote_margin.min(48_000);
         let live = controls.is_enhanced();
@@ -190,13 +248,10 @@ impl PlayerApp {
         {
             controls.toggle();
         }
+    }
 
-        ui.add_space(10.0);
-        self.draw_spectrum(ui);
-
-        ui.add_space(6.0);
-        self.draw_waveform(ui);
-
+    /// The keys that do something, for the user without a mouse.
+    fn draw_key_hint(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(
@@ -205,7 +260,14 @@ impl PlayerApp {
             .weak()
             .size(11.0),
         );
+    }
 
+    /// Play/pause, the playhead, and how much of the file the renderer has reached.
+    fn draw_playback(&mut self, ui: &mut egui::Ui, prepared_frames: usize) {
+        let rate = self.engine.device_rate;
+        let controls = Arc::clone(&self.engine.controls);
+        let position = controls.position_secs(rate);
+        let duration = self.info.audio_secs.max(0.001);
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             let playing = controls.is_playing();
@@ -237,7 +299,10 @@ impl PlayerApp {
                 .size(11.0),
             );
         });
+    }
 
+    /// How much of the file the renderer has written, as a bar.
+    fn draw_progress(&mut self, ui: &mut egui::Ui) {
         ui.add_space(10.0);
         if let Some(frontier) = &self.frontier {
             let fraction =
@@ -252,10 +317,11 @@ impl PlayerApp {
                     }),
             );
         }
+    }
 
-        ui.add_space(8.0);
-        self.draw_render_status(ui, prepared_frames);
-
+    /// What it is playing with: device, cutoff, source, output format.
+    fn draw_metadata(&mut self, ui: &mut egui::Ui) {
+        let rate = self.engine.device_rate;
         ui.add_space(10.0);
         let source = if self.info.from_cache {
             "cached"
@@ -280,12 +346,19 @@ impl PlayerApp {
             .weak()
             .size(11.0),
         );
+    }
+
+    /// The one claim the window must not overstate.
+    fn draw_disclaimer(&mut self, ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new("the top band is generated, not recovered")
                 .weak()
                 .size(11.0),
         );
+    }
 
+    /// The output stream's own failures, when the device stops keeping up.
+    fn draw_stream_errors(&mut self, ui: &mut egui::Ui) {
         let errors = self
             .engine
             .stream_errors
@@ -297,8 +370,10 @@ impl PlayerApp {
                     .size(11.0),
             );
         }
+    }
 
-        // The hardware gate: say it rather than let the switch silently never unlock.
+    /// The hardware gate: say it rather than let the switch silently never unlock.
+    fn draw_cpu_warning(&mut self, ui: &mut egui::Ui) {
         if is_cpu_device(&self.info.device) {
             ui.add_space(6.0);
             ui.colored_label(
@@ -307,7 +382,10 @@ impl PlayerApp {
                  may unlock late or not at all. The original plays throughout.",
             );
         }
+    }
 
+    /// Why the last load failed, if it did; the previous file is still playing.
+    fn draw_error(&mut self, ui: &mut egui::Ui) {
         if let Some(error) = &self.error {
             ui.add_space(8.0);
             ui.colored_label(egui::Color32::from_rgb(220, 90, 90), error);
@@ -318,6 +396,7 @@ impl PlayerApp {
     /// that it is not going to catch up. Both otherwise look the same from here — an
     /// empty generated curve and a switch that never lights.
     fn draw_render_status(&self, ui: &mut egui::Ui, prepared_frames: usize) {
+        ui.add_space(8.0);
         let Some(status) = &self.status else {
             return;
         };
@@ -381,6 +460,7 @@ impl PlayerApp {
     /// has reached are bright, the rest are dim. Click or drag anywhere to seek; this is
     /// the transport, not a picture.
     fn draw_waveform(&self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
         let height = 64.0;
         let (response, painter) = ui.allocate_painter(
             egui::vec2(ui.available_width(), height),
@@ -454,6 +534,7 @@ impl PlayerApp {
     /// The two spectra at the playhead. This is the product's explanation: below the
     /// cutoff the curves sit on top of each other, above it they part company.
     fn draw_spectrum(&self, ui: &mut egui::Ui) {
+        ui.add_space(10.0);
         let height = 108.0;
         let (response, painter) = ui.allocate_painter(
             egui::vec2(ui.available_width(), height),
@@ -793,5 +874,39 @@ mod tests {
         assert!(!is_cpu_device("mps"));
         assert!(!is_cpu_device("none"));
         assert!(!is_cpu_device("rendering"));
+    }
+
+    #[test]
+    fn given_the_transport_sections_when_listed_then_they_draw_in_this_order() {
+        use TransportSection::*;
+        assert_eq!(
+            TRANSPORT_SECTIONS,
+            [
+                Heading,
+                Toggle,
+                Spectrum,
+                Waveform,
+                KeyHint,
+                Playback,
+                Progress,
+                RenderStatus,
+                Metadata,
+                Disclaimer,
+                StreamErrors,
+                CpuWarning,
+                Error,
+            ]
+        );
+    }
+
+    #[test]
+    fn given_the_transport_sections_when_counted_then_each_appears_exactly_once() {
+        for section in TRANSPORT_SECTIONS {
+            let count = TRANSPORT_SECTIONS
+                .iter()
+                .filter(|other| **other == section)
+                .count();
+            assert_eq!(count, 1, "{section:?} is drawn {count} times");
+        }
     }
 }

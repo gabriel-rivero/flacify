@@ -80,6 +80,27 @@ impl AudioStream {
         self.channels
     }
 
+    /// Decode until `wanted` seconds of audio have arrived, or the stream ends.
+    ///
+    /// A container's own frame count is not enough to tell audio from a file that merely
+    /// probed as audio: a disk image decoded as 2.5 s of stereo out of 90 MB. Counting
+    /// decoded frames is what actually bounds a file's length, and it stops as soon as
+    /// the wanted duration is reached, so a long file costs only that much work.
+    pub fn holds_at_least_seconds(&mut self, wanted: f64) -> bool {
+        let rate = f64::from(self.sample_rate);
+        if rate <= 0.0 {
+            return false;
+        }
+        let mut frames = 0usize;
+        while (frames as f64) / rate < wanted {
+            match self.next_chunk() {
+                Ok(Some(chunk)) => frames = frames.saturating_add(chunk.frames),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        (frames as f64) / rate >= wanted
+    }
+
     /// Pull the next decoded packet, or `None` at the end of the stream.
     ///
     /// The first packet fixes the sample rate and channel count; a later packet whose audio

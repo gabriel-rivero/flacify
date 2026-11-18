@@ -457,3 +457,28 @@ fn given_a_file_that_is_not_audio_when_streamed_then_the_error_names_the_path() 
         "{message}"
     );
 }
+
+#[test]
+fn given_a_short_file_when_asked_for_a_longer_one_then_the_probe_says_it_is_short() {
+    // The check a batch walk uses to refuse a container that probed as audio but cannot
+    // hold the bytes it occupies: a file has to deliver the audio its size promises.
+    let file = TempPath::new("too-short", "wav");
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: 48_000,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut writer = WavWriter::create(file.path(), spec).expect("creating the wav");
+    for sample in 0..4_800 {
+        writer
+            .write_sample((sample % 1000) as i16)
+            .expect("writing a sample");
+    }
+    writer.finalize().expect("finalising the wav");
+
+    let mut stream = decode::AudioStream::open(file.path()).expect("opening the wav");
+    assert!(stream.holds_at_least_seconds(0.05), "it holds 0.1 s");
+    let mut stream = decode::AudioStream::open(file.path()).expect("opening the wav");
+    assert!(!stream.holds_at_least_seconds(10.0), "it cannot hold 10 s");
+}

@@ -262,14 +262,6 @@ fn is_audio(path: &Path) -> bool {
     opens(path)
 }
 
-/// Whether symphonia can open the file. The probe logs its own failure at ERROR, which
-/// would put a line about a file the walk is deliberately ignoring on the user's terminal,
-/// so it is asked with no subscriber attached: the answer is a boolean, not a report.
-fn opens(path: &Path) -> bool {
-    let silent = tracing::subscriber::NoSubscriber::default();
-    tracing::subscriber::with_default(silent, || crate::decode::AudioStream::open(path).is_ok())
-}
-
 fn has_audio_extension(path: &Path) -> bool {
     path.extension()
         .and_then(std::ffi::OsStr::to_str)
@@ -279,6 +271,30 @@ fn has_audio_extension(path: &Path) -> bool {
                 .any(|known| extension.eq_ignore_ascii_case(known))
         })
 }
+
+/// Whether symphonia can open the file and it holds the audio its size claims.
+///
+/// The probe logs its own failure at ERROR, which would put a line about a file the walk
+/// is deliberately ignoring on the user's terminal, so it is asked with no subscriber
+/// attached: the answer is a boolean, not a report.
+///
+/// Opening is not enough. Symphonia decoded a 90 MB disk image as 2.5 s of 16 kHz
+/// stereo, and its own frame count was absent, so the length is proven by decoding: a
+/// file must hold at least as much audio as its bytes allow at the highest bitrate we
+/// support. The decode stops the moment that much audio has arrived.
+fn opens(path: &Path) -> bool {
+    let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let wanted = bytes as f64 / MAX_BYTES_PER_SECOND;
+    let silent = tracing::subscriber::NoSubscriber::default();
+    tracing::subscriber::with_default(silent, || match crate::decode::AudioStream::open(path) {
+        Ok(mut stream) => stream.holds_at_least_seconds(wanted),
+        Err(_) => false,
+    })
+}
+
+/// The most a second of audio can plausibly need: 5 Mbit/s covers 24-bit 96 kHz stereo
+/// with room to spare.
+const MAX_BYTES_PER_SECOND: f64 = 5_000_000.0 / 8.0;
 
 /// What the cache holds at `key`, read from the entry's manifest and nothing else.
 ///
@@ -542,6 +558,54 @@ fn elapsed_label(elapsed: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_a_short_file_when_asked_for_more_audio_than_it_holds_then_it_says_no() {
+        // A file cannot contain more audio than it has; this is the check that refuses a
+        // container which probed as audio and decoded a few seconds out of a large file.
+        let root = temp_root("decode-holds-short");
+        std::fs::create_dir_all(&root).expect("creating the root");
+        let path = root.join("short.wav");
+        wav::write(&path, 48_000, 2, &vec![0.1f32; 4_800]).expect("writing the wav");
+        let mut stream = crate::decode::AudioStream::open(&path).expect("opening the wav");
+        assert!(stream.holds_at_least_seconds(0.05));
+        let mut stream = crate::decode::AudioStream::open(&path).expect("opening the wav");
+        assert!(!stream.holds_at_least_seconds(10.0));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_a_large_file_of_noise_when_probed_then_it_is_not_audio_at_its_own_size() {
+        // The shape the walk met on a real disk: a container that opens and decodes a
+        // short stream out of far more bytes than any audio at 5 Mbit/s could fill.
+        let root = temp_root("walk-large-non-audio");
+        std::fs::create_dir_all(&root).expect("creating the root");
+        let path = root.join("image.dmg");
+        std::fs::write(&path, vec![0x5au8; 20_000_000]).expect("writing the image");
+        assert!(!is_audio(&path));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn given_the_walk_over_a_non_audio_file_when_planned_then_it_is_left_out() {
+        let root = temp_root("plan-disk-image");
+        std::fs::create_dir_all(&root).expect("creating the root");
+        // A file that symphonia will happily "decode": 200 kB of zeros, which its probe
+        // reads as a short stream, next to a real WAV.
+        std::fs::write(root.join("big.dmg"), vec![0u8; 200_000]).expect("writing the image");
+        let source = root.join("real.wav");
+        wav::write(&source, 48_000, 2, &vec![0.25f32; 4_800]).expect("writing the wav");
+        let cache = Cache::new(root.join("cache"));
+
+        let plan = plan(&root, &settings(&cache)).expect("planning");
+        let names: Vec<String> = plan
+            .files
+            .iter()
+            .map(|file| file.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["real.wav".to_string()]);
+        std::fs::remove_dir_all(root).ok();
+    }
     use crate::limit::LimitReport;
     use crate::wav;
 

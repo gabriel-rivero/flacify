@@ -3,10 +3,12 @@
 Status: current, 2026-11-27. One page per decision: context, decision, consequences.
 Reopen a decision by adding a superseding ADR, not by editing the old one.
 
-ADR-009 does not exist. The number was never used; `git log -S ADR-009` finds no commit
-that introduced or removed one. The numbers after it were not shifted down because
-sixteen cross-references across the code, the README and these pages name them. The gap
-is deliberate and `tools/check_docs.py` accepts it as long as this paragraph is here.
+**ADR-009 is unresolved.** No record of what it was meant to decide exists in this repo
+or in its history: the number was never used, and `git log -S ADR-009` finds no commit
+that added or removed one. Nobody has been able to say what it was. It stays a gap
+rather than being renumbered, because sixteen cross-references across the code, the
+README and these pages name the numbers after it. `tools/check_docs.py` accepts the gap
+as long as this paragraph is here.
 
 ---
 

@@ -138,9 +138,9 @@ def check_adr(files):
                 f"ADR-{numbers[0]:03d} … ADR-{numbers[-1]:03d}")
     gaps = [n for n in range(numbers[0], numbers[-1] + 1) if n not in numbers]
     for gap in gaps:
-        # A gap is acceptable only when the page says why it is a gap. Hard-coding
-        # ADR-009 here would let the next silent skip pass, so the reason is read.
-        if not re.search(rf"ADR-{gap:03d} does not exist", decisions):
+        # A gap is acceptable only when the page records it, so a later silent skip
+        # cannot pass by leaving nothing behind at all.
+        if not re.search(rf"ADR-{gap:03d} is unresolved|ADR-{gap:03d} does not exist", decisions):
             problems.append(
                 f"docs/decisions.md: ADR-{gap:03d} is missing and the page does not say why")
     return problems

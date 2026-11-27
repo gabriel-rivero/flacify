@@ -10,7 +10,7 @@ on:
       version:
         description: Version to build (must equal the workspace version in Cargo.toml)
         required: true
-        default: "1.0.0"
+        default: "1.1.0"
 
 permissions:
   contents: write
@@ -234,6 +234,12 @@ jobs:
           fail_on_unmatched_files: true
           body: |
             flacify ${{ needs.version.outputs.value }}: audio arrives while it is still happening.
+
+            **Playlists.** `play` now takes a queue: a folder, an `.m3u`/`.m3u8`/`.pls` file, a
+            YouTube playlist, or `--radio <video>` for that song's recommendations. Tracks advance
+            at the end, `N`/`B` move through them, and the next remote track is fetched while the
+            current one plays. A single file is still a queue of one, and `flacify` with no
+            argument opens the window empty so a queue can be dropped onto it.
 
             - **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) or the raw `flacify.exe`.
             - **macOS:** `flacify.dmg` with `Flacify.app`. Nothing is signed yet; right-click, then Open,

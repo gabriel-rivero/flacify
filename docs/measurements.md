@@ -898,3 +898,10 @@ replay a file it fetched, and nothing re-downloads.
 The high-band figure is a crude FFT mean over a 20 s window, not the loudness-matched
 per-window comparison the acceptance runs use; it says the model added content, not how
 well it matched. A proper listening verdict on this track is not recorded here.
+
+## Playlists (unverified)
+
+The session queue (ADR-015) has no end-to-end number here yet. `yt-dlp --flat-playlist`
+listing time and the first-track download were **not** timed against a real playlist when
+the queue landed, so this file makes no claim about how long a radio mix takes to start.
+A run on the M1, with the playlist source and the date, is the next row.

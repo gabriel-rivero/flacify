@@ -356,6 +356,39 @@ right for a missing cache segment and wrong for live audio, where silence is a g
 
 ---
 
+## ADR-015 — Playlists are a session queue, not a library
+
+**Status:** accepted, 2026-11-27. Supersedes the "no playlist" scope note in the UI section
+of [`architecture.md`](architecture.md) and the roadmap; it narrows that note rather than
+reopening it.
+
+**Context:** playing one file at a time makes the window a demo. Local `.m3u`/`.m3u8`/`.pls`
+files and folders already name an order, and yt-dlp can list a YouTube playlist or the
+`start_radio=1` mix behind one video. None of that needs a library, a database or a
+persistent collection.
+
+**Decision:**
+
+- A queue is a list of entries and a cursor, built from one input: a folder, a playlist
+  file, a URL, or a single file (a queue of one). It lives only as long as the window.
+- Local entries expand at build time. A remote playlist is listed with
+  `yt-dlp --flat-playlist` and each track is downloaded lazily, prefetching the next.
+- `--radio` is explicit: a share link carrying `list=RD…&start_radio=1` still plays the one
+  video it names. `--single` is the opposite opt-out for an explicit playlist URL.
+- The window advances at track end and adds next/previous; the strip is a line, not a
+  panel. `flacify` with no argument opens the window empty.
+- No named playlists, no library scan, no persistence, no new crate.
+
+**Consequences:**
+
+- `playlist.rs` is small and testable with no device, network or model.
+- A pause between remote tracks is a yt-dlp download unless the prefetch finished; the
+  strip says "fetching" rather than pretending it is instant.
+- The earlier "no playlist" line protected against becoming a mediocre music manager.
+  Refusing the library keeps that guard while allowing the queue.
+
+---
+
 ## Open questions
 
 1. **Runtime endgame.** Backlog E1-4 to E1-8: split the graph so the CoreML EP can take

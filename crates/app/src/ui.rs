@@ -8,18 +8,24 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use eframe::egui;
 
 use crate::device::{self, AudioEngine};
+use crate::first_run;
 use crate::frontier::Frontier;
+use crate::playlist;
+use crate::process::Cancel;
 use crate::render_status::RenderStatus;
 use crate::segments::Resident;
-use crate::session::{LivePlayback, Playback, SegmentView, Session, SinkRoute};
+use crate::session::{needs_setup, LivePlayback, Playback, SegmentView, Session, SinkRoute};
+use crate::setup;
 use crate::sink::{CaptureState, SILENT_HINT};
 use crate::source::SecondPeaks;
 use crate::spectrum;
+use crate::youtube;
 
 /// What the window needs to know about the track, none of it expensive.
 pub struct TrackInfo {
@@ -33,6 +39,21 @@ pub struct TrackInfo {
     pub from_cache: bool,
     /// Loudness gain applied to the generated side, for the status line.
     pub gain_db: f64,
+}
+
+/// A remote entry being fetched on its own thread, so the window never blocks on yt-dlp.
+struct PendingFetch {
+    index: usize,
+    label: String,
+    cancel: Cancel,
+    handle: JoinHandle<anyhow::Result<playlist::Resolved>>,
+}
+
+/// What the current queue entry is doing.
+enum LoadState {
+    Ready,
+    Fetching { label: String },
+    Failed(String),
 }
 
 pub struct PlayerApp {
@@ -68,6 +89,17 @@ pub struct PlayerApp {
     /// Present when the track plays from segments: the peaks and the resident segment
     /// its waveform and spectrum read.
     segments: Option<SegmentView>,
+    /// The queue this playback belongs to; `None` keeps a bare single track.
+    queue: Option<playlist::Queue>,
+    /// A remote entry being fetched, for the cursor or as a prefetch of the next one.
+    pending: Option<PendingFetch>,
+    /// A downloaded entry waiting for its turn.
+    prefetched: Option<(usize, playlist::Resolved)>,
+    /// What the current remote entry is doing.
+    load_state: LoadState,
+    /// Set once an end-of-track has advanced the queue, so a pending fetch is not
+    /// advanced again on every frame.
+    auto_advanced: bool,
 }
 
 /// No more waveform bars than this; a pixel is narrower than a bar worth drawing.
@@ -79,6 +111,7 @@ const WAVEFORM_MAX_BARS: usize = 512;
 enum TransportSection {
     Heading,
     Toggle,
+    Queue,
     Spectrum,
     Waveform,
     KeyHint,
@@ -96,9 +129,10 @@ enum TransportSection {
 
 /// The draw order. Add a variant here as well as to `TransportSection`; a list entry with
 /// no arm is a compile error, an arm with no list entry is a section that never draws.
-const TRANSPORT_SECTIONS: [TransportSection; 15] = [
+const TRANSPORT_SECTIONS: [TransportSection; 16] = [
     TransportSection::Heading,
     TransportSection::Toggle,
+    TransportSection::Queue,
     TransportSection::Spectrum,
     TransportSection::Waveform,
     TransportSection::KeyHint,
@@ -152,17 +186,33 @@ impl PlayerApp {
             waveform,
             waveform_bar_frames,
             segments,
+            queue: None,
+            pending: None,
+            prefetched: None,
+            load_state: LoadState::Ready,
+            auto_advanced: false,
         }
+    }
+
+    /// A playback that belongs to a queue: the window can advance it and move through it.
+    pub fn with_queue(session: Session, playback: Playback, queue: playlist::Queue) -> Self {
+        let mut app = Self::new(session, playback);
+        app.queue = Some(queue);
+        // Fetch the next remote entry while the first one plays; nothing else would start
+        // that download until the current track ended.
+        app.prefetch_next();
+        app
     }
 
     /// Replace what is playing, keeping the worker. A failed load leaves the current
     /// file alone and says why, instead of stopping playback with nothing to show.
-    fn load(&mut self, path: &Path) {
+    /// Returns whether the new track is playing.
+    fn load(&mut self, path: &Path) -> bool {
         let mut playback = match self.session.open(path) {
             Ok(playback) => playback,
             Err(error) => {
                 self.error = Some(format!("could not play {}: {error:#}", path.display()));
-                return;
+                return false;
             }
         };
         // The new file owns the worker's next window; the old renderer must let go.
@@ -197,6 +247,223 @@ impl PlayerApp {
         self.opened_at = std::time::Instant::now();
         self.title_dirty = true;
         self.error = None;
+        self.load_state = LoadState::Ready;
+        self.auto_advanced = false;
+        true
+    }
+
+    /// The directory remote entries are downloaded into, from the queue when there is one.
+    fn downloads_dir(&self) -> PathBuf {
+        if let Some(queue) = &self.queue {
+            return queue.downloads().to_path_buf();
+        }
+        setup::Paths::discover()
+            .map(|paths| paths.downloads_dir())
+            .unwrap_or_default()
+    }
+
+    /// Play the queue's current entry: local files load now, remote ones are fetched on a
+    /// thread so the window keeps drawing while yt-dlp works.
+    fn play_current(&mut self) {
+        let Some(queue) = &self.queue else {
+            return;
+        };
+        let index = queue.cursor();
+        let Some(entry) = queue.current().cloned() else {
+            return;
+        };
+        match entry {
+            playlist::Entry::Local { path, .. } => {
+                self.load(&path);
+            }
+            playlist::Entry::Remote { request, label } => {
+                if self.prefetched.as_ref().is_some_and(|(at, _)| *at == index) {
+                    let (_, resolved) = self.prefetched.take().expect("just checked");
+                    self.load_resolved(resolved, index);
+                    return;
+                }
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.index == index)
+                {
+                    self.engine.controls.set_playing(false);
+                    self.load_state = LoadState::Fetching { label };
+                    return;
+                }
+                if let Some(pending) = self.pending.take() {
+                    pending.cancel.cancel();
+                }
+                self.engine.controls.set_playing(false);
+                self.spawn_fetch(index, request, label, true);
+            }
+        }
+    }
+
+    /// Start downloading one remote entry. `current` says whether the queue is waiting on
+    /// it, which is what the strip reports; a prefetch is silent until it is needed.
+    fn spawn_fetch(
+        &mut self,
+        index: usize,
+        request: youtube::Request,
+        label: String,
+        current: bool,
+    ) {
+        let Some(downloads) = self
+            .queue
+            .as_ref()
+            .map(|queue| queue.downloads().to_path_buf())
+        else {
+            return;
+        };
+        if current {
+            self.load_state = LoadState::Fetching {
+                label: label.clone(),
+            };
+        }
+        let cancel = Cancel::default();
+        let token = cancel.clone();
+        let entry = playlist::Entry::Remote {
+            request,
+            label: label.clone(),
+        };
+        let handle =
+            std::thread::spawn(move || playlist::resolve(&entry, &downloads, Some(&token)));
+        self.pending = Some(PendingFetch {
+            index,
+            label,
+            cancel,
+            handle,
+        });
+    }
+
+    /// Adopt a downloaded entry: open its file and let yt-dlp's names win over the tags.
+    fn load_resolved(&mut self, resolved: playlist::Resolved, index: usize) {
+        if self.load(&resolved.path) {
+            if resolved.title.is_some() {
+                self.info.title = resolved.title;
+            }
+            if resolved.artist.is_some() {
+                self.info.artist = resolved.artist;
+            }
+        }
+        self.load_state = LoadState::Ready;
+        if index
+            == self
+                .queue
+                .as_ref()
+                .map_or(usize::MAX, playlist::Queue::cursor)
+        {
+            self.prefetch_next();
+        }
+    }
+
+    /// Collect a finished background fetch, once.
+    fn poll_fetch(&mut self) {
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        if !pending.handle.is_finished() {
+            return;
+        }
+        let pending = self.pending.take().expect("just checked");
+        let cursor = self.queue.as_ref().map(playlist::Queue::cursor);
+        match pending.handle.join() {
+            Ok(Ok(resolved)) => {
+                if Some(pending.index) == cursor {
+                    self.load_resolved(resolved, pending.index);
+                } else {
+                    self.prefetched = Some((pending.index, resolved));
+                }
+            }
+            Ok(Err(error)) => {
+                if Some(pending.index) == cursor {
+                    self.load_state = LoadState::Failed(format!("{error:#}"));
+                }
+            }
+            Err(_) => {
+                if Some(pending.index) == cursor {
+                    self.load_state =
+                        LoadState::Failed(format!("fetching {} failed", pending.label));
+                }
+            }
+        }
+    }
+
+    /// Fetch the next remote entry while the current one plays, so the transition costs
+    /// nothing but the download that already ran.
+    fn prefetch_next(&mut self) {
+        if self.pending.is_some() || self.prefetched.is_some() {
+            return;
+        }
+        let Some(queue) = &self.queue else {
+            return;
+        };
+        let Some(index) = queue.next_index() else {
+            return;
+        };
+        let Some(entry) = queue.at(index).cloned() else {
+            return;
+        };
+        if let playlist::Entry::Remote { request, label } = entry {
+            self.spawn_fetch(index, request, label, false);
+        }
+    }
+
+    fn next_track(&mut self) {
+        let advanced = self.queue.as_mut().is_some_and(playlist::Queue::advance);
+        if advanced {
+            self.begin_entry();
+        }
+    }
+
+    fn previous_track(&mut self) {
+        let rewound = self.queue.as_mut().is_some_and(playlist::Queue::rewind);
+        if rewound {
+            self.begin_entry();
+        }
+    }
+
+    /// Stop the current render and start the queue's current entry.
+    fn begin_entry(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.load_state = LoadState::Ready;
+        self.play_current();
+    }
+
+    /// Replace the queue with one built from dropped paths.
+    fn open_paths(&mut self, paths: &[PathBuf]) {
+        let downloads = self.downloads_dir();
+        let queue = match playlist::Queue::from_local(paths, &downloads) {
+            Ok(queue) => queue,
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        if let Some(pending) = self.pending.take() {
+            pending.cancel.cancel();
+        }
+        self.prefetched = None;
+        self.queue = Some(queue);
+        self.begin_entry();
+    }
+
+    /// Advance a queue when the track has ended, once per track.
+    fn auto_advance(&mut self) {
+        if self.auto_advanced || self.queue.is_none() || self.live.is_some() {
+            return;
+        }
+        if !self.engine.controls.at_end() {
+            return;
+        }
+        self.auto_advanced = true;
+        let advanced = self.queue.as_mut().is_some_and(playlist::Queue::advance);
+        if advanced {
+            self.begin_entry();
+        }
     }
 
     fn ready_frames(&self) -> usize {
@@ -220,6 +487,7 @@ impl PlayerApp {
             match section {
                 TransportSection::Heading => self.draw_heading(ui),
                 TransportSection::Toggle => self.draw_toggle(ui, prepared_frames),
+                TransportSection::Queue => self.draw_queue(ui),
                 TransportSection::Spectrum => self.draw_spectrum(ui),
                 TransportSection::Waveform => self.draw_waveform(ui),
                 TransportSection::KeyHint => self.draw_key_hint(ui),
@@ -282,12 +550,78 @@ impl PlayerApp {
         }
     }
 
+    /// Where this track sits in the queue, and the two ways to move through it.
+    fn draw_queue(&mut self, ui: &mut egui::Ui) {
+        let Some(queue) = &self.queue else {
+            return;
+        };
+        if queue.len() < 2 && self.pending.is_none() {
+            return;
+        }
+        let indicator = queue.indicator();
+        let current = queue
+            .current()
+            .map(|entry| entry.label().to_string())
+            .unwrap_or_default();
+        let next = queue
+            .next_index()
+            .and_then(|index| queue.at(index))
+            .map(|entry| entry.label().to_string());
+        let has_previous = queue.previous_index().is_some();
+        let has_next = queue.next_index().is_some();
+        let pending_next = self
+            .pending
+            .as_ref()
+            .filter(|pending| Some(pending.index) != Some(queue.cursor()))
+            .map(|pending| pending.label.clone());
+        let state = match &self.load_state {
+            LoadState::Fetching { label } => Some(format!("loading {label}…")),
+            LoadState::Failed(error) => Some(format!("failed: {error}")),
+            LoadState::Ready => None,
+        };
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(has_previous, egui::Button::new("◀"))
+                .clicked()
+            {
+                self.previous_track();
+            }
+            ui.label(
+                egui::RichText::new(format!("{indicator} · {current}"))
+                    .weak()
+                    .size(11.0),
+            );
+            if ui.add_enabled(has_next, egui::Button::new("▶")).clicked() {
+                self.next_track();
+            }
+            if let Some(state) = state {
+                ui.label(egui::RichText::new(state).weak().size(11.0));
+            } else if let Some(label) = pending_next {
+                ui.label(
+                    egui::RichText::new(format!("fetching {label}"))
+                        .weak()
+                        .size(11.0),
+                );
+            } else if !has_next {
+                ui.label(egui::RichText::new("end of queue").weak().size(11.0));
+            } else if let Some(label) = next {
+                ui.label(
+                    egui::RichText::new(format!("next: {label}"))
+                        .weak()
+                        .size(11.0),
+                );
+            }
+        });
+    }
+
     /// The keys that do something, for the user without a mouse.
     fn draw_key_hint(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(
-                "space toggles   ·   p plays   ·   ←/→ seek 5 s   ·   drop a file   ·   esc quits",
+                "space toggles   ·   p plays   ·   ←/→ seek 5 s   ·   n/b track   ·   drop a file   ·   esc quits",
             )
             .weak()
             .size(11.0),
@@ -1061,21 +1395,28 @@ impl eframe::App for PlayerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("flacify — {name}")));
         }
 
-        // The window takes another file without restarting the app, which is what lets
-        // the resident worker pay for itself: the second file skips the weight load.
-        let dropped = ctx.input(|input| {
+        // The window takes another file, or several, without restarting the app, which is
+        // what lets the resident worker pay for itself: the next track skips the weight load.
+        let dropped: Vec<PathBuf> = ctx.input(|input| {
             input
                 .raw
                 .dropped_files
                 .iter()
-                .find_map(|file| file.path.clone())
+                .filter_map(|file| file.path.clone())
+                .collect()
         });
-        if let Some(path) = dropped {
-            self.load(&path);
+        if !dropped.is_empty() {
+            self.open_paths(&dropped);
         }
 
+        self.poll_fetch();
+        self.auto_advance();
         self.maybe_start();
-        if let Some(engine) = Some(&self.engine) {
+
+        let mut next = false;
+        let mut previous = false;
+        {
+            let engine = &self.engine;
             let controls = &engine.controls;
             ctx.input(|input| {
                 if input.key_pressed(egui::Key::Space) {
@@ -1095,12 +1436,20 @@ impl eframe::App for PlayerApp {
                 if input.key_pressed(egui::Key::Escape) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+                next = input.key_pressed(egui::Key::N);
+                previous = input.key_pressed(egui::Key::B);
             });
             if controls.is_playing() {
                 ctx.request_repaint_after(Duration::from_millis(33));
             } else {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
+        }
+        if next {
+            self.next_track();
+        }
+        if previous {
+            self.previous_track();
         }
 
         egui::CentralPanel::default().show(ctx, |ui| self.draw_transport(ui));
@@ -1114,6 +1463,9 @@ impl Drop for PlayerApp {
         if let Some(cancel) = self.cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
+        if let Some(pending) = self.pending.take() {
+            pending.cancel.cancel();
+        }
     }
 }
 
@@ -1126,6 +1478,131 @@ pub fn run(app: impl eframe::App + 'static) -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native("flacify", options, Box::new(|_cc| Ok(Box::new(app))))
+}
+
+/// The window before anything is playing: the app launched with no argument.
+enum EmptyState {
+    Waiting,
+    Player(PlayerApp),
+    Setup(first_run::FirstRun),
+}
+
+struct EmptyApp {
+    paths: setup::Paths,
+    splice: bool,
+    state: EmptyState,
+    error: Option<String>,
+}
+
+impl EmptyApp {
+    fn new(paths: setup::Paths, splice: bool) -> Self {
+        Self {
+            paths,
+            splice,
+            state: EmptyState::Waiting,
+            error: None,
+        }
+    }
+
+    /// Build a queue from dropped paths and start it. These are filesystem paths, so no
+    /// network is touched here and the UI thread does not block on a download.
+    fn open(&mut self, dropped: &[PathBuf]) {
+        let downloads = self.paths.downloads_dir();
+        let queue = match playlist::Queue::from_local(dropped, &downloads) {
+            Ok(queue) => queue,
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        let Some(entry) = queue.current() else {
+            self.error = Some("the queue is empty".to_string());
+            return;
+        };
+        let resolved = match playlist::resolve(entry, &downloads, None) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        let session = match Session::new(&self.paths, self.splice) {
+            Ok(session) => session,
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        match session.open(&resolved.path) {
+            Ok(playback) => {
+                self.state = EmptyState::Player(PlayerApp::with_queue(session, playback, queue));
+                self.error = None;
+            }
+            Err(error) if needs_setup(&error) => {
+                self.state = EmptyState::Setup(first_run::FirstRun::with_queue(
+                    self.paths.clone(),
+                    queue,
+                    self.splice,
+                ));
+                self.error = None;
+            }
+            Err(error) => {
+                self.error = Some(format!(
+                    "could not play {}: {error:#}",
+                    resolved.path.display()
+                ));
+            }
+        }
+    }
+}
+
+impl eframe::App for EmptyApp {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        match &mut self.state {
+            EmptyState::Player(player) => {
+                player.update(ctx, frame);
+                return;
+            }
+            EmptyState::Setup(setup) => {
+                setup.update(ctx, frame);
+                return;
+            }
+            EmptyState::Waiting => {}
+        }
+
+        let dropped: Vec<PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.open(&dropped);
+            ctx.request_repaint();
+            return;
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("flacify").size(20.0).strong());
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("drop an audio file, a folder, or an .m3u/.pls playlist")
+                    .weak(),
+            );
+            if let Some(error) = &self.error {
+                ui.add_space(6.0);
+                ui.colored_label(egui::Color32::from_rgb(220, 90, 90), error);
+            }
+        });
+    }
+}
+
+/// Run the window with nothing loaded; `flacify` with no argument uses this.
+pub fn run_empty(paths: setup::Paths, splice: bool) -> eframe::Result<()> {
+    run(EmptyApp::new(paths, splice))
 }
 
 #[cfg(test)]
@@ -1464,6 +1941,7 @@ mod tests {
             [
                 Heading,
                 Toggle,
+                Queue,
                 Spectrum,
                 Waveform,
                 KeyHint,

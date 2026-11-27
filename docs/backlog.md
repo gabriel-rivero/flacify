@@ -141,6 +141,18 @@ Shapes and wave order are in [`v1.0-plan.md`](v1.0-plan.md); this is the issue l
 | E10-5 | First-run setup: uv-fetched CPython, pinned wheels, weights, resumable | clean machine reaches E10-4 with one command, and reports the 6 GB before starting |
 | E10-6 | Playback + A/B toggle, file-based first | toggle is sample-locked and gap-free between original and rendered buffers |
 
+## E11 — Queue and playlists (ADR-015)
+
+A session queue, deliberately not a library.
+
+| # | title | acceptance |
+|---|---|---|
+| E11-1 | Local playlist inputs: folder, `.m3u`/`.m3u8`, `.pls` | a folder plays in path order; relative paths resolve against the list; a missing entry is skipped with a warning |
+| E11-2 | yt-dlp playlist and radio | a `/playlist` URL enumerates lazily; `--radio <video>` queues the `start_radio` mix; a share link with `list=RD…` and no `--radio` still plays one video |
+| E11-3 | Window queue: strip, auto-advance, next/previous | a track ending advances once; `N`/`B` move through the queue; the strip names `3 / 12`, the next track, and a fetch in progress |
+| E11-4 | No-argument launch | `flacify` opens the window with no track; dropping a file, folder or playlist starts a queue |
+| E11-5 | Remote prefetch | the next remote entry downloads while the current one plays; a failed fetch is a stated state, not a silent stop |
+
 ## State of the scaffold (2026-11-12)
 
 What actually exists, with its evidence. The Rust workspace and the export are

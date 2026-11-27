@@ -50,12 +50,19 @@ pub struct Controls {
     /// Frames a segment-backed play asked for and could not fill, i.e. the audible cost
     /// of a segment miss. The live path counts its own starvation in [`live::Stats`].
     underrun_frames: AtomicU64,
+    /// Set once the playhead has reached the end, so the window can advance a queue.
+    at_end: AtomicBool,
 }
 
 impl Controls {
     /// Frames of silence written because a segment had not arrived.
     pub fn underrun_frames(&self) -> u64 {
         self.underrun_frames.load(Ordering::Relaxed)
+    }
+
+    /// Whether this playback has reached the end of its track.
+    pub fn at_end(&self) -> bool {
+        self.at_end.load(Ordering::Relaxed)
     }
 
     fn add_underrun(&self, frames: usize) {
@@ -216,6 +223,7 @@ impl Mixer {
             auto_promote: AtomicBool::new(false),
             promoted: AtomicBool::new(has_enhanced),
             underrun_frames: AtomicU64::new(0),
+            at_end: AtomicBool::new(false),
         });
         let mixer = Self {
             source: Source::Whole {
@@ -253,6 +261,7 @@ impl Mixer {
             auto_promote: AtomicBool::new(true),
             promoted: AtomicBool::new(false),
             underrun_frames: AtomicU64::new(0),
+            at_end: AtomicBool::new(false),
         });
         let mixer = Self {
             source: Source::Progressive {
@@ -280,6 +289,7 @@ impl Mixer {
             auto_promote: AtomicBool::new(false),
             promoted: AtomicBool::new(has_enhanced),
             underrun_frames: AtomicU64::new(0),
+            at_end: AtomicBool::new(false),
         });
         let mixer = Self {
             source: Source::Segmented(reader),
@@ -307,6 +317,7 @@ impl Mixer {
             auto_promote: AtomicBool::new(false),
             promoted: AtomicBool::new(false),
             underrun_frames: AtomicU64::new(0),
+            at_end: AtomicBool::new(false),
         });
         let mixer = Self {
             source: Source::Live(source),
@@ -383,6 +394,7 @@ impl Mixer {
         while written < frames {
             if self.is_at_end(position) {
                 self.controls.playing.store(false, Ordering::Relaxed);
+                self.controls.at_end.store(true, Ordering::Relaxed);
                 out[written * channels..].fill(0.0);
                 break;
             }
@@ -814,6 +826,21 @@ mod tests {
         assert_eq!(controls.position.load(Ordering::Relaxed), 10);
         assert_eq!(out[0], 0.0);
         assert_eq!(out[18], 9.0);
+    }
+
+    #[test]
+    fn given_playback_to_the_end_when_filled_then_at_end_is_set_and_playback_stops() {
+        let (mut mixer, controls) = Mixer::new(ramp_track(8, 0.0), None, 2, 48_000);
+        controls.set_playing(true);
+        let mut out = vec![0.0f32; 4];
+        assert!(!controls.at_end());
+        assert_eq!(mixer.fill(&mut out), 2);
+        assert!(!controls.at_end(), "the end is not reached yet");
+
+        let mut rest = vec![0.0f32; 16];
+        mixer.fill(&mut rest);
+        assert!(controls.at_end(), "the track has ended");
+        assert!(!controls.is_playing());
     }
 
     #[test]

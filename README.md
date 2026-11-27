@@ -3,7 +3,7 @@
 A desktop player that reconstructs the high frequencies an MP3 threw away, and lets
 you hear the difference on a single keystroke.
 
-Status: **1.0**, playable on macOS, Linux and Windows. `flacify setup` installs the
+Status: **1.1**, playable on macOS, Linux and Windows. `flacify setup` installs the
 Python sidecar and the model, `flacify enhance` renders a file, `flacify play` opens a
 window with an instant A/B switch, and `flacify play --live` renders a file while it plays
 from bounded memory. `flacify sink` does the same for system audio on macOS. The Rust side
@@ -49,8 +49,13 @@ cargo build --release
 ./target/release/flacify setup --cuda          # the CUDA torch wheel on an NVIDIA machine
 ./target/release/flacify probe song.mp3        # cutoff, verdict, wait
 ./target/release/flacify enhance song.mp3      # -> song.mp3.flacify.wav
-./target/release/flacify play song.mp3         # window: space toggles, p plays, drag to seek, drop a file
+./target/release/flacify                       # open the window; drop a file, folder or playlist
+./target/release/flacify play song.mp3         # window: space toggles, p plays, drag to seek, drop more
+./target/release/flacify play ~/Music          # every audio file under a folder, in path order
+./target/release/flacify play mix.m3u          # an .m3u/.m3u8/pls playlist
 ./target/release/flacify play https://youtu.be/ID # the same, for a URL: yt-dlp fetches the audio first
+./target/release/flacify play --radio https://youtu.be/ID # the song's start_radio mix, as a queue
+./target/release/flacify play https://www.youtube.com/playlist?list=ID # a YouTube playlist
 ./target/release/flacify enhance https://youtu.be/ID  # render a URL's audio; --out names the file
 ./target/release/flacify play song.mp3 --live  # bounded memory: one window at a time, latency stated
 ./target/release/flacify play song.mp3 --live --window 4
@@ -64,6 +69,12 @@ cargo build --release
 ./target/release/flacify cache                 # what the cache holds, by kind, against its 20 GB cap
 ./target/release/flacify cache --evict         # evict least recently used entries until it fits
 ```
+
+`play` takes a queue: a folder, an `.m3u`/`.m3u8`/`.pls`, a YouTube playlist, or
+`--radio <video>` for that song's recommendations. Tracks advance at the end, `N`/`B` move
+through them, and the next remote track is fetched while the current one plays. A single
+file is a queue of one. `flacify` with no argument opens the same window empty so a queue
+can be dropped onto it.
 
 `flacify sink` captures one device, enhances it, and plays it on another: it is the same
 bounded path as `play --live`, with the capture stream as the feed. macOS has no loopback of
@@ -95,9 +106,9 @@ which builds and attaches:
 
 - **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) and the raw `flacify.exe`.
 - **macOS:** `flacify.dmg` containing `Flacify.app`.
-- **Debian and Ubuntu:** `flacify_1.0.0_amd64.deb` (`sudo apt install ./flacify_1.0.0_amd64.deb`).
-- **Arch and CachyOS:** `flacify-bin-1.0.0-1-x86_64.pkg.tar.zst`
-  (`sudo pacman -U flacify-bin-1.0.0-1-x86_64.pkg.tar.zst`). The binary needs only alsa,
+- **Debian and Ubuntu:** `flacify_1.1.0_amd64.deb` (`sudo apt install ./flacify_1.1.0_amd64.deb`).
+- **Arch and CachyOS:** `flacify-bin-1.1.0-1-x86_64.pkg.tar.zst`
+  (`sudo pacman -U flacify-bin-1.1.0-1-x86_64.pkg.tar.zst`). The binary needs only alsa,
   libc and libgcc to link; GL, X11 and Wayland are opened when the window starts.
 
 Nothing is signed or notarised yet: on macOS, right-click → Open (or
@@ -132,7 +143,7 @@ See [`docs/vision.md`](docs/vision.md).
 | [`docs/dependencies.md`](docs/dependencies.md) | crates in the tree and considered, model runtime, artifacts, licences |
 | [`docs/risks.md`](docs/risks.md) | risk register, kill criteria |
 | [`docs/backlog.md`](docs/backlog.md) | epics and issue drafts, in build order |
-| [`docs/decisions.md`](docs/decisions.md) | ADR-001 … ADR-014 with status and outcomes |
+| [`docs/decisions.md`](docs/decisions.md) | ADR-001 … ADR-015 with status and outcomes |
 | [`docs/measurements.md`](docs/measurements.md) | every number, with the machine and the date behind it |
 | [`docs/release-1.0.md`](docs/release-1.0.md) | the release checklist, and the evidence that closes each line |
 
@@ -143,7 +154,7 @@ any page that drifts.
 ## Start here
 
 ```sh
-cargo test --workspace --all-targets   # 511 tests, no GPU, no audio device, no model, no Python
+cargo test --workspace --all-targets   # 527 tests, no GPU, no audio device, no model, no Python
 python3 tools/check_docs.py --tests    # the docs still describe this tree
 ```
 

@@ -342,7 +342,8 @@ what it is; this table is the map to those lines.
 | `diagnose.rs` | one text file with the facts an issue needs |
 | `setup.rs` | first-run provisioning: `uv`, CPython, wheels, weights, resumable state |
 | `process.rs` | running another program: one child, its output read as it arrives, killed on cancel |
-| `youtube.rs` | a URL as a source: `yt-dlp` fetches the audio, then the pipeline gets a file |
+| `youtube.rs` | a URL as a source: `yt-dlp` fetches the audio or lists a playlist, then the pipeline gets a file |
+| `playlist.rs` | the queue: folder, `.m3u`/`.m3u8`/`.pls` and yt-dlp listings as entries, one cursor |
 | `first_run.rs` | provisioning from inside the window |
 | `ui.rs` | the egui window: one toggle, one transport, progress, the truth about enhancement |
 | `spectrum.rs` | two spectra of the same moment, so the switch shows what it does |
@@ -482,6 +483,11 @@ local file.
 - **Reuse**: a file keyed by id is trusted without asking yt-dlp again, but it is decoded
   before it is trusted, so a truncated file left by an interrupted run re-fetches rather
   than failing forever.
+- **Playlists**: a URL that names a playlist (`/playlist`, or a `list=` parameter that is
+  not a radio mix) is listed with `yt-dlp --flat-playlist`; each entry is fetched lazily and
+  the next one is prefetched. `--radio` expands a video into its
+  `list=RD<id>&start_radio=1` mix. A share link carrying `list=RD…` without `--radio` stays
+  one video, which preserves the behaviour the URL measurement below records.
 
 ## Loudness
 
@@ -500,7 +506,9 @@ desktop form.
   the detected cutoff shaded. Watching the top octave fill in is the demo.
 - **Waveform**: per-second RMS bars, with the rendered frontier marked. Unrendered
   audio is dimmed so the user can see the renderer catching up.
-- **Transport**: play/pause, seek, A/B, gain. No playlist.
+- **Transport**: play/pause, seek, A/B, gain, next/previous (`N`/`B`). A queue strip shows
+  the position (`3 / 12`), the next track, and a remote fetch in progress. A single file is
+  a queue of one, which hides the strip.
 - **Status**: RTF, buffer depth, dropout count, backend. Small, monospace, always
   visible. This is the credibility surface.
 - **A/B**: one key (`A`), one button, and optionally "hold to hear original" which is

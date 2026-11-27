@@ -65,7 +65,7 @@ artifact. Trigger: you catch yourself saying "it sounds better to me".
 | R15 | stereo image shifts (channels enhanced independently) | M | M | evaluate mid/side; keep the stereo tensor joint through the model | narrow/wide A/B difference |
 | R16 | hallucination on transients and sibilance | M | M | bypass on full-band input; artifact metrics; per-genre corpus | "sounds metallic/smeared" |
 | R17 | audio device matrix (44.1-only, exclusive mode, Bluetooth) | H | M | resample in-app, shared mode default, device diagnostics | clicks or resampler errors |
-| R18 | scope creep turns a demo into a media manager | H | M | the MVP cut table is a contract; new features go to `v2+` | playlists appear in the design |
+| R18 | scope creep turns a demo into a media manager | H | M | the MVP cut table is a contract; the queue is bounded by ADR-015 (no library, no named playlists, no persistence) | a library, named playlists or saved queues appear in the design |
 | R19 | Python tooling rots (torch/CUDA drift) | M | L | pin the export environment in a container | export stops reproducing |
 | R20 | solo-project bus factor | M | M | docs are the deliverable (this set), one-command `diagnose` | you cannot resume after 3 weeks away |
 | R21 | the model sounds wrong at 1–2 granules (v1.0 presets) | M | H | spike S1 measures each preset and the human listens before the UI offers it | 0.64 s clearly broken on two of the five tracks → drop that preset |
@@ -76,8 +76,9 @@ artifact. Trigger: you catch yourself saying "it sounds better to me".
 
 ## Accepted risks
 
-- **No playlist.** Deliberate. It is the fastest way to become a mediocre music
-  player instead of a good enhancer.
+- **No library.** A session queue landed (ADR-015) because it made the enhancer easier to
+  listen through, but named playlists, library scans and persistence stay out: that is the
+  shortest road to a mediocre music player instead of a good enhancer.
 - **No plugin architecture for models.** The `Upscaler` trait is enough; a registry
   can wait for the second model.
 - **Unsigned Windows builds at v1.** SmartScreen warnings cost users; accept it until

@@ -20,6 +20,7 @@ mod limit;
 mod live;
 mod loudness;
 mod player;
+mod playlist;
 mod process;
 mod render;
 mod render_status;
@@ -46,22 +47,27 @@ fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Setup { cuda } => commands::setup::run(cuda),
-        Command::Probe { file, rtf } => commands::probe::run(&file, rtf),
-        Command::Enhance { file, out, splice } => commands::enhance::run(&file, out, splice),
-        Command::Play {
+        None => commands::play::run_gui(),
+        Some(Command::Setup { cuda }) => commands::setup::run(cuda),
+        Some(Command::Probe { file, rtf }) => commands::probe::run(&file, rtf),
+        Some(Command::Enhance { file, out, splice }) => commands::enhance::run(&file, out, splice),
+        Some(Command::Play {
             file,
             smoke,
             splice,
+            radio,
+            single,
             live,
             window,
             rtf,
             watch,
             seek,
-        } => commands::play::run(commands::play::Request {
-            file: &file,
+        }) => commands::play::run(commands::play::Request {
+            file: file.as_deref(),
             smoke,
             splice,
+            radio,
+            single,
             live: if live {
                 Some(commands::play::LiveOptions::parse(&window, rtf)?)
             } else {
@@ -70,30 +76,30 @@ fn main() -> Result<()> {
             watch_secs: watch,
             seek_secs: seek,
         }),
-        Command::Devices => commands::devices::run(),
-        Command::Sink {
+        Some(Command::Devices) => commands::devices::run(),
+        Some(Command::Sink {
             from,
             to,
             window,
             rtf,
             smoke,
             watch,
-        } => commands::sink::run(commands::sink::Request {
+        }) => commands::sink::run(commands::sink::Request {
             from: &from,
             to: &to,
             live: commands::play::LiveOptions::parse(&window, rtf)?,
             smoke,
             watch_secs: watch,
         }),
-        Command::Batch { dir, dry_run } => commands::batch::run(&dir, dry_run),
-        Command::Ab {
+        Some(Command::Batch { dir, dry_run }) => commands::batch::run(&dir, dry_run),
+        Some(Command::Ab {
             file,
             trials,
             seed,
             export,
-        } => commands::ab::run(&file, trials, seed, export.as_deref()),
-        Command::Cache { evict, cap_gb } => commands::cache::run(evict, cap_gb),
-        Command::Diagnose { out } => {
+        }) => commands::ab::run(&file, trials, seed, export.as_deref()),
+        Some(Command::Cache { evict, cap_gb }) => commands::cache::run(evict, cap_gb),
+        Some(Command::Diagnose { out }) => {
             let path = diagnose::run(out)?;
             println!("wrote {}", path.display());
             Ok(())

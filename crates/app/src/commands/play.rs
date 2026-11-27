@@ -9,6 +9,7 @@ use flacify_core::{Preset, Probe, SAMPLE_RATE};
 
 use crate::first_run;
 use crate::live;
+use crate::playlist;
 use crate::session::{needs_setup, Playback, Session};
 use crate::setup;
 use crate::ui;
@@ -16,9 +17,14 @@ use crate::youtube;
 
 /// What `play` was asked for, one field per flag group.
 pub(crate) struct Request<'a> {
-    pub file: &'a Path,
+    /// `None` opens the window with no track, so one can be dropped onto it.
+    pub file: Option<&'a Path>,
     pub smoke: bool,
     pub splice: bool,
+    /// Expand a YouTube video into its radio mix.
+    pub radio: bool,
+    /// Play one video even when the URL names a playlist.
+    pub single: bool,
     /// Present when `--live` was asked for.
     pub live: Option<LiveOptions>,
     /// Seconds a smoke run listens before it reports.
@@ -54,16 +60,79 @@ fn check_flags(request: &Request<'_>) -> Result<()> {
         !(request.live.is_some() && request.splice),
         "--splice is not wired into the live path; drop one of the two"
     );
+    anyhow::ensure!(
+        !(request.radio && request.single),
+        "--radio and --single ask for different queues; pick one"
+    );
+    if request.radio || request.single {
+        let Some(file) = request.file else {
+            anyhow::bail!("--radio and --single need a URL");
+        };
+        let is_url = youtube::parse(&file.to_string_lossy()).is_some();
+        anyhow::ensure!(
+            is_url,
+            "{} needs a URL, not {}",
+            if request.radio { "--radio" } else { "--single" },
+            file.display()
+        );
+    }
     Ok(())
+}
+
+/// Open the window with nothing loaded, so a file, folder or playlist can be dropped on it.
+pub(crate) fn run_gui() -> Result<()> {
+    let paths = setup::Paths::discover()?;
+    ui::run_empty(paths, false).map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+/// The queue a command line names: local inputs through the queue module, URLs through
+/// yt-dlp. A single file is a queue of one, so the window always speaks queue.
+fn build_queue(
+    input: &Path,
+    downloads: &Path,
+    radio: bool,
+    single: bool,
+) -> Result<playlist::Queue> {
+    let text = input.to_string_lossy();
+    match youtube::parse(&text) {
+        Some(_) => playlist::Queue::from_url(&text, downloads, radio, single),
+        None => playlist::Queue::from_local(&[input.to_path_buf()], downloads),
+    }
 }
 
 pub(crate) fn run(request: Request<'_>) -> Result<()> {
     check_flags(&request)?;
+    let Some(input) = request.file else {
+        anyhow::ensure!(
+            !(request.smoke || request.live.is_some()),
+            "--smoke and --live need a file"
+        );
+        return run_gui();
+    };
     let paths = setup::Paths::discover()?;
-    // A URL is fetched before anything else looks at the path, so every consumer below
-    // (the window, the first-run screen, the smoke report) gets a real file.
-    let track = youtube::resolve(request.file, &paths.downloads_dir(), None)?;
-    let file = track.path.as_path();
+    let downloads = paths.downloads_dir();
+
+    // The whole input becomes a queue before the window opens, so the first track's
+    // fetch has the same cold-start cost a single `play <url>` always had.
+    let queue = build_queue(input, &downloads, request.radio, request.single)?;
+    if request.live.is_some() {
+        anyhow::ensure!(
+            queue.len() == 1,
+            "--live plays one track, but this names {}; drop --live",
+            queue.len()
+        );
+    }
+    let entry = queue
+        .current()
+        .context("a queue always has a current entry")?;
+    let first = playlist::resolve(entry, &downloads, None)?;
+    if queue.len() > 1 {
+        eprintln!("queue     {} ({})", queue.len(), queue.origin());
+    }
+    if entry.local_path().is_none() {
+        eprintln!("source    {} ({})", first.label(), queue.indicator());
+    }
+    let file = first.path.as_path();
     let session = Session::new(&paths, request.splice)?;
     let started = Instant::now();
 
@@ -79,9 +148,9 @@ pub(crate) fn run(request: Request<'_>) -> Result<()> {
             if request.smoke {
                 anyhow::bail!("{error}. A headless run cannot install it.");
             }
-            return ui::run(first_run::FirstRun::new(
+            return ui::run(first_run::FirstRun::with_queue(
                 paths,
-                file.to_path_buf(),
+                queue,
                 request.splice,
             ))
             .map_err(|error| anyhow::anyhow!("{error}"));
@@ -90,7 +159,7 @@ pub(crate) fn run(request: Request<'_>) -> Result<()> {
     };
 
     if !request.smoke {
-        return ui::run(ui::PlayerApp::new(session, playback))
+        return ui::run(ui::PlayerApp::with_queue(session, playback, queue))
             .map_err(|error| anyhow::anyhow!("{error}"));
     }
     let result = if playback.live.is_some() {
@@ -385,9 +454,11 @@ mod tests {
 
     fn request(live: Option<LiveOptions>, splice: bool) -> Request<'static> {
         Request {
-            file: Path::new("song.mp3"),
+            file: Some(Path::new("song.mp3")),
             smoke: true,
             splice,
+            radio: false,
+            single: false,
             live,
             watch_secs: 4.0,
             seek_secs: None,
@@ -456,5 +527,33 @@ mod tests {
                 LiveOptions::parse("8", rtf).expect_err("a ratio must be a positive number");
             assert!(format!("{error:#}").contains("positive"), "{rtf}");
         }
+    }
+
+    #[test]
+    fn given_radio_and_single_when_checked_then_the_pair_is_refused() {
+        let mut request = request(None, false);
+        request.radio = true;
+        request.single = true;
+        let error = check_flags(&request).expect_err("they ask for different queues");
+        assert!(format!("{error}").contains("pick one"), "{error}");
+    }
+
+    #[test]
+    fn given_radio_or_single_with_a_path_when_checked_then_a_url_is_required() {
+        for (radio, single) in [(true, false), (false, true)] {
+            let mut request = request(None, false);
+            request.radio = radio;
+            request.single = single;
+            let error = check_flags(&request).expect_err("a URL is required");
+            assert!(format!("{error}").contains("needs a URL"), "{error}");
+        }
+    }
+
+    #[test]
+    fn given_radio_with_a_url_when_checked_then_it_is_accepted() {
+        let mut request = request(None, false);
+        request.radio = true;
+        request.file = Some(Path::new("https://youtu.be/dQw4w9WgXcQ"));
+        assert!(check_flags(&request).is_ok());
     }
 }

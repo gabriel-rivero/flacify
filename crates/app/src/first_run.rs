@@ -7,13 +7,15 @@
 //! ready. The CLI command stays for scripted installs and for `--smoke`, which cannot
 //! click through a dialog.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::{Context, Result};
 use eframe::egui;
 
+use crate::playlist;
 use crate::session::Session;
 use crate::setup::{self, Paths, Progress};
 use crate::ui;
@@ -67,6 +69,8 @@ impl SetupState {
 pub struct FirstRun {
     paths: Paths,
     file: PathBuf,
+    /// When the install is for a queue, the whole queue so playback resumes into it.
+    queue: Option<playlist::Queue>,
     splice: bool,
     state: Arc<SetupState>,
     /// The token for the running install; a fresh one is made on each attempt.
@@ -84,6 +88,7 @@ impl FirstRun {
         Self {
             paths,
             file,
+            queue: None,
             splice,
             state: Arc::new(SetupState::default()),
             cancel: setup::Cancel::default(),
@@ -92,6 +97,18 @@ impl FirstRun {
             player: None,
             error: None,
         }
+    }
+
+    /// The install a queue needs: provision, then open the queue's current entry.
+    pub fn with_queue(paths: Paths, queue: playlist::Queue, splice: bool) -> Self {
+        let file = queue
+            .current()
+            .and_then(|entry| entry.local_path())
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let mut first_run = Self::new(paths, file, splice);
+        first_run.queue = Some(queue);
+        first_run
     }
 
     /// Run the download on its own thread; the window stays responsive and can be closed.
@@ -137,12 +154,33 @@ impl FirstRun {
         if self.player.is_some() || self.error.is_some() {
             return;
         }
+        let file = match self.resolve_file() {
+            Ok(file) => file,
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                return;
+            }
+        };
         match Session::new(&self.paths, self.splice)
-            .and_then(|session| session.open(&self.file).map(|playback| (session, playback)))
+            .and_then(|session| session.open(&file).map(|playback| (session, playback)))
         {
-            Ok((session, playback)) => self.player = Some(ui::PlayerApp::new(session, playback)),
+            Ok((session, playback)) => {
+                self.player = Some(match self.queue.take() {
+                    Some(queue) => ui::PlayerApp::with_queue(session, playback, queue),
+                    None => ui::PlayerApp::new(session, playback),
+                });
+            }
             Err(error) => self.error = Some(format!("{error:#}")),
         }
+    }
+
+    /// The file playback starts with: the queue's current entry, or the single file.
+    fn resolve_file(&self) -> Result<PathBuf> {
+        let Some(queue) = &self.queue else {
+            return Ok(self.file.clone());
+        };
+        let entry = queue.current().context("the queue has a current entry")?;
+        Ok(playlist::resolve(entry, queue.downloads(), None)?.path)
     }
 }
 

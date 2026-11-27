@@ -134,7 +134,8 @@ band subtracted from the generated side and its own added back, the result corre
 stays off. The numbers are in
 [`docs/measurements.md`](measurements.md#alignment-and-the-low-band-splice-2026-11-13).
 
-Deliberately absent: playlists, library view, EQ, skins, export UI, system sink.
+Deliberately absent: library view, EQ, skins, export UI, system sink. (A session queue
+landed later; see ADR-015 and the v1.1 note below.)
 
 ## v0.3 — a real app
 
@@ -339,8 +340,9 @@ release where it should land.
 
 **Explicitly parked**
 
-13. Playlists, library view, EQ, export UI, system-wide sink, live capture: unchanged from
-    the MVP cut below, and none of them are blocked by the gaps above.
+13. Library view, EQ, export UI, system-wide sink, live capture: unchanged from the MVP
+    cut below, and none of them are blocked by the gaps above. A session queue is no longer
+    parked (ADR-015).
 14. `flacify probe --rtf` still defaults to 0.3. The app now knows how to measure this for
     real (the render prints its own RTF); folding that into a saved hardware profile is
     v0.2 work.
@@ -349,7 +351,7 @@ release where it should land.
 
 | in | out |
 |---|---|
-| one file at a time | playlists, queue, library |
+| one file, or one queue of them | library, named playlists, persistence |
 | one model, one window | model picker, presets |
 | A/B toggle | separate volume-matched master |
 | spectrum + waveform | skins, themes, visualisers |
@@ -467,7 +469,8 @@ the second has no trigger yet.
 
 ### Later, no trigger
 
-Playlists and library management; Winamp `.wsz` skin support; EQ and DSP chain;
+Library management and named playlists (the session queue shipped under ADR-015);
+Winamp `.wsz` skin support; EQ and DSP chain;
 VST/DAW plugin; alternative models behind the `Upscaler` trait (AERO, AudioSR,
 AP-BWE); a local HTTP + MCP server so agents and other tools can call the enhancer;
 multi-channel and 44.1 kHz-native models; a public RTF-by-GPU compatibility table fed

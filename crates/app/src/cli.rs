@@ -11,8 +11,9 @@ use clap::{Parser, Subcommand};
     about = "It's not a FLAC, but it's close enough."
 )]
 pub(crate) struct Cli {
+    /// No subcommand opens the window, which is what the packaged app launches.
     #[command(subcommand)]
-    pub(crate) command: Command,
+    pub(crate) command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -45,12 +46,21 @@ pub(crate) enum Command {
         #[arg(long)]
         splice: bool,
     },
-    /// Play a file with an instant A/B switch between original and generated.
+    /// Play a file, folder, playlist or URL with an instant A/B switch.
+    ///
+    /// With no file, opens the window so a track can be dropped onto it.
     Play {
-        file: PathBuf,
+        /// A file, a folder, an `.m3u`/`.m3u8`/`.pls`, or a URL.
+        file: Option<PathBuf>,
         /// Keep the input's low band instead of the model's (experimental).
         #[arg(long)]
         splice: bool,
+        /// Expand a YouTube video into its radio mix: the recommendations from that song.
+        #[arg(long)]
+        radio: bool,
+        /// Play only the video a URL names, even when the URL carries a playlist.
+        #[arg(long)]
+        single: bool,
         /// Render, open the output device, play for a second, report and exit.
         /// This is how a headless machine (and CI) checks the audio path.
         #[arg(long)]

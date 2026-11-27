@@ -142,6 +142,132 @@ fn short_hash(text: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// Marks the one stdout line shape `enumerate` reads, the same trick `fetch` uses.
+const LIST_SENTINEL: &str = "FLACIFY-LIST";
+
+/// One track a playlist URL named, before any audio is fetched.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Listed {
+    pub request: Request,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+}
+
+/// Whether a URL names a playlist rather than one video.
+///
+/// A `list=` parameter is a playlist unless it is a radio mix (`RD…`), which is only
+/// expanded when the caller asks for radio: a share link carrying `start_radio=1` must
+/// keep playing the single video it names, as it did before playlists existed.
+pub fn is_playlist_url(text: &str) -> bool {
+    let url = text.trim();
+    if !has_scheme(url) {
+        return false;
+    }
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let (_, path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
+    let (path_only, rest) = match path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path, None),
+    };
+    let query = rest.map(|query| query.split('#').next().unwrap_or(query));
+    let playlist_path = path_only.trim_end_matches('/').ends_with("playlist");
+    let names_a_list = query
+        .unwrap_or("")
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("list="))
+        .is_some_and(|value| !value.is_empty() && !value.starts_with("RD"));
+    playlist_path || names_a_list
+}
+
+/// The seed video's radio mix: YouTube's `start_radio=1` recommendations.
+pub fn radio_request(seed: &Request) -> Result<Request> {
+    anyhow::ensure!(
+        !seed.video_id.starts_with("url-"),
+        "radio is a YouTube feature; {} is not a YouTube video",
+        seed.url
+    );
+    let id = &seed.video_id;
+    Ok(Request {
+        url: format!("https://www.youtube.com/watch?v={id}&list=RD{id}&start_radio=1"),
+        video_id: id.clone(),
+    })
+}
+
+/// List a playlist or mix with `yt-dlp --flat-playlist`, metadata only. Nothing is
+/// downloaded here; each entry is fetched by [`fetch`] when it is about to play.
+pub fn enumerate(url: &str, cancel: Option<&Cancel>) -> Result<Vec<Listed>> {
+    let program = find_ytdlp().context(
+        "yt-dlp is not installed, and it is what lists a playlist. Install it with `brew \
+         install yt-dlp`, `pipx install yt-dlp` or `pip install yt-dlp`, then try again.",
+    )?;
+    let fields =
+        format!("{LIST_SENTINEL}\t%(id)s\t%(webpage_url,url)s\t%(title)s\t%(uploader,channel)s");
+    let args = [
+        "--flat-playlist",
+        "--no-warnings",
+        "--print",
+        fields.as_str(),
+        "--",
+        url,
+    ];
+    let finished = process::run_streaming(&program, &args, cancel, &mut |_| {})
+        .with_context(|| format!("listing {url}"))?;
+
+    let youtube_source = is_youtube(url);
+    let mut listed = Vec::new();
+    for line in &finished.stdout {
+        let Some(rest) = line.strip_prefix(LIST_SENTINEL) else {
+            continue;
+        };
+        let rest = rest.trim_start_matches('\t');
+        let mut parts = rest.splitn(4, '\t');
+        let id = parts.next().unwrap_or("").trim();
+        let webpage = parts.next().unwrap_or("").trim();
+        let title = clean(parts.next());
+        let artist = clean(parts.next());
+        let request = if has_scheme(webpage) {
+            let video_id =
+                video_id_of(webpage).unwrap_or_else(|| format!("url-{}", short_hash(webpage)));
+            Some(Request {
+                url: webpage.to_string(),
+                video_id,
+            })
+        } else if youtube_source && sanitised(id).is_some() {
+            Some(Request {
+                url: format!("https://www.youtube.com/watch?v={id}"),
+                video_id: id.to_string(),
+            })
+        } else {
+            None
+        };
+        if let Some(request) = request {
+            listed.push(Listed {
+                request,
+                title,
+                artist,
+            });
+        }
+    }
+    anyhow::ensure!(!listed.is_empty(), "yt-dlp listed no tracks for {url}");
+    Ok(listed)
+}
+
+fn has_scheme(text: &str) -> bool {
+    let text = text.get(..8).unwrap_or(text).to_ascii_lowercase();
+    text.starts_with("http://") || text.starts_with("https://")
+}
+
+fn is_youtube(url: &str) -> bool {
+    let url = url.split('#').next().unwrap_or(url);
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let (authority, _) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    host_is(&host, "youtube.com")
+        || host_is(&host, "youtu.be")
+        || host_is(&host, "youtube-nocookie.com")
+}
+
 /// The file a command should actually open: the input itself when it is a path, and a
 /// downloaded track when it is a URL.
 ///
@@ -665,6 +791,114 @@ mod tests {
         assert_eq!(second.title.as_deref(), Some("Some Title"));
         assert_eq!(second.artist.as_deref(), Some("Some Artist"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn given_urls_when_asked_if_they_are_playlists_then_radio_mixes_are_not() {
+        for url in [
+            "https://www.youtube.com/playlist?list=PL123",
+            "https://www.youtube.com/watch?v=abc&list=PL123",
+            "https://www.youtube.com/playlist",
+        ] {
+            assert!(is_playlist_url(url), "{url} is a playlist");
+        }
+        for url in [
+            "https://youtu.be/abc",
+            "https://www.youtube.com/watch?v=abc",
+            "https://www.youtube.com/watch?v=abc&list=RDabc&start_radio=1",
+            "song.mp3",
+        ] {
+            assert!(!is_playlist_url(url), "{url} is not a playlist");
+        }
+    }
+
+    #[test]
+    fn given_a_seed_video_when_made_radio_then_the_url_asks_for_its_mix() {
+        let seed = parse("https://youtu.be/dQw4w9WgXcQ").expect("a URL");
+        let radio = radio_request(&seed).expect("YouTube does radio");
+        assert!(radio.url.contains("v=dQw4w9WgXcQ"), "{}", radio.url);
+        assert!(radio.url.contains("list=RDdQw4w9WgXcQ"), "{}", radio.url);
+        assert!(radio.url.contains("start_radio=1"), "{}", radio.url);
+
+        let other = parse("https://example.com/audio/1").expect("a URL");
+        let error = radio_request(&other).expect_err("radio is YouTube-only");
+        assert!(format!("{error:#}").contains("YouTube"), "{error:#}");
+    }
+
+    // The fake yt-dlp is a `#!/bin/sh` script, so it does not run on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn given_a_playlist_when_enumerated_then_each_printed_line_becomes_an_entry() {
+        let _guard = env_lock();
+        let dir = temp_root("enumerate");
+        let script = fake_listing(
+            &dir,
+            "FLACIFY-LIST\tone\thttps://www.youtube.com/watch?v=one\tFirst\tArtist A\n\
+             FLACIFY-LIST\ttwo\tNA\tSecond\tNA\n",
+        );
+        std::env::set_var(YTDLP_ENV, &script);
+
+        let listed = enumerate("https://www.youtube.com/playlist?list=PL1", None)
+            .expect("the fake lists two");
+        std::env::remove_var(YTDLP_ENV);
+
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].request.video_id, "one");
+        assert_eq!(listed[0].title.as_deref(), Some("First"));
+        assert_eq!(listed[0].artist.as_deref(), Some("Artist A"));
+        // No webpage URL, but the source is YouTube, so the id is enough to fetch it.
+        assert_eq!(listed[1].request.url, "https://www.youtube.com/watch?v=two");
+        assert_eq!(listed[1].title.as_deref(), Some("Second"));
+        assert_eq!(listed[1].artist, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_no_ytdlp_when_listing_a_playlist_then_the_error_says_how_to_install_it() {
+        let _guard = env_lock();
+        let empty = temp_root("no-ytdlp-list");
+        std::fs::create_dir_all(&empty).expect("a temp dir");
+        let path = std::env::var_os("PATH");
+        let over = std::env::var_os(YTDLP_ENV);
+        std::env::set_var("PATH", &empty);
+        std::env::remove_var(YTDLP_ENV);
+
+        let error = enumerate("https://www.youtube.com/playlist?list=PL1", None)
+            .expect_err("no yt-dlp, no listing");
+
+        std::env::remove_var("PATH");
+        if let Some(path) = path {
+            std::env::set_var("PATH", path);
+        }
+        if let Some(over) = over {
+            std::env::set_var(YTDLP_ENV, over);
+        }
+        let _ = std::fs::remove_dir_all(&empty);
+        assert!(
+            format!("{error:#}").contains("yt-dlp is not installed"),
+            "{error:#}"
+        );
+    }
+
+    /// A stand-in for yt-dlp that prints the listing lines given, ignoring its arguments.
+    #[cfg(unix)]
+    fn fake_listing(dir: &Path, lines: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("a temp dir");
+        let script = dir.join("fake-list-yt-dlp.sh");
+        let body = format!(
+            "#!/bin/sh\nprintf '%s' '{}'\n",
+            lines.replace('\'', r"'\''")
+        );
+        std::fs::write(&script, body).expect("a fake script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).expect("chmod");
+        }
+        script
     }
 
     /// A stand-in for yt-dlp: prints the fields the real one does, for a real WAV that a

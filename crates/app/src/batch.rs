@@ -207,6 +207,18 @@ pub fn plan(dir: &Path, settings: &Settings) -> Result<Plan> {
     })
 }
 
+/// The audio files under `dir`, in path order: what playing a folder as a queue contains.
+///
+/// The walk is the same one [`plan`] uses, so a folder accepted for rendering is accepted
+/// for playback with the same extensions and the same refusal to follow symlinks.
+pub(crate) fn audio_files(dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut problems = Vec::new();
+    walk(dir, &mut paths, &mut problems);
+    paths.sort();
+    paths
+}
+
 /// Collect the audio files under `dir`, unordered: the caller sorts.
 ///
 /// Symlinks are not followed, so a linked folder cannot make the walk loop. A subfolder

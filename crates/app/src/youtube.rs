@@ -28,6 +28,9 @@ const AUDIO_FORMAT: &str = "flac";
 /// here rather than failing later inside the decoder.
 const DECODABLE: &[&str] = &["flac", "wav", "m4a", "mp3", "aac", "ogg"];
 
+/// The names a fetch printed, kept beside the audio so a replay shows the same title.
+const NAMES_FILE: &str = "names.tsv";
+
 /// One URL, resolved enough to fetch: the address to give yt-dlp and the id to key it by.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Request {
@@ -153,14 +156,16 @@ pub fn find_ytdlp() -> Option<PathBuf> {
 ///
 /// A file already in `dir` is trusted: it is keyed by the video id, so another video
 /// cannot have written it, and `flacify cache --evict` is how it is reclaimed or
-/// refreshed. The second play therefore spawns nothing.
+/// refreshed. The second play therefore spawns nothing, and shows the same title because
+/// the names are written beside the audio rather than asked for again.
 pub fn fetch(request: &Request, dir: &Path, cancel: Option<&Cancel>) -> Result<Track> {
     let target = dir.join(&request.video_id);
     if let Some(existing) = already_downloaded(&target) {
+        let names = Names::load(&target);
         return Ok(Track {
             path: existing,
-            title: None,
-            artist: None,
+            title: names.title,
+            artist: names.artist,
         });
     }
 
@@ -223,11 +228,53 @@ pub fn fetch(request: &Request, dir: &Path, cancel: Option<&Cancel>) -> Result<T
             format!("fetching {}; yt-dlp said: {note}", request.url)
         }
     })?;
+    Names {
+        title: title.clone(),
+        artist: artist.clone(),
+    }
+    .save(&target);
     Ok(Track {
         path,
         title,
         artist,
     })
+}
+
+/// The names a fetch printed, saved beside the audio. Not a cache key: it is only what
+/// the window shows, and losing it costs a title line rather than the track.
+#[derive(Default)]
+struct Names {
+    title: Option<String>,
+    artist: Option<String>,
+}
+
+impl Names {
+    fn load(dir: &Path) -> Names {
+        let Ok(text) = std::fs::read_to_string(dir.join(NAMES_FILE)) else {
+            return Names::default();
+        };
+        let mut names = Names::default();
+        for line in text.lines() {
+            if let Some(title) = line.strip_prefix("title\t") {
+                names.title = clean(Some(title));
+            } else if let Some(artist) = line.strip_prefix("artist\t") {
+                names.artist = clean(Some(artist));
+            }
+        }
+        names
+    }
+
+    /// Best effort: a failed write costs the title on the next play, not the download.
+    fn save(&self, dir: &Path) {
+        let mut text = String::new();
+        if let Some(title) = &self.title {
+            text.push_str(&format!("title\t{title}\n"));
+        }
+        if let Some(artist) = &self.artist {
+            text.push_str(&format!("artist\t{artist}\n"));
+        }
+        let _ = std::fs::write(dir.join(NAMES_FILE), text);
+    }
 }
 
 /// A file an earlier fetch left, when it is one this build can decode.
@@ -446,6 +493,27 @@ mod tests {
         std::env::remove_var(YTDLP_ENV);
 
         assert!(process::is_cancelled(&error), "{error:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn given_a_download_then_a_replay_shows_the_title_without_asking_yt_dlp_again() {
+        let _guard = env_lock();
+        let dir = temp_root("names");
+        let script = fake_ytdlp(&dir, "prints a WAV");
+        std::env::set_var(YTDLP_ENV, &script);
+
+        let target = dir.join("downloads");
+        let request = parse("https://youtu.be/dQw4w9WgXcQ").expect("a URL");
+        let first = fetch(&request, &target, None).expect("the first fetch downloads");
+        // A yt-dlp that would fail if it ran again: the replay must not need it.
+        std::env::set_var(YTDLP_ENV, dir.join("no-such-program"));
+        let second = fetch(&request, &target, None).expect("the replay reuses the file");
+        std::env::remove_var(YTDLP_ENV);
+
+        assert_eq!(second.path, first.path);
+        assert_eq!(second.title.as_deref(), Some("Some Title"));
+        assert_eq!(second.artist.as_deref(), Some("Some Artist"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

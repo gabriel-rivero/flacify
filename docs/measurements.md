@@ -866,3 +866,29 @@ loudness match is fixed per track from the first window, and on real dynamic mus
 6 s excerpt landed 0.53 dB out. Either the match needs to be per-excerpt or the gate needs
 a defensible number; 1.1 owns that. 1.0 ships the command and the refusal, and **no blind
 report is attached to this release**, because the only run of it failed its own gate.
+
+## A URL as a source, end to end (2026-11-27)
+
+`flacify play` and `flacify enhance` take a URL now, with `yt-dlp` doing the fetch.
+yt-dlp 2026.10.26, ffmpeg 9.0.2, both from Homebrew; M1, 2026-11-27. The video is
+`https://www.youtube.com/watch?v=hyWDKjljFt0`, a 188.4 s upload, with the playlist
+parameters the share link carries (`&list=RDMM…&start_radio=1`) left on, which is what
+`--no-playlist` and the `v=` parse have to survive.
+
+| what | measured |
+|---|---|
+| fetched file | 39 162 240 bytes, FLAC 24-bit 48 kHz stereo, 9 042 408 frames (188.38 s) |
+| download + first audio, play --smoke | 19.75 s cold, 0.33 s once the file exists |
+| detected cutoff | 13 757 Hz, so the top 10.2 kHz is inferred |
+| playback | 289 792 frames in 6 s of watching, 0 dropouts, switch `generated`, promoted at 19.9 s |
+| enhance, whole track | 141.1 s of compute for 188.4 s of audio (RTF 0.75) |
+| high band, source vs rendered, 30–50 s | 16–22 kHz **+5.1 dB** relative to 1–5 kHz; output length equals input to the sample |
+| replay with yt-dlp removed from `PATH` | 0.32 s to first audio, same title, file mtime unchanged |
+
+The replay line is the one that matters for the design: the title comes from a
+`names.tsv` written beside the audio, so a machine that no longer has yt-dlp can still
+replay a file it fetched, and nothing re-downloads.
+
+The high-band figure is a crude FFT mean over a 20 s window, not the loudness-matched
+per-window comparison the acceptance runs use; it says the model added content, not how
+well it matched. A proper listening verdict on this track is not recorded here.

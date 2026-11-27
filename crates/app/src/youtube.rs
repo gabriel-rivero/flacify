@@ -26,10 +26,18 @@ const AUDIO_FORMAT: &str = "flac";
 
 /// The containers the pipeline can actually decode, so a download it cannot read is named
 /// here rather than failing later inside the decoder.
-const DECODABLE: &[&str] = &["flac", "wav", "m4a", "mp3", "aac", "ogg"];
+///
+/// `ogg` is absent on purpose: the build enables the Ogg container and Vorbis but has no
+/// Opus codec, so an Ogg file may pass an extension check and still fail to decode. Every
+/// entry here is a container whose audio codec is always one this build has.
+const DECODABLE: &[&str] = &["flac", "wav", "m4a", "mp3", "aac"];
 
 /// The names a fetch printed, kept beside the audio so a replay shows the same title.
 const NAMES_FILE: &str = "names.tsv";
+
+/// Marks the one stdout line that carries the download's path, so it can be found among
+/// the progress lines without guessing. Never shown to a user.
+const SENTINEL: &str = "FLACIFY-FETCH";
 
 /// One URL, resolved enough to fetch: the address to give yt-dlp and the id to key it by.
 #[derive(Clone, Debug, PartialEq)]
@@ -64,7 +72,9 @@ impl Track {
 /// know how to parse.
 pub fn parse(text: &str) -> Option<Request> {
     let url = text.trim();
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
+    // A scheme is case-insensitive, and a URL without one is a path.
+    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
         return None;
     }
     let video_id = video_id_of(url).unwrap_or_else(|| format!("url-{}", short_hash(url)));
@@ -76,12 +86,18 @@ pub fn parse(text: &str) -> Option<Request> {
 
 /// The id from a watch, `youtu.be` or `shorts` URL, when the URL is one of those shapes.
 fn video_id_of(url: &str) -> Option<String> {
+    // The fragment never reaches yt-dlp, so it must not change the id either: `#t=42`
+    // and the bare URL are the same video and deserve the same download directory.
+    let url = url.split('#').next().unwrap_or(url);
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let (host, path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
+    let (authority, path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
+    // A userinfo section and a port are not the host, and hosts are case-insensitive.
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
     let query = path.split_once('?').map(|(_, query)| query).unwrap_or("");
-    let id = if host.ends_with("youtu.be") {
+    let id = if host_is(&host, "youtu.be") {
         path.split(['?', '/']).next().unwrap_or("")
-    } else if host.ends_with("youtube.com") || host.ends_with("youtube-nocookie.com") {
+    } else if host_is(&host, "youtube.com") || host_is(&host, "youtube-nocookie.com") {
         if let Some(rest) = path.strip_prefix("shorts/") {
             rest.split(['?', '/']).next().unwrap_or("")
         } else if let Some(rest) = path.strip_prefix("embed/") {
@@ -96,6 +112,12 @@ fn video_id_of(url: &str) -> Option<String> {
         ""
     };
     sanitised(id)
+}
+
+/// Whether `host` is `wanted` or a subdomain of it. A bare `ends_with` would let
+/// `notyoutube.com` and `evilyoutu.be` through.
+fn host_is(host: &str, wanted: &str) -> bool {
+    host == wanted || host.ends_with(&format!(".{wanted}"))
 }
 
 /// An id that is safe to use as a directory name: the alphabet YouTube uses, and nothing
@@ -160,13 +182,22 @@ pub fn find_ytdlp() -> Option<PathBuf> {
 /// the names are written beside the audio rather than asked for again.
 pub fn fetch(request: &Request, dir: &Path, cancel: Option<&Cancel>) -> Result<Track> {
     let target = dir.join(&request.video_id);
-    if let Some(existing) = already_downloaded(&target) {
-        let names = Names::load(&target);
-        return Ok(Track {
-            path: existing,
-            title: names.title,
-            artist: names.artist,
-        });
+    if let Some(existing) = already_downloaded(&target, &request.video_id) {
+        // A zero-length or truncated file left by an interrupted run must not be trusted
+        // forever: every replay would fail in the decoder and nothing would re-fetch.
+        if check_decodable(&existing).is_ok() {
+            let names = Names::load(&target);
+            return Ok(Track {
+                path: existing,
+                title: names.title,
+                artist: names.artist,
+            });
+        }
+        tracing::warn!(
+            file = %existing.display(),
+            "the stored download is unreadable; fetching it again"
+        );
+        let _ = std::fs::remove_file(&existing);
     }
 
     let program = find_ytdlp().context(
@@ -176,7 +207,11 @@ pub fn fetch(request: &Request, dir: &Path, cancel: Option<&Cancel>) -> Result<T
     std::fs::create_dir_all(&target).with_context(|| format!("creating {}", target.display()))?;
 
     let template = target.join("%(id)s.%(ext)s");
-    let fields = "after_move:%(filepath)s\t%(title)s\t%(artist,uploader,channel)s";
+    // The sentinel is what makes the printed line findable: without it, every progress
+    // line also "looks like" a path, since it has no tab. A tab is a legal byte in a
+    // title, so the fields are separated by one only because the sentinel is first.
+    let fields =
+        format!("after_move:{SENTINEL}\t%(filepath)s\t%(title)s\t%(artist,uploader,channel)s");
     let template = template.to_string_lossy().into_owned();
     let args = [
         "--no-playlist",
@@ -191,7 +226,7 @@ pub fn fetch(request: &Request, dir: &Path, cancel: Option<&Cancel>) -> Result<T
         "-o",
         &template,
         "--print",
-        fields,
+        &fields,
         &request.url,
     ];
     let finished = process::run_streaming(&program, &args, cancel, &mut |line| {
@@ -208,10 +243,9 @@ pub fn fetch(request: &Request, dir: &Path, cancel: Option<&Cancel>) -> Result<T
         .stdout
         .iter()
         .rev()
-        .find(|line| {
-            line.split('\t')
-                .next()
-                .is_some_and(|path| !path.trim().is_empty())
+        .find_map(|line| {
+            line.strip_prefix(SENTINEL)
+                .map(|rest| rest.trim_start_matches('\t'))
         })
         .context("yt-dlp printed no file name, so nothing was written")?;
     let mut parts = line.splitn(3, '\t');
@@ -255,10 +289,14 @@ impl Names {
         };
         let mut names = Names::default();
         for line in text.lines() {
-            if let Some(title) = line.strip_prefix("title\t") {
-                names.title = clean(Some(title));
-            } else if let Some(artist) = line.strip_prefix("artist\t") {
-                names.artist = clean(Some(artist));
+            let Some((field, value)) = line.split_once('\t') else {
+                continue;
+            };
+            let value = unescape(value);
+            match field {
+                "title" => names.title = Some(value),
+                "artist" => names.artist = Some(value),
+                _ => {}
             }
         }
         names
@@ -268,17 +306,56 @@ impl Names {
     fn save(&self, dir: &Path) {
         let mut text = String::new();
         if let Some(title) = &self.title {
-            text.push_str(&format!("title\t{title}\n"));
+            text.push_str(&format!("title\t{}\n", escape(title)));
         }
         if let Some(artist) = &self.artist {
-            text.push_str(&format!("artist\t{artist}\n"));
+            text.push_str(&format!("artist\t{}\n", escape(artist)));
         }
+        let _ = std::fs::create_dir_all(dir);
         let _ = std::fs::write(dir.join(NAMES_FILE), text);
     }
 }
 
+/// A title is arbitrary text and the file is line- and tab-delimited, so both have to be
+/// escaped: a title containing a newline would otherwise truncate, and one containing
+/// `\nartist\tX` would forge a line.
+fn escape(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 /// A file an earlier fetch left, when it is one this build can decode.
-fn already_downloaded(dir: &Path) -> Option<PathBuf> {
+///
+/// The file named after the id wins over any other decodable file in the directory.
+/// `flacify enhance <url>` writes its output beside the source (`<name>.flacify.wav`),
+/// which is also decodable; picking by name order alone would make `play` on that id
+/// quietly return the render instead of the fetch.
+fn already_downloaded(dir: &Path, video_id: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     let mut found: Vec<PathBuf> = entries
         .flatten()
@@ -286,7 +363,11 @@ fn already_downloaded(dir: &Path) -> Option<PathBuf> {
         .filter(|path| extension(path).is_some_and(|ext| DECODABLE.contains(&ext.as_str())))
         .collect();
     found.sort();
-    found.into_iter().next()
+    found
+        .iter()
+        .find(|path| path.file_stem().is_some_and(|stem| stem == video_id))
+        .or_else(|| found.first())
+        .cloned()
 }
 
 /// Refuse a container the pipeline cannot decode, by name, before it reaches the decoder.
@@ -306,6 +387,10 @@ pub fn check_decodable(path: &Path) -> Result<()> {
         "yt-dlp wrote no audio to {}",
         path.display()
     );
+    // The extension is a cheap filter, not proof: a truncated file, or a right container
+    // holding a codec this build lacks, passes it. Probing reads headers only, and this
+    // runs once per fetch rather than per window.
+    crate::decode::probe_headers(path)?;
     Ok(())
 }
 
@@ -382,6 +467,63 @@ mod tests {
     }
 
     #[test]
+    fn given_a_fragment_or_uppercase_host_when_parsed_then_the_same_id_comes_back() {
+        // A fragment never reaches yt-dlp and a host is case-insensitive, so neither may
+        // change the id: it is the download directory's name.
+        for url in [
+            "https://youtu.be/dQw4w9WgXcQ#t=42",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ#t=42",
+            "HTTPS://WWW.YOUTUBE.COM/watch?v=dQw4w9WgXcQ",
+            "https://WWW.YouTube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com:443/watch?v=dQw4w9WgXcQ",
+        ] {
+            let request = parse(url).unwrap_or_else(|| panic!("{url} is a URL"));
+            assert_eq!(request.video_id, "dQw4w9WgXcQ", "{url}");
+        }
+    }
+
+    #[test]
+    fn given_a_lookalike_host_when_parsed_then_it_is_keyed_by_its_url_not_a_youtube_id() {
+        for url in [
+            "https://notyoutube.com/watch?v=dQw4w9WgXcQ",
+            "https://evilyoutu.be/dQw4w9WgXcQ",
+        ] {
+            let request = parse(url).unwrap_or_else(|| panic!("{url} is a URL"));
+            assert!(
+                request.video_id.starts_with("url-"),
+                "{url} gave {}",
+                request.video_id
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_title_with_a_tab_or_newline_when_saved_and_loaded_then_it_round_trips() {
+        let dir = temp_root("names-escape");
+        let names = Names {
+            title: Some("a\tb\nc\\d".to_string()),
+            artist: Some("x\ty".to_string()),
+        };
+        names.save(&dir);
+        let loaded = Names::load(&dir);
+        assert_eq!(loaded.title.as_deref(), Some("a\tb\nc\\d"));
+        assert_eq!(loaded.artist.as_deref(), Some("x\ty"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn given_a_title_that_looks_like_a_field_when_loaded_then_it_cannot_forge_one() {
+        let dir = temp_root("names-forge");
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        std::fs::write(dir.join(NAMES_FILE), "title\tinnocent\\nartist\\tforged\n")
+            .expect("a names file");
+        let loaded = Names::load(&dir);
+        assert_eq!(loaded.title.as_deref(), Some("innocent\nartist\tforged"));
+        assert_eq!(loaded.artist, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn given_a_url_we_cannot_parse_when_parsed_then_it_still_gets_a_directory_name() {
         let request = parse("https://example.com/audio/1").expect("still a URL");
         assert!(request.video_id.starts_with("url-"), "{}", request.video_id);
@@ -428,6 +570,8 @@ mod tests {
         );
     }
 
+    // The fake yt-dlp is a `#!/bin/sh` script, so it does not run on Windows.
+    #[cfg(unix)]
     #[test]
     fn given_a_fetch_when_run_then_the_printed_path_is_the_track() {
         let _guard = env_lock();
@@ -447,6 +591,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // The fake yt-dlp is a `#!/bin/sh` script, so it does not run on Windows.
+    #[cfg(unix)]
     #[test]
     fn given_a_second_fetch_of_the_same_id_when_run_then_no_child_is_spawned() {
         let _guard = env_lock();
@@ -478,6 +624,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // The fake yt-dlp is a `#!/bin/sh` script, so it does not run on Windows.
+    #[cfg(unix)]
     #[test]
     fn given_a_cancelled_token_when_fetching_then_it_is_cancelled_not_installed_missing() {
         let _guard = env_lock();
@@ -496,6 +644,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // The fake yt-dlp is a `#!/bin/sh` script, so it does not run on Windows.
+    #[cfg(unix)]
     #[test]
     fn given_a_download_then_a_replay_shows_the_title_without_asking_yt_dlp_again() {
         let _guard = env_lock();
@@ -534,7 +684,7 @@ echo started >> "{dir}/starts"
 if [ "{mode}" = "sleeps forever" ]; then sleep 30; fi
 mkdir -p "$(dirname "{wav}")"
 cp "{template}" "{wav}"
-printf '%s\t%s\t%s\n' "{wav}" "Some Title" "Some Artist"
+printf '%s\t%s\t%s\t%s\n' "FLACIFY-FETCH" "{wav}" "Some Title" "Some Artist"
 "#,
             dir = dir.display(),
             mode = mode,

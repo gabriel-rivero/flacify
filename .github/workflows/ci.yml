@@ -130,6 +130,12 @@ jobs:
       # line. A doc is the only description of the code a reader gets first, and
       # nothing else in this pipeline notices when it stops being true. The test-count
       # half of this gate lives in the rust job, which already links the workspace.
+      # The self-test first: it proves the checker still catches the drift it claims to,
+      # so a green run below means something. `AGENTS.md` asks contributors to add a case
+      # here with any fix, and this is what makes that request real.
+      - name: Check the checker itself
+        run: python3 tools/check_docs.py --self-test
+
       - name: Check the docs against the tree
         run: python3 tools/check_docs.py
 

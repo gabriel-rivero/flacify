@@ -1,6 +1,6 @@
 # Dependencies
 
-Status: current, 2026-11-18. Versions are deliberately unpinned; pin them in
+Status: current, 2026-11-27. Versions are deliberately unpinned; pin them in
 `Cargo.toml` at v0.1 and let `cargo update` move them.
 
 The rule: **the shipped binary must not contain Python.** If a dependency needs a
@@ -43,12 +43,12 @@ today; a crate that is not there is not used, whatever an earlier plan said.
 
 | crate | where | why | risk |
 |---|---|---|---|
-| `symphonia` | app | demux + decode MP3, AAC, FLAC, ALAC, Vorbis, Opus, WAV, MP4, OGG | MPL-2.0: file-level copyleft, fine to link, don't fork silently |
+| `symphonia` | app | demux + decode MP3, AAC, FLAC, Vorbis, WAV, MP4, OGG. Not ALAC or Opus: those codecs are not enabled, which is why a URL is fetched as FLAC | MPL-2.0: file-level copyleft, fine to link, don't fork silently |
 | `cpal` | app | one audio output and input API over CoreAudio / WASAPI / ALSA | device matrix is the real cost, not the crate |
 | `flacenc` | app | pure-Rust FLAC encoder for the cache and `enhance --out x.flac` | young; 24-bit round-trip verified 2026-11-17, streaming append still to check |
 | `hound` | app | WAV reading in `sink_probe` and writing in `enhance`/`wav.rs` | — |
 | `lofty` | app | reads the title/artist tag the window shows | — |
-| `egui` + `eframe` | app | UI, custom-painted, single binary | skinning is manual; no Winamp `.wsz` for free |
+| `eframe` | app | the window; `egui` itself arrives through it, not as a direct dependency | skinning is manual; no Winamp `.wsz` for free |
 | `arc-swap` | app | hands the render frontier, resident segment and status to the window without a lock | — |
 | `blake3` | app | cache keys and model checksums | — |
 | `realfft` | core, app | FFT for the cutoff detector, spectrogram, loudness | — |
@@ -69,7 +69,7 @@ control plane are the standard library (`AtomicU32` samples in a bounded ring,
 | `rubato` | the band-limit round trip has to match `scipy.signal.resample_poly` bin for bin, and a general resampler does not. The port is ~285 lines of implementation in `dsp/resample.rs` (452 with its tests) and already pinned against scipy goldens |
 | `biquad` | the Chebyshev port is SOS filtering with the scipy matrix pinned in a test; a crate would hide the bug surface |
 | `ort`, `ndarray` | ADR-002's ONNX Runtime measured 15–31 RTF against PyTorch's 0.51 on the same weights, so the backend is the Python sidecar (ADR-010) and no Rust tensor crate is in the tree |
-| `reqwest`, `ureq`, `sha2` | nothing downloads from Rust: `setup` runs `uv`, `pip` and `curl` as child processes, and the weights come through them |
+| `reqwest`, `ureq`, `sha2` | nothing downloads from Rust: `setup` runs `uv`, `pip` and `curl` as child processes, and the weights arrive via `huggingface_hub` inside the embedded Python script |
 | `claxon` | redundant with symphonia; add only if 30 s seek latency becomes a problem |
 | `egui_kittest` | UI state-machine tests target the plain data the window reads; the crate was not needed |
 | `toml`, `directories` | settings are JSON with hand-written platform paths (`platform_data_dir` in `setup.rs`) |
@@ -97,8 +97,9 @@ developer conveniences, not build requirements.
 
 The app runs other programs; it links none of their libraries. `flacify setup` installs
 the sidecar with `uv`, `pip`, `curl` and `tar`, and `flacify play|enhance <url>` fetches
-audio with `yt-dlp`. All of them are located on `PATH` (honouring `PATHEXT` on Windows)
-and each is overridable for tests: `FLACIFY_UV`, `FLACIFY_YTDLP`.
+audio with `yt-dlp`. The executables are located on `PATH` (honouring `PATHEXT` on
+Windows); the two we can be pointed elsewhere for a test are `FLACIFY_UV` and
+`FLACIFY_YTDLP`.
 
 | program | needed for | if it is missing |
 |---|---|---|

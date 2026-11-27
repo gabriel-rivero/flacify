@@ -58,6 +58,12 @@ against the count in `README.md`.
 | breakdown at v0.0 | 19 core lib, 1 fixture, 11 pipeline, 8 infer | same |
 | `cargo test --workspace --all-targets` at v1.0 | 481 tests, 0 failed | M1, 2026-11-18 |
 | breakdown at v1.0 | 62 core, 34 infer, 385 app (3 are `cfg(unix)`, so a Windows run counts fewer) | same |
+| `cargo test --workspace --all-targets` today | 509 tests, 0 failed | M1, 2026-11-27 |
+| breakdown today | 62 core, 34 infer, 413 app | same |
+
+The total counts a test once per target it is compiled into: `process.rs` and `setup.rs`
+are each mounted by `#[path]` in `tests/setup.rs` as well as built into the binary, so 14
+of those tests run twice and the number overstates unique coverage.
 
 ## The ONNX export (E1)
 

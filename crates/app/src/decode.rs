@@ -113,6 +113,24 @@ impl AudioStream {
     }
 }
 
+/// Whether the file's container is one this build can demux and its track has a decoder
+/// this build can build, without decoding any audio.
+///
+/// `open` already does exactly this work, so this is `AudioStream::open` thrown away. It
+/// exists so a caller with a file it did not produce (a download) can refuse it by name
+/// instead of discovering the problem later, deep in playback.
+// The decode test mounts this module for its decoders and never checks headers.
+#[cfg_attr(test, allow(dead_code))]
+pub fn probe_headers(path: &Path) -> Result<()> {
+    let stream = AudioStream::open(path)?;
+    anyhow::ensure!(
+        stream.sample_rate() > 0,
+        "{} reports no sample rate",
+        path.display()
+    );
+    Ok(())
+}
+
 /// The demuxer and decoder behind `AudioStream`, plus the layout the first packet fixed.
 struct PacketSource {
     path: PathBuf,

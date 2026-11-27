@@ -463,6 +463,26 @@ problem, and it buys seek, instant replay, and a zero-GPU second listen.
   render recovers the crossfade tail the previous segment handed on by rendering that
   segment's last window, which one model call reproduces exactly.
 
+## Fetched audio
+
+A URL is resolved to a file before the pipeline sees anything, so everything above applies
+unchanged: the source tier, the render key and the A/B switch cannot tell a download from a
+local file.
+
+- **Layout**: `<home>/downloads/<video id>/` holds the audio and a `names.tsv` with the
+  title and artist yt-dlp printed. Outside `cache/` on purpose: the cache scan sweeps a
+  directory it cannot read as an entry, and a download is not one. `flacify cache` reports
+  the bytes separately and never evicts them.
+- **One file per id**: the file named after the id wins over any other decodable file in
+  the directory, because `flacify enhance <url>` used to write its render beside the source;
+  it now writes to the working directory for a URL.
+- **Container**: the fetch asks for FLAC. `symphonia` here has no Opus and no ALAC codec, so
+  yt-dlp's default WebM/Opus would not decode, and `youtube::DECODABLE` names only the
+  containers whose codec is always one this build has.
+- **Reuse**: a file keyed by id is trusted without asking yt-dlp again, but it is decoded
+  before it is trusted, so a truncated file left by an interrupted run re-fetches rather
+  than failing forever.
+
 ## Loudness
 
 The PoC matches RMS per window with a 0.2–5× clamp and a 0.5 EMA. It works, but it

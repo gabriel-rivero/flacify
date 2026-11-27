@@ -168,15 +168,16 @@ def crate_deps(member_dir, internal):
 
 
 def table_rows(text, heading):
-    """Rows of the first markdown table after `heading`, as cell lists."""
+    """Rows of the first markdown table after `heading`, as cell lists, header dropped."""
     if heading not in text:
         return []
     block = text.split(heading, 1)[1]
-    rows, seen = [], False
+    rows, separator, seen = [], False, False
     for line in block.splitlines():
         if line.startswith("|"):
             cells = [c.strip() for c in line.strip().strip("|").split("|")]
             if all(set(c) <= set("-: ") for c in cells):
+                separator = True
                 continue
             rows.append(cells)
             seen = True
@@ -184,7 +185,9 @@ def table_rows(text, heading):
             break
         elif line.startswith("#"):
             continue
-    return rows[1:] if rows else []
+    # Drop the header row only when a `|---|` separator proved one was there. Otherwise a
+    # table written without a separator would lose its first real row from every check.
+    return rows[1:] if separator and rows else rows
 
 
 def crate_tokens(cells):
@@ -218,12 +221,21 @@ def check_crates(files):
     for member, cells in documented.items():
         if member not in members or len(cells) < 3:
             continue
+        # A row may point at `dependencies.md` instead of listing every crate, which is
+        # what `crates/app` does with sixteen. That is an explicit form, not an omission,
+        # so the list check applies only to rows that claim to be a list.
+        if re.search(r"\[[^\]]*\]\([^)]*dependencies\.md", cells[2]):
+            continue
         # Only the cell's own code spans name crates; a link inside it is prose.
         cell = re.sub(r"\[[^\]]*\]\([^)]*\)", " ", cells[2])
         claimed = {t for t in crate_tokens(cell) if t not in internal}
         real = crate_deps(members[member], internal)
         for wrong in sorted(claimed - real):
             problems.append(f"docs/architecture.md: {member} does not depend on {wrong}")
+        # Both directions: a crate that gains a dependency the table does not name is the
+        # drift the table exists to catch, not only a credited dependency it lacks.
+        for missing in sorted(real - claimed):
+            problems.append(f"docs/architecture.md: {member} depends on {missing}, unnamed in the table")
     return problems
 
 
@@ -238,6 +250,7 @@ def check_deps(files):
     text = files.get(os.path.join(DOCS, "dependencies.md"), "")
     in_tree = table_rows(text, "### In the tree")
     not_used = table_rows(text, "### Considered, not used")
+    absent = table_rows(text, "## Deliberately absent")
     if not in_tree:
         return ["docs/dependencies.md: the `### In the tree` crate table is gone"]
     lock = read(os.path.join(ROOT, "Cargo.lock"))
@@ -251,13 +264,20 @@ def check_deps(files):
     for cells in in_tree:
         for name in crate_tokens(cells[0]):
             present.add(name)
-            if name not in locked:
-                problems.append(f"docs/dependencies.md: {name} is listed as used but not in Cargo.lock")
-    for cells in not_used:
-        for name in crate_tokens(cells[0]):
-            if name in locked:
+            # A direct dependency, not merely "somewhere in the lock": a transitive crate
+            # (egui, tokio) listed as ours would otherwise pass.
+            if name not in direct:
                 problems.append(
-                    f"docs/dependencies.md: {name} is under 'not used' but is in Cargo.lock")
+                    f"docs/dependencies.md: {name} is under 'In the tree' but is not a direct dependency")
+    # Both "absent" tables claim a crate is not used. What that means is "not a direct
+    # dependency": a crate can sit in Cargo.lock transitively (tokio arrives only on the
+    # wasm build of cpal/eframe), so the lock alone would wrongly flag it.
+    for heading, rows in (("Considered, not used", not_used), ("Deliberately absent", absent)):
+        for cells in rows:
+            for name in crate_tokens(cells[0]):
+                if name in direct:
+                    problems.append(
+                        f"docs/dependencies.md: {name} is under '{heading}' but is a direct dependency")
 
     documented = {name.replace("-", "_") for name in present} | present
     for dep in sorted(direct - documented):
@@ -365,6 +385,22 @@ def self_test():
     assert slug("The sink, end to end (A3), 2026-11-18") == "the-sink-end-to-end-a3-2026-11-18"
     text = "## Crates\n\n| a | b |\n|---|---|\n| `crates/x` | y |\n"
     assert table_rows(text, "## Crates") == [["`crates/x`", "y"]]
+    # A table with no `|---|` separator still has a real first row, which must survive.
+    headerless = "## Crates\n\n| `crates/x` | y |\n| `crates/z` | w |\n"
+    assert table_rows(headerless, "## Crates") == [["`crates/x`", "y"], ["`crates/z`", "w"]]
+    # ADR range and gap logic, keyed the way the checks look files up.
+    decisions_path = os.path.join(DOCS, "decisions.md")
+    readme_path = os.path.join(ROOT, "README.md")
+    docs = {decisions_path: "# D\n\n## ADR-001 — a\n\n## ADR-003 — c\n",
+            readme_path: "| x | ADR-001 … ADR-003 |\n"}
+    assert any("does not say why" in p for p in check_adr(docs)), "an unexplained gap must be caught"
+    docs[decisions_path] += "\nADR-002 is unresolved.\n"
+    assert check_adr(docs) == [], check_adr(docs)
+    docs[readme_path] = "| x | ADR-001 … ADR-009 |\n"
+    assert any("quotes" in p for p in check_adr(docs)), "a wrong range must be caught"
+    # A Status line without a date is drift, and so is a missing one.
+    assert check_status({os.path.join(DOCS, "a.md"): "Status: current\n"}), "an undated Status must be caught"
+    assert check_status({os.path.join(DOCS, "a.md"): "Status: current, 2026-11-27.\n"}) == []
     print("self-test ok")
 
 

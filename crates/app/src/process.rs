@@ -11,12 +11,17 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+
+/// The one child a run owns, shared with its watchdog. `Child` is not `Sync`, so the
+/// handle is; killing and waiting both go through it, which keeps the kill off `PATH` and
+/// off a pid that may have been recycled.
+type SharedChild = Arc<Mutex<Child>>;
 
 /// How often the reload of a cancelled child is checked, and how long a killed child is
 /// waited for before its pipes are abandoned.
@@ -100,17 +105,25 @@ pub fn run_streaming(
             .with_context(|| format!("{command} has no stdout"))?,
     );
     let stderr = child.stderr.take().map(drain);
-    let watching = cancel.map(|token| Watchdog::new(&child, token));
+    // The watchdog kills through this handle rather than by running `kill`, which would
+    // need `PATH` and is exactly what a test emptying `PATH` takes away.
+    let shared = Arc::new(Mutex::new(child));
+    let mut watching = cancel.map(|token| Watchdog::new(Arc::clone(&shared), token));
 
     let mut lines = Vec::new();
-    let mut line = String::new();
+    let mut raw = Vec::new();
     let mut read_failed = None;
     loop {
-        line.clear();
-        match pipe.read_line(&mut line) {
+        raw.clear();
+        // `read_until`, not `read_line`: one byte of non-UTF-8 (a path in a non-UTF-8
+        // encoding is a realistic yt-dlp output) would make `read_line` return
+        // `InvalidData` and abort a run that would otherwise succeed.
+        match pipe.read_until(b'\n', &mut raw) {
             Ok(0) => break,
             Ok(_) => {
-                let text = line.trim_end_matches(['\r', '\n']).to_string();
+                let text = String::from_utf8_lossy(&raw)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string();
                 on_line(&text);
                 lines.push(text);
             }
@@ -120,21 +133,23 @@ pub fn run_streaming(
             }
         }
     }
+    // Signalled on every path, not just the happy one: a reader error must not leave the
+    // watchdog to time out on its own.
+    if let Some(watching) = watching.as_mut() {
+        watching.stop();
+    }
     let status = match read_failed {
         // The watchdog kills a child whose pipe we are trying to read; a reset is that.
         Some(error) => {
-            reap(&mut child);
+            reap(&shared);
             let _ = finish(stderr);
             if cancel.is_some_and(Cancel::is_cancelled) {
                 return Err(anyhow::Error::new(Cancelled));
             }
             return Err(error).with_context(|| format!("reading {command}'s output"));
         }
-        None => wait_for(&mut child, cancel)?,
+        None => wait_for(&shared, cancel)?,
     };
-    if let Some(watching) = watching {
-        watching.stop();
-    }
     let stderr = finish(stderr);
     if status.success() {
         return Ok(Finished {
@@ -151,28 +166,39 @@ pub fn run_streaming(
 
 /// Waits for the child, but reports cancellation rather than a status when that is why it
 /// died: a killed child's exit code says nothing about the program.
-fn wait_for(child: &mut Child, cancel: Option<&Cancel>) -> Result<std::process::ExitStatus> {
+fn wait_for(shared: &SharedChild, cancel: Option<&Cancel>) -> Result<ExitStatus> {
     loop {
         if cancel.is_some_and(Cancel::is_cancelled) {
-            reap(child);
+            reap(shared);
             return Err(anyhow::Error::new(Cancelled));
         }
+        let mut child = shared.lock().expect("the child handle");
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
-            Ok(None) => std::thread::sleep(POLL),
+            Ok(None) => {
+                drop(child);
+                std::thread::sleep(POLL);
+            }
             Err(error) => return Err(error).context("waiting for the child"),
         }
     }
 }
 
 /// Kills the child and waits a bounded time for it, so a cancel cannot leak a process.
-fn reap(child: &mut Child) {
-    let _ = child.kill();
+fn reap(shared: &SharedChild) {
     let deadline = std::time::Instant::now() + REAP;
+    {
+        let mut child = shared.lock().expect("the child handle");
+        let _ = child.kill();
+    }
     while std::time::Instant::now() < deadline {
+        let mut child = shared.lock().expect("the child handle");
         match child.try_wait() {
             Ok(Some(_)) | Err(_) => return,
-            Ok(None) => std::thread::sleep(POLL),
+            Ok(None) => {
+                drop(child);
+                std::thread::sleep(POLL);
+            }
         }
     }
 }
@@ -181,14 +207,13 @@ fn reap(child: &mut Child) {
 /// prints nothing would block the caller's read forever and the cancel would go unseen.
 struct Watchdog {
     done: std::sync::mpsc::Sender<()>,
-    thread: std::thread::JoinHandle<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Watchdog {
-    fn new(child: &Child, cancel: &Cancel) -> Self {
-        // The pid is what the thread kills: a `&mut Child` cannot cross threads, and a
-        // killed pid is the same process the caller is waiting on.
-        let pid = child.id();
+    fn new(child: SharedChild, cancel: &Cancel) -> Self {
+        // The handle, not the pid: `Child::kill` is the syscall, so it needs no `PATH` and
+        // cannot hit a recycled pid. A reaped child makes it a harmless `InvalidInput`.
         let token = cancel.clone();
         let (done, waiting) = std::sync::mpsc::channel::<()>();
         let thread = std::thread::spawn(move || loop {
@@ -196,29 +221,37 @@ impl Watchdog {
                 return;
             }
             if token.is_cancelled() {
-                kill(pid);
+                if let Ok(mut child) = child.lock() {
+                    let _ = child.kill();
+                }
                 return;
             }
         });
-        Self { done, thread }
+        Self {
+            done,
+            thread: Some(thread),
+        }
     }
 
-    fn stop(self) {
+    /// Signal the thread and wait for it, when the caller is on the happy path and can
+    /// afford to block. Takes the handle out so `Drop` has nothing left to join.
+    fn stop(&mut self) {
         let _ = self.done.send(());
-        let _ = self.thread.join();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
-/// Ends a process the short way, by pid, which is what a blocked read needs.
-fn kill(pid: u32) {
-    #[cfg(windows)]
-    let _ = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
-        .output();
-    #[cfg(unix)]
-    let _ = std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .output();
+impl Drop for Watchdog {
+    /// The early returns above drop the watchdog without stopping it. A `Sender` dropped
+    /// on its own makes `recv_timeout` return `Err` at once, which would leave the thread
+    /// spinning for the life of the process, so the signal has to be sent here too. The
+    /// thread is not joined: it exits on its own next poll, and blocking a `Drop` on a
+    /// path that was already reporting an error would be the wrong trade.
+    fn drop(&mut self) {
+        let _ = self.done.send(());
+    }
 }
 
 /// Read a child's pipe to the end on its own thread, so the child never blocks on a full
@@ -311,6 +344,8 @@ mod tests {
         Path::new("/usr/bin/sh").to_path_buf()
     }
 
+    // A POSIX shell: this test needs `/bin/sh -c`, so it does not run on Windows.
+    #[cfg(unix)]
     #[test]
     fn given_a_child_that_prints_when_run_then_every_line_reaches_the_sink() {
         let mut seen = Vec::new();
@@ -325,6 +360,8 @@ mod tests {
         assert_eq!(finished.stdout, seen);
     }
 
+    // A POSIX shell: this test needs `/bin/sh -c`, so it does not run on Windows.
+    #[cfg(unix)]
     #[test]
     fn given_a_child_that_fails_when_run_then_the_error_carries_its_last_lines() {
         let error = run_streaming(
@@ -337,6 +374,8 @@ mod tests {
         assert!(format!("{error:#}").contains("the reason"), "{error:#}");
     }
 
+    // A POSIX shell: this test needs `/bin/sh -c`, so it does not run on Windows.
+    #[cfg(unix)]
     #[test]
     fn given_a_cancelled_token_when_run_then_no_child_is_spawned() {
         let cancel = Cancel::default();
@@ -346,6 +385,8 @@ mod tests {
         assert!(is_cancelled(&error), "{error:#}");
     }
 
+    // A POSIX shell: this test needs `/bin/sh -c`, so it does not run on Windows.
+    #[cfg(unix)]
     #[test]
     fn given_a_child_that_never_prints_when_cancelled_then_it_is_killed_not_hung() {
         let cancel = Cancel::default();
@@ -354,9 +395,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             token.cancel();
         });
+        let started = std::time::Instant::now();
         let error = run_streaming(&shell(), &["-c", "sleep 30"], Some(&cancel), &mut |_| {})
             .expect_err("a cancelled child does not return success");
+        // `sleep 30` would end on its own, so the error alone proves nothing: the
+        // watchdog firing is what makes this fast, and that is what is asserted.
         assert!(is_cancelled(&error), "{error:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}, so the child was not killed",
+            started.elapsed()
+        );
     }
 
     #[test]

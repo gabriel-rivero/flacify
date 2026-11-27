@@ -18,13 +18,21 @@ pub(crate) fn run(file: &Path, out: Option<PathBuf>, splice: bool) -> Result<()>
         anyhow::bail!("the model is not installed yet. Run `flacify setup` once (about 6 GB).");
     }
     // A URL is fetched first; a path comes back as it was.
-    let track = youtube::resolve(file, &paths.downloads_dir(), None)?;
-    let file = track.path.as_path();
+    let fetched = youtube::resolve(file, &paths.downloads_dir(), None)?;
+    let from_url = youtube::parse(&file.to_string_lossy()).is_some();
+    let file = fetched.path.as_path();
     let session = Session::new(&paths, splice)?;
     let out = out.unwrap_or_else(|| {
         let mut name = file.file_name().unwrap_or_default().to_os_string();
         name.push(".flacify.wav");
-        file.with_file_name(name)
+        // A file's render sits beside it. A fetched track's render goes to the working
+        // directory instead: the download directory holds the source and its names file,
+        // and a render there would be mistaken for a download on the next play.
+        if from_url {
+            PathBuf::from(name)
+        } else {
+            file.with_file_name(name)
+        }
     });
 
     let started = Instant::now();

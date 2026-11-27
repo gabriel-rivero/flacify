@@ -48,10 +48,16 @@ source and a band-limited one.
 
 ## Test suite
 
+The first number is the suite as it was at the start; the second is what
+`cargo test --workspace` lists today, which `tools/check_docs.py --tests` compares
+against the count in `README.md`.
+
 | metric | value | source |
 |---|---|---|
-| `cargo test --workspace` | 39 passed, 0 failed | M1, 2026-11-12 |
-| breakdown | 19 core lib, 1 fixture, 11 pipeline, 8 infer | same |
+| `cargo test --workspace` at v0.0 | 39 passed, 0 failed | M1, 2026-11-12 |
+| breakdown at v0.0 | 19 core lib, 1 fixture, 11 pipeline, 8 infer | same |
+| `cargo test --workspace --all-targets` at v1.0 | 481 tests, 0 failed | M1, 2026-11-18 |
+| breakdown at v1.0 | 62 core, 34 infer, 385 app (3 are `cfg(unix)`, so a Windows run counts fewer) | same |
 
 ## The ONNX export (E1)
 

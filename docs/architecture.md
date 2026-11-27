@@ -1,7 +1,9 @@
 # Architecture
 
-Status: current for v1.0, 2026-11-18. Written against the recommended option in each ADR
-([`decisions.md`](decisions.md)).
+Status: current for v1.0, checked against the code 2026-11-27. Where the ADRs described
+a plan the code has since replaced (ADR-002's ONNX Runtime, for one), this page records
+what the code does and names the ADR that changed it; the decisions themselves are in
+[`decisions.md`](decisions.md).
 
 ## Overview
 
@@ -11,8 +13,8 @@ Status: current for v1.0, 2026-11-18. Written against the recommended option in 
                  └───────▲──────────────────────────────▲─────────────────────────┘
                          │                              │
  source ──▶ decode ──▶ preprocess ──▶ window ──▶ infer ──▶ overlap-add ──▶ mixer ──▶ device
- (file,     (symphonia  (cutoff +  (5.12 s   (ONNX)    (cosine xfade,   (A/B xfade)   (cpal)
-  capture)   → f32 48k)  lowpass)    frames)             loudness match)
+ (file,     (symphonia  (cutoff +  (5.12 s   (Python   (cosine xfade,   (A/B xfade)   (cpal)
+  capture)   → f32 48k)  lowpass)    frames)   sidecar)  loudness match)
                               │
                               └──▶ render cache (segmented FLAC, background)
 ```
@@ -25,15 +27,19 @@ identical, which is the whole point of the rewrite.
 
 | crate | owns | depends on |
 |---|---|---|
-| `crates/core` | windows, overlap-add, xfade, delay line, buffer policy, cutoff detector, loudness, state machine, the `Upscaler` trait and its mocks | `realfft` — no I/O |
-| `crates/infer` | ONNX session, execution-provider selection, model download/verify, the `Model` trait (one window in, one out) | `ort`, `reqwest`, `sha2` |
-| `crates/app` (bin) | symphonia decode, `cpal` output, cache, probe, egui UI, CLI | the two above |
-| `crates/eval` (bin, later) | metrics, spectrograms, blind A/B reports | `core` only |
+| `crates/core` | windows, overlap-add, xfade, delay line, buffer policy, cutoff detector, loudness, state machine, the `Upscaler` trait and its mocks | `realfft`, `thiserror` — no I/O |
+| `crates/infer` | the `Model` trait (one window in, one out), the deterministic noise, the `Model`-driven `Upscaler`, and the Python sidecar client that serves a window | `flacify-core`, `thiserror` |
+| `crates/app` (bin) | symphonia decode, `cpal` output, cache, probe, egui UI, CLI | the two above, plus the crates in [`dependencies.md`](dependencies.md) |
 
 Two traits, two boundaries, and the split is deliberate. `Upscaler` lives in `core`
 because the pipeline's own tests need mock implementations and must run with no model;
-`Model` lives in `infer` because it is the shape of the ONNX graph and nothing in
-`core` may know about tensors.
+`Model` lives in `infer` because it is the shape of the window the backend accepts, and
+nothing in `core` may know about tensors.
+
+`crates/infer` names no inference runtime on purpose. ADR-010 put the model in a Python
+sidecar the app installs, so the crate holds a client for `tools/worker.py` and a trait
+the backend sits behind; the ONNX path ADR-002 planned is not in the tree. Swapping the
+backend is one implementation of `Model`, not a new dependency in `core`.
 
 `core` must compile and test with no GPU, no audio device, and no model. That is
 what makes the project developable on a laptop, in CI, and by someone who has not
@@ -47,9 +53,10 @@ until something else needs them.
 ### 1. Decode
 
 `symphonia` to `f32`, planar, **48 kHz** — the model's native rate. Resample once,
-at the source, with `rubato` (sinc, high quality). 44.1 kHz sources are the common
-case and the resampler is on the critical path, so measure it: it must cost well
-under 1% of a core or it belongs on the render thread.
+at the source, with the crate's own polyphase resampler
+(`crates/core/src/dsp/resample.rs`, a port of `scipy.signal.resample_poly`), not a
+third-party one. 44.1 kHz sources are the common case and the resampler is on the
+critical path, so its cost is measured in [`measurements.md`](measurements.md).
 
 Decode ahead of the renderer by a bounded amount (the lookahead the windower needs,
 plus one window). Do not decode the whole file into RAM: an hour of stereo float is
@@ -86,18 +93,26 @@ which pumps on dynamic material), clamped for safety; see [Loudness](#loudness).
 | thread | owns | rules |
 |---|---|---|
 | decode | `symphonia` decoder, resampler | fills the source ring; stops when full |
-| render | windower, `ort` session, cache writer | the only thread that calls the model |
+| pump | windower, the `Model` (one sidecar call per window), cache writer | the only thread that calls the model |
 | audio callback | `cpal` output, mixer, delay line | **alloc-free, lock-free, no logging, no GPU** |
 | UI | egui, probes, file dialogs | reads atomics, sends commands |
-| download | model fetch, checksum | `ureq`, cancellable, resumable |
+| setup | `uv`, pip and the weights fetch, as child processes | cancellable, resumable |
 
 Data flow between them:
 
-- source ring: SPSC (`rtrb`), decode → render.
-- output ring: SPSC, render → audio callback.
-- control: `crossbeam-channel` for commands (seek, open file, toggle) and events
-  (underrun, render progress) — never in the callback.
-- meters: `AtomicU64`/`AtomicU32` only, read by the UI at 30 Hz.
+- source ring: one bounded ring of interleaved frames, samples in `AtomicU32`, addressed
+  by absolute frame number (`live.rs`). A producer writes, the audio thread reads, and
+  neither takes a lock.
+- output ring: the same ring type, pump → audio callback.
+- control: `std::sync::mpsc` for commands (seek, open file, toggle, device errors), and
+  `arc-swap` for what the UI reads (the render frontier, the resident segment, the
+  render status). Neither is touched from the callback.
+- meters: `AtomicU64`/`AtomicUsize` only, read by the UI at 30 Hz.
+
+There is no `rtrb`, no `crossbeam-channel` and no `ureq` in the dependency tree: the
+standard library's channels and atomics cover what the rings and the control plane need,
+and downloads are child processes, not HTTP calls from Rust. See
+[`dependencies.md`](dependencies.md).
 
 The audio callback's only job is to pop samples from a ring, apply the A/B crossfade
 and the master gain, and write them to the device. What it does when the ring is empty
@@ -279,19 +294,6 @@ pipe (`tools/worker.py`): one window in, one window out, 2 ms of IPC, RTF 0.543,
 bit-identical to in-process Metal. `Model` is the seam, so this is one implementation
 rather than a fork of the design, and it never ships in a signed build.
 
-The app crate is small on purpose, one module per job:
-
-| module | job |
-|---|---|
-| `decode.rs` | symphonia → planar f32, channel map, polyphase resample to 48 kHz |
-| `render.rs` | decode + analyse + the pipeline over the shared worker, one track at a time |
-| `session.rs` | one resident worker for the window, the cache, and a file becoming playback |
-| `player.rs` | the mixer: two signals, one position, an 8 ms ramp, atomics only |
-| `segments.rs` | segmented playback: a prefetch worker decoding cache and source segments |
-| `device.rs` | `cpal` output: config, one-time resample, channel map, callback |
-| `setup.rs` | first-run provisioning: uv, CPython, wheels, weights, resumable state |
-| `ui.rs` | the egui window: one toggle, one transport, progress |
-
 **The window-size cost.** Supporting 0.64 / 1.28 / 2.56 / 5.12 s at full quality
 means either dynamic axes (CoreML EP handles these poorly) or four copies of a
 3.3 GB model. So v1 ships one window size, chosen by measurement, and the latency
@@ -299,10 +301,83 @@ presets arrive only if dynamic axes survive the spike. The PoC's flexibility was
 free because the Python runtime was already there; here it costs gigabytes. Decide
 this in v0.0, not in v0.4.
 
+The sidecar made the presets cheap after all: `tools/worker.py` derives the latent
+grid from `channels, frames`, so 1, 2, 4 and 8 granules are an input it already
+accepts, and `flacify play --live --window N` / `flacify sink --window N` expose them
+(`Preset` in `crates/core/src/policy.rs`). Measured cost per preset, and the listening
+verdict that 2 granules are noisy, are in
+[`measurements.md`](measurements.md#window-presets-s1-2026-11-18).
+
 **Verification gate.** Export is not done when it runs; it is done when it matches
 PyTorch. Take five tracks, render them with a fixed seed through both paths, and
 require ≤ −40 dB relative RMS difference per window, plus an identical cutoff
 decision per window. Below that the export is wrong, whatever it sounds like.
+
+## Modules
+
+One module per job, in the crate that owns it. Each file opens with a `//!` line saying
+what it is; this table is the map to those lines.
+
+### `crates/app` (the binary)
+
+| module | job |
+|---|---|
+| `main.rs` | parse the CLI and dispatch to one `commands/` module |
+| `cli.rs` | the clap surface: one subcommand per thing the app does |
+| `commands/` | one `run` each: `setup.rs`, `probe.rs`, `enhance.rs`, `play.rs`, `ab.rs`, `batch.rs`, `cache.rs`, `devices.rs`, `diagnose.rs`, `sink.rs` |
+| `decode.rs` | symphonia → planar f32, channel map, polyphase resample to 48 kHz |
+| `render.rs` | one track through the model, start to finish |
+| `session.rs` | one app run: installed paths, one resident model, a file becoming playback |
+| `player.rs` | the mixer: two signals, one position, an 8 ms ramp, atomics only |
+| `segments.rs` | segmented playback: the callback reads decoded FLAC segments, not a track |
+| `source.rs` | the source tier: one sequential pass writes 48 kHz stereo FLAC segments |
+| `cache.rs` | the render cache: keys, manifests, eviction, claims |
+| `frontier.rs` | the render frontier: audio that exists, published one second at a time |
+| `render_status.rs` | what the background render is doing, in a form the window reads |
+| `live.rs` | bounded-memory playback: a feed in, the A/B mix out |
+| `sink.rs` | the sink's feed: one capture device into the live rings, rate-corrected |
+| `device.rs` | `cpal` output and capture: list, open by name, one-time resample |
+| `ab.rs` | the blind A/B run: seeded plan, answers, level gate, report |
+| `batch.rs` | a folder rendered one file at a time |
+| `diagnose.rs` | one text file with the facts an issue needs |
+| `setup.rs` | first-run provisioning: `uv`, CPython, wheels, weights, resumable state |
+| `first_run.rs` | provisioning from inside the window |
+| `ui.rs` | the egui window: one toggle, one transport, progress, the truth about enhancement |
+| `spectrum.rs` | two spectra of the same moment, so the switch shows what it does |
+| `splice.rs` | swap the model's low band for the input's |
+| `loudness.rs` | BS.1770 loudness, so the two sides of the switch are the same level |
+| `limit.rs` | keep a rendered track inside full scale |
+| `flac.rs` | writing 24-bit FLAC |
+| `wav.rs` | writing 32-bit float WAV |
+| `bin/sink_probe.rs` | S2: play a tone into a loopback device and read it back, to measure drift |
+
+### `crates/core` (pure, no I/O)
+
+| module | job |
+|---|---|
+| `lib.rs` | the constants (`GRANULE`, `SAMPLE_RATE`) and the public surface |
+| `block.rs` | the `Block`: planar f32 frames handed between stages |
+| `pipeline.rs` | windowing, overlap-add and the `Tail` |
+| `policy.rs` | `Preset`, `Probe` and what to do with the measured speed of the machine |
+| `preprocess.rs` | band-limiting and zero-phase filtering before the model sees a sample |
+| `upscaler.rs` | the `Upscaler` trait and its mocks (`Identity`, `Gain`, `Delay`, `Noise`, `Fail`) |
+| `error.rs` | the crate's typed errors |
+| `dsp/cheby.rs` | Chebyshev I lowpass design, ported from `scipy.signal.cheby1` |
+| `dsp/cutoff.rs` | band-limit detection, a port of `UtilAudioSR.find_cutoff_freq` |
+| `dsp/filtfilt.rs` | zero-phase filtering, ported from `scipy.signal.sosfiltfilt` |
+| `dsp/resample.rs` | polyphase resampling, ported from `scipy.signal.resample_poly` |
+
+### `crates/infer` (the model boundary)
+
+| module | job |
+|---|---|
+| `lib.rs` | the seam between the pipeline and a model |
+| `model.rs` | the `Model` boundary: one window in, one window out, `[channels, frames]` |
+| `noise.rs` | reproducible noise for the sampler's starting point (ADR-006) |
+| `engine.rs` | the `Upscaler` the pipeline drives: preprocess, add noise, call the model |
+| `python.rs` | the sidecar: spawn `tools/worker.py` and serve one window per request |
+| `session.rs` | one model worker, kept for the life of the app |
+| `bin/fake_worker.rs` | a stand-in for `tools/worker.py`, so the client's tests need no Python |
 
 ## The preprocessing port
 
@@ -322,9 +397,10 @@ This is the most likely place for the Rust output to diverge from the PoC.
    padding behaviour matter for the first and last ~100 ms of each window.
 3. **Band-limit round trip.** `resample_poly` down to `cutoff` and back up to 48 kHz.
    This is what actually removes the high band before the model sees it, and it is
-   the stage most people miss when reimplementing. `rubato` is not
-   `resample_poly`; the filters differ. Either build the polyphase FIR to match
-   scipy, or accept a documented deviation and validate it with the eval harness.
+   the stage most people miss when reimplementing. The port designs the polyphase FIR
+   to match scipy rather than taking a library resampler: same Kaiser window, ten lobes
+   per side, and the same output offset, pinned by the scipy golden tests in
+   `crates/core/tests/fixtures.rs`.
 
 Do **not** leave this inside the ONNX graph. `lowpass_input=True` in Python runs a
 scipy filter with a cutoff computed per window; exporting it bakes one cutoff into
@@ -448,12 +524,13 @@ design constraint, not a convenience.
 | buffer | simulated producer rates 0.3–2.0 → assert no underrun below 0.95, passthrough above 1.0 |
 | cutoff | golden corpus, Python vs Rust, bin-exact |
 | preprocess | golden corpus, Python vs Rust, ≤ −60 dB |
-| ONNX | PyTorch vs `ort`, five tracks, ≤ −40 dB, fixed seed |
-| audio device | `cpal` null/loopback device in CI, real device manually |
-| UI | `egui_kittest` for the state machine, manual for looks |
+| model | the fake worker (`crates/infer/src/bin/fake_worker.rs`) for the protocol, a real worker manually for numbers |
+| audio device | a simulated device in CI, a real device by hand (`bin/sink_probe.rs` measures drift) |
+| UI | state-machine tests over the plain data the window reads, manual for looks |
 
-Fuzz the windower with `proptest` over lengths 0…3 windows and every overlap value;
-the off-by-one at the final partial window is where this class of code always breaks.
+Fuzz the windower over lengths 0…3 windows and every overlap value; the off-by-one at
+the final partial window is where this class of code always breaks. `proptest` is not a
+dependency yet, so the case table is hand-written.
 
 ## Invariants
 

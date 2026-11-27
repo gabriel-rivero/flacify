@@ -35,43 +35,63 @@ not offer the flag yet; use `flacify setup --cuda` on the CUDA machine.
 
 ## Rust crates
 
-| crate | why | risk |
-|---|---|---|
-| `symphonia` | demux + decode MP3, AAC, FLAC, ALAC, Vorbis, Opus, WAV, MP4, OGG | MPL-2.0: file-level copyleft, fine to link, don't fork silently |
-| `cpal` | one audio output API over CoreAudio / WASAPI / ALSA | device matrix is the real cost, not the crate |
-| `rubato` | high-quality resampling 44.1 → 48 kHz | different filter than scipy's `resample_poly`, see the preprocessing port |
-| `flacenc` | pure-Rust FLAC encoder for the cache and `enhance --out x.flac` | young; 24-bit round-trip verified 2026-11-17, streaming append still to check |
-| `claxon` | fast FLAC decode for cache replay | redundant with symphonia; add only if 30 s seek latency is too slow |
-| `ort` | ONNX Runtime bindings; the only place GPU code is called | dylib distribution, EP quirks, `coreml` coverage |
-| `ndarray` | tensor shapes across the `ort` boundary | keep it out of `core` |
-| `realfft` | FFT for the cutoff detector, spectrogram, loudness | — |
-| `biquad` *(not used)* | was the plan for the cheby1 port | the port is ~120 lines of SOS filtering with the scipy matrix pinned in a test; a crate would hide the bug surface |
-| `egui` + `eframe` | UI, custom-painted, single binary | skinning is manual; no Winamp `.wsz` for free |
-| `egui_kittest` | UI state-machine tests | young |
-| `rtrb` | SPSC ring for audio, wait-free, no allocation | pick one ring crate and stay with it |
-| `crossbeam-channel` | control plane | never touch it from the audio callback |
-| `blake3` | cache keys and model checksums | — |
-| `ureq` | blocking HTTP for model download (resume, ranges) | no async runtime needed |
-| `serde`, `toml`, `serde_json` | `profile.toml`, cache manifest, settings | — |
-| `directories` | platform config/cache paths | — |
-| `clap` | CLI (`play`, `enhance`, `probe`, `diagnose`) | — |
-| `tracing` + `tracing-subscriber` + `tracing-appender` | structured logs to a rolling file | — |
-| `thiserror`, `anyhow` | typed errors internally, context at the edges | — |
-| `souvlaki` | OS media keys / Now Playing (optional) | nice-to-have, adds platform surface |
+Sixteen direct dependencies, and `cargo deny check bans licenses sources advisories`
+in CI is what keeps the list honest. The tables below are the ones in `Cargo.lock`
+today; a crate that is not there is not used, whatever an earlier plan said.
 
-Dev: `proptest`, `insta`, `criterion`, `cargo-nextest`, `cargo-deny` (licences and
-advisories), `cargo-machete` (unused deps).
+### In the tree
+
+| crate | where | why | risk |
+|---|---|---|---|
+| `symphonia` | app | demux + decode MP3, AAC, FLAC, ALAC, Vorbis, Opus, WAV, MP4, OGG | MPL-2.0: file-level copyleft, fine to link, don't fork silently |
+| `cpal` | app | one audio output and input API over CoreAudio / WASAPI / ALSA | device matrix is the real cost, not the crate |
+| `flacenc` | app | pure-Rust FLAC encoder for the cache and `enhance --out x.flac` | young; 24-bit round-trip verified 2026-11-17, streaming append still to check |
+| `hound` | app | WAV reading in `sink_probe` and writing in `enhance`/`wav.rs` | — |
+| `lofty` | app | reads the title/artist tag the window shows | — |
+| `egui` + `eframe` | app | UI, custom-painted, single binary | skinning is manual; no Winamp `.wsz` for free |
+| `arc-swap` | app | hands the render frontier, resident segment and status to the window without a lock | — |
+| `blake3` | app | cache keys and model checksums | — |
+| `realfft` | core, app | FFT for the cutoff detector, spectrogram, loudness | — |
+| `clap` | app | CLI (`play`, `enhance`, `probe`, `sink`, …) | — |
+| `serde`, `serde_json` | app, core (dev) | cache manifest, settings, fixture goldens | — |
+| `tracing` + `tracing-subscriber` | app | structured logs to a rolling file | no `tracing-appender`: the rolling file is hand-rolled |
+| `thiserror`, `anyhow` | core + infer, app | typed errors internally, context at the edges | — |
+
+The resampler is not a crate: `crates/core/src/dsp/resample.rs` is a port of
+`scipy.signal.resample_poly`, pinned by the scipy golden tests. The rings and the
+control plane are the standard library (`AtomicU32` samples in a bounded ring,
+`std::sync::mpsc`, `arc-swap`), so there is no `rtrb` and no `crossbeam-channel`.
+
+### Considered, not used
+
+| crate | why it is not here |
+|---|---|
+| `rubato` | the band-limit round trip has to match `scipy.signal.resample_poly` bin for bin, and a general resampler does not. The port is ~285 lines of implementation in `dsp/resample.rs` (452 with its tests) and already pinned against scipy goldens |
+| `biquad` | the Chebyshev port is SOS filtering with the scipy matrix pinned in a test; a crate would hide the bug surface |
+| `ort`, `ndarray` | ADR-002's ONNX Runtime measured 15–31 RTF against PyTorch's 0.51 on the same weights, so the backend is the Python sidecar (ADR-010) and no Rust tensor crate is in the tree |
+| `reqwest`, `ureq`, `sha2` | nothing downloads from Rust: `setup` runs `uv`, `pip` and `curl` as child processes, and the weights come through them |
+| `claxon` | redundant with symphonia; add only if 30 s seek latency becomes a problem |
+| `egui_kittest` | UI state-machine tests target the plain data the window reads; the crate was not needed |
+| `toml`, `directories` | settings are JSON with hand-written platform paths (`platform_data_dir` in `setup.rs`) |
+| `souvlaki` | OS media keys / Now Playing: nice-to-have, adds platform surface |
+
+Dev-only crates that a reader might expect are also absent: dev dependencies are
+`serde` and `serde_json` in `core` and nothing else. There is no `proptest`, `insta`
+or `criterion`; the DSP goldens are JSON fixtures generated by `tools/fixtures/gen.py`
+and the timing numbers come from the `tools/bench_*.py` scripts in
+[`measurements.md`](measurements.md). `cargo-nextest` and `cargo-machete` are
+developer conveniences, not build requirements.
 
 ## Deliberately absent
 
 | not using | because |
 |---|---|
 | `rodio` | it owns the player and the device; we need our own queue and clock |
-| `tokio` | nothing here needs async; the download is one blocking HTTP call |
+| `tokio` | nothing here needs an async runtime; every long job is a child process. It reaches `Cargo.lock` only as `wasm-bindgen-futures`' dependency under `cpal`/`eframe`/`winit`, which builds for wasm only, not for the shipped targets |
 | `tauri` | a webview and a JS toolchain for one window, and it breaks "the binary is the app" |
-| `candle` / `burn` (for now) | reimplementing the graph and the vocoder is more work than exporting it; revisit if `ort`'s macOS story disappoints |
+| `candle` / `burn` (for now) | reimplementing the graph and the vocoder is more work than exporting it; revisit if the runtime endgame in [`decisions.md`](decisions.md) moves |
 | any `libmpg123` / `ffmpeg` sys dependency | the first-run story stays trivial if decode is pure Rust |
-| Python at runtime | see the rule above |
+| a Rust inference runtime | the graph is run by `tools/worker.py` under the app's Python sidecar (ADR-010), so no ONNX, CUDA or Metal binding is linked |
 
 ## Model runtime
 

@@ -1,7 +1,12 @@
 # Decisions
 
-Status: current, 2026-11-18. One page per decision: context, decision, consequences.
+Status: current, 2026-11-27. One page per decision: context, decision, consequences.
 Reopen a decision by adding a superseding ADR, not by editing the old one.
+
+ADR-009 does not exist. The number was never used; `git log -S ADR-009` finds no commit
+that introduced or removed one. The numbers after it were not shifted down because
+sixteen cross-references across the code, the README and these pages name them. The gap
+is deliberate and `tools/check_docs.py` accepts it as long as this paragraph is here.
 
 ---
 

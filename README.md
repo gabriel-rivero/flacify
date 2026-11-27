@@ -126,16 +126,23 @@ See [`docs/vision.md`](docs/vision.md).
 |---|---|
 | [`docs/vision.md`](docs/vision.md) | who this is for, what we claim, what we refuse to claim |
 | [`docs/roadmap.md`](docs/roadmap.md) | releases v0.0 → v1.0, exit criteria, the MVP cut |
-| [`docs/architecture.md`](docs/architecture.md) | components, threads, buffer math, A/B alignment, cache |
-| [`docs/dependencies.md`](docs/dependencies.md) | crates, model runtime, artifacts, licences |
+| [`docs/architecture.md`](docs/architecture.md) | crates, modules, stages, threads, buffer math, A/B alignment, cache |
+| [`docs/dependencies.md`](docs/dependencies.md) | crates in the tree and considered, model runtime, artifacts, licences |
 | [`docs/risks.md`](docs/risks.md) | risk register, kill criteria |
 | [`docs/backlog.md`](docs/backlog.md) | epics and issue drafts, in build order |
-| [`docs/decisions.md`](docs/decisions.md) | ADR-001 … ADR-010 with status and outcomes |
+| [`docs/decisions.md`](docs/decisions.md) | ADR-001 … ADR-014 with status and outcomes |
+| [`docs/measurements.md`](docs/measurements.md) | every number, with the machine and the date behind it |
+| [`docs/release-1.0.md`](docs/release-1.0.md) | the release checklist, and the evidence that closes each line |
+
+`tools/check_docs.py` is the gate over all of the above: it holds the documented ADR
+range, crate list, dependency list and status lines to the repository, and CI fails on
+any page that drifts.
 
 ## Start here
 
 ```sh
-cargo test --workspace   # 290 tests, no GPU, no audio device, no model, no Python
+cargo test --workspace --all-targets   # 481 tests, no GPU, no audio device, no model, no Python
+python3 tools/check_docs.py --tests    # the docs still describe this tree
 ```
 
 `core` and `infer` are testable without a model, which is what makes the DSP and the

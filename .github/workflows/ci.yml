@@ -60,6 +60,12 @@ jobs:
           test -f tools/fixtures/out/manifest.json
           cargo test --workspace --all-targets
 
+      # README quotes the test total, so a stale number is drift like any other. It
+      # runs here rather than in the docs job because `--list` links the workspace,
+      # and this is the job that already installed the headers for it.
+      - name: Check the counted test total
+        run: python3 tools/check_docs.py --tests
+
   macos:
     name: build and test (macos)
     runs-on: macos-latest
@@ -108,6 +114,24 @@ jobs:
       # the tools are importable and their arguments parse, so `--help` cannot rot.
       - name: Byte-compile the tools
         run: python3 -m py_compile tools/*.py tools/fixtures/gen.py
+
+  docs:
+    name: docs match the repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The checks are structural and need no build: links, anchors, the ADR range,
+      # the crate table, the dependency table, every module named, and a dated Status
+      # line. A doc is the only description of the code a reader gets first, and
+      # nothing else in this pipeline notices when it stops being true. The test-count
+      # half of this gate lives in the rust job, which already links the workspace.
+      - name: Check the docs against the tree
+        run: python3 tools/check_docs.py
 
   windows:
     name: build and test (windows)

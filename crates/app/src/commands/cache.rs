@@ -17,6 +17,14 @@ pub(crate) fn run(evict: bool, cap_gb: Option<f64>) -> Result<()> {
     let cap = cap_bytes(cap_gb)?;
 
     print_usage(&cache.usage(), cap);
+    // Fetched audio lives outside the cache, so the cache total would quietly omit it.
+    // Reported here rather than evicted: a re-download is the user's call, and deleting a
+    // 10-minute video to reclaim space should not be a side effect of a cache command.
+    println!(
+        "  {:<10} {:>11} of fetched audio",
+        "downloads",
+        human_bytes(crate::setup::dir_size(&paths.downloads_dir()))
+    );
     if !evict {
         return Ok(());
     }

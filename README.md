@@ -50,6 +50,8 @@ cargo build --release
 ./target/release/flacify probe song.mp3        # cutoff, verdict, wait
 ./target/release/flacify enhance song.mp3      # -> song.mp3.flacify.wav
 ./target/release/flacify play song.mp3         # window: space toggles, p plays, drag to seek, drop a file
+./target/release/flacify play youtu.be/ID      # the same, for a URL: yt-dlp fetches the audio first
+./target/release/flacify enhance youtu.be/ID   # render a URL's audio; --out names the file
 ./target/release/flacify play song.mp3 --live  # bounded memory: one window at a time, latency stated
 ./target/release/flacify play song.mp3 --live --window 4
 ./target/release/flacify play song.mp3 --smoke # headless audio-path check
@@ -141,7 +143,7 @@ any page that drifts.
 ## Start here
 
 ```sh
-cargo test --workspace --all-targets   # 481 tests, no GPU, no audio device, no model, no Python
+cargo test --workspace --all-targets   # 504 tests, no GPU, no audio device, no model, no Python
 python3 tools/check_docs.py --tests    # the docs still describe this tree
 ```
 

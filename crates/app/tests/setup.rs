@@ -16,6 +16,9 @@ use anyhow::Result;
 
 #[path = "../src/setup.rs"]
 mod setup;
+// `setup` re-exports its cancel token from here, so the mount needs this module too.
+#[path = "../src/process.rs"]
+mod process;
 
 use setup::{
     ensure, ensure_cancellable, ensure_with, plan, Cancel, Paths, Progress, Runner, SystemRunner,

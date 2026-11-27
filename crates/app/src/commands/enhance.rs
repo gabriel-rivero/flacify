@@ -10,12 +10,16 @@ use flacify_core::SAMPLE_RATE;
 use crate::render;
 use crate::session::Session;
 use crate::setup;
+use crate::youtube;
 
 pub(crate) fn run(file: &Path, out: Option<PathBuf>, splice: bool) -> Result<()> {
     let paths = setup::Paths::discover()?;
     if !paths.is_ready() {
         anyhow::bail!("the model is not installed yet. Run `flacify setup` once (about 6 GB).");
     }
+    // A URL is fetched first; a path comes back as it was.
+    let track = youtube::resolve(file, &paths.downloads_dir(), None)?;
+    let file = track.path.as_path();
     let session = Session::new(&paths, splice)?;
     let out = out.unwrap_or_else(|| {
         let mut name = file.file_name().unwrap_or_default().to_os_string();

@@ -12,6 +12,7 @@ use crate::live;
 use crate::session::{needs_setup, Playback, Session};
 use crate::setup;
 use crate::ui;
+use crate::youtube;
 
 /// What `play` was asked for, one field per flag group.
 pub(crate) struct Request<'a> {
@@ -59,14 +60,18 @@ fn check_flags(request: &Request<'_>) -> Result<()> {
 pub(crate) fn run(request: Request<'_>) -> Result<()> {
     check_flags(&request)?;
     let paths = setup::Paths::discover()?;
+    // A URL is fetched before anything else looks at the path, so every consumer below
+    // (the window, the first-run screen, the smoke report) gets a real file.
+    let track = youtube::resolve(request.file, &paths.downloads_dir(), None)?;
+    let file = track.path.as_path();
     let session = Session::new(&paths, request.splice)?;
     let started = Instant::now();
 
     // A full-band file and a cache hit never need the model, so they play on a machine
     // without the 6 GB install. Only a file that has to render asks for setup.
     let opened = match request.live {
-        Some(live) => session.open_live(request.file, live.preset, &Probe::from_rtf(live.rtf)),
-        None => session.open(request.file),
+        Some(live) => session.open_live(file, live.preset, &Probe::from_rtf(live.rtf)),
+        None => session.open(file),
     };
     let mut playback = match opened {
         Ok(playback) => playback,
@@ -76,7 +81,7 @@ pub(crate) fn run(request: Request<'_>) -> Result<()> {
             }
             return ui::run(first_run::FirstRun::new(
                 paths,
-                request.file.to_path_buf(),
+                file.to_path_buf(),
                 request.splice,
             ))
             .map_err(|error| anyhow::anyhow!("{error}"));

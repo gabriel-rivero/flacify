@@ -9,9 +9,8 @@
 
 use std::env;
 use std::fs;
-use std::io::{Read, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -249,6 +248,14 @@ impl Paths {
         self.root.join("models")
     }
 
+    /// Where a fetched URL lands, one directory per id. Outside `cache/` on purpose: the
+    /// cache scan sweeps a directory it cannot read as an entry, and a download is not one.
+    // The state-machine test mounts this module without the commands, so it cannot use it.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn downloads_dir(&self) -> PathBuf {
+        self.root.join("downloads")
+    }
+
     /// The sidecar entry point.
     pub fn worker_script(&self) -> PathBuf {
         self.runtime_dir().join("worker.py")
@@ -450,35 +457,15 @@ pub(crate) fn dir_size(path: &Path) -> u64 {
     total
 }
 
-/// A token a long step can be stopped with. Cloning one shares the same flag.
-#[derive(Clone, Default)]
-pub struct Cancel(Arc<AtomicBool>);
+/// The cancel token and the "stopped on purpose" error live in [`crate::process`], which
+/// the provisioning steps share with the downloader. Re-exported because every caller of
+/// this module already names them here.
+pub use crate::process::{is_cancelled, Cancel, Cancelled};
 
-impl Cancel {
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
-    }
-}
-
-/// The setup was cancelled. Not a failure: the unfinished step re-runs next time.
-#[derive(Debug)]
-pub struct Cancelled;
-
-impl std::fmt::Display for Cancelled {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("setup cancelled")
-    }
-}
-
-impl std::error::Error for Cancelled {}
-
-/// Whether an error means the user cancelled rather than the install failing.
-pub fn is_cancelled(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<Cancelled>().is_some()
+/// The shared cancellation error, worded for the install: "setup cancelled" is what the
+/// user asked for and what the window shows, not a bare "cancelled".
+fn cancelled() -> anyhow::Error {
+    anyhow::Error::new(Cancelled).context("setup cancelled")
 }
 
 /// The IO a step needs. Public only so tests can substitute a fake.
@@ -514,55 +501,7 @@ impl SystemRunner {
 
 impl Runner for SystemRunner {
     fn run(&self, program: &Path, args: &[&str]) -> Result<()> {
-        let command = command_line(program, args);
-        if self.cancel.is_cancelled() {
-            return Err(anyhow::Error::new(Cancelled));
-        }
-        // Poll instead of `output()` so a cancel can kill the child. Both pipes are
-        // drained on threads: a pip that prints past the pipe buffer would otherwise
-        // deadlock the wait.
-        let mut child = std::process::Command::new(program)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("running {command}"))?;
-        let stdout = child.stdout.take().map(drain);
-        let stderr = child.stderr.take().map(drain);
-        let status = loop {
-            if self.cancel.is_cancelled() {
-                let _ = child.kill();
-                let _ = child.wait();
-                if let Some(reader) = stdout {
-                    let _ = reader.join();
-                }
-                if let Some(reader) = stderr {
-                    let _ = reader.join();
-                }
-                return Err(anyhow::Error::new(Cancelled));
-            }
-            match child
-                .try_wait()
-                .with_context(|| format!("waiting for {command}"))?
-            {
-                Some(status) => break status,
-                None => std::thread::sleep(Duration::from_millis(100)),
-            }
-        };
-        let stderr = stderr
-            .and_then(|reader| reader.join().ok())
-            .unwrap_or_default();
-        if let Some(reader) = stdout {
-            let _ = reader.join();
-        }
-        if status.success() {
-            return Ok(());
-        }
-        let detail = last_lines(&String::from_utf8_lossy(&stderr), 20);
-        if detail.trim().is_empty() {
-            bail!("{command} failed ({status})");
-        }
-        bail!("{command} failed: {detail}")
+        crate::process::run_streaming(program, args, Some(&self.cancel), &mut |_| {}).map(|_| ())
     }
 
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -598,16 +537,6 @@ impl Runner for SystemRunner {
     }
 }
 
-/// Read a child's pipe to the end on its own thread, so the child never blocks on a full
-/// pipe while the parent is polling for cancellation.
-fn drain(mut stream: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stream.read_to_end(&mut buffer);
-        buffer
-    })
-}
-
 /// Runs every step that is not already done, saving progress after each one.
 pub fn ensure(paths: &Paths, progress: Progress) -> Result<()> {
     ensure_with(paths, &SystemRunner::default(), progress)
@@ -623,14 +552,14 @@ pub fn ensure_cancellable(paths: &Paths, progress: Progress, cancel: &Cancel) ->
 pub fn ensure_with(paths: &Paths, runner: &dyn Runner, progress: Progress) -> Result<()> {
     let cancel = runner.cancel();
     if cancel.is_some_and(Cancel::is_cancelled) {
-        return Err(anyhow::Error::new(Cancelled));
+        return Err(cancelled());
     }
     let mut state = State::load(paths);
     let mut uv = uv_program(paths, runner);
 
     for step in plan() {
         if cancel.is_some_and(Cancel::is_cancelled) {
-            return Err(anyhow::Error::new(Cancelled));
+            return Err(cancelled());
         }
         if state.is_done(step.id) && step_outputs_exist(step.id, paths, runner, uv.as_deref(), true)
         {
@@ -882,34 +811,7 @@ fn require_uv(uv: &Option<PathBuf>) -> Result<&Path> {
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    let file_name = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_string()
-    };
-    env::split_paths(&path)
-        .map(|dir| dir.join(&file_name))
-        .find(|candidate| is_executable(candidate))
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    // Written this way so both platform branches are one expression: the `if`/`return`
-    // shape left a `bool` literal behind on Windows and clippy 1.100 called it.
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    let executable = {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    };
-    #[cfg(not(unix))]
-    let executable = true;
-    executable
+    crate::process::find_on_path(name)
 }
 
 /// The release archive for this platform.
@@ -1061,17 +963,6 @@ fn strings_after(text: &str, key: &str) -> Option<Vec<String>> {
         inner = &after[end + 1..];
     }
     Some(found)
-}
-
-fn command_line(program: &Path, args: &[&str]) -> String {
-    format!("{} {}", program.display(), args.join(" "))
-}
-
-fn last_lines(text: &str, count: usize) -> String {
-    let mut lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(count);
-    lines.drain(..start);
-    lines.join("\n")
 }
 
 fn temp_path(path: &Path) -> PathBuf {

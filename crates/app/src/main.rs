@@ -20,6 +20,7 @@ mod limit;
 mod live;
 mod loudness;
 mod player;
+mod process;
 mod render;
 mod render_status;
 mod segments;
@@ -31,6 +32,7 @@ mod spectrum;
 mod splice;
 mod ui;
 mod wav;
+mod youtube;
 
 use anyhow::Result;
 use clap::Parser;

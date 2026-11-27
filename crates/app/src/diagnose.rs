@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use crate::cache::{human_bytes, Cache, Usage, CACHE_VERSION, DEFAULT_CAP_BYTES};
 use crate::device;
 use crate::setup::{self, Paths};
+use crate::youtube;
 
 /// Write the report and return its path.
 pub fn run(out: Option<PathBuf>) -> Result<PathBuf> {
@@ -59,6 +60,19 @@ pub fn report_devices(paths: &Paths, devices: Result<device::DeviceList>) -> Str
     let usage = Cache::new(paths.cache_dir()).usage();
     write_usage(&mut text, &usage);
     let _ = writeln!(text, "batch    {}", batch_report(&paths.cache_dir()));
+
+    // Only presence is reported, not a version: `--version` would be a process spawn in
+    // the one function the tests call, and a bug report can run it itself. yt-dlp is the
+    // tool whose version moves under us, so naming where it is found matters most.
+    let ytdlp = youtube::find_ytdlp()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "missing (only a URL needs it)".to_string());
+    let _ = writeln!(text, "yt-dlp   {ytdlp}");
+    let _ = writeln!(
+        text,
+        "downloads {} bytes",
+        setup::dir_size(&paths.downloads_dir())
+    );
 
     let _ = writeln!(text, "\nsteps");
     for step in setup::plan() {

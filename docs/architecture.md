@@ -341,6 +341,8 @@ what it is; this table is the map to those lines.
 | `batch.rs` | a folder rendered one file at a time |
 | `diagnose.rs` | one text file with the facts an issue needs |
 | `setup.rs` | first-run provisioning: `uv`, CPython, wheels, weights, resumable state |
+| `process.rs` | running another program: one child, its output read as it arrives, killed on cancel |
+| `youtube.rs` | a URL as a source: `yt-dlp` fetches the audio, then the pipeline gets a file |
 | `first_run.rs` | provisioning from inside the window |
 | `ui.rs` | the egui window: one toggle, one transport, progress, the truth about enhancement |
 | `spectrum.rs` | two spectra of the same moment, so the switch shows what it does |

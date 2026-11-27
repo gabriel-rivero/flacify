@@ -93,6 +93,26 @@ developer conveniences, not build requirements.
 | any `libmpg123` / `ffmpeg` sys dependency | the first-run story stays trivial if decode is pure Rust |
 | a Rust inference runtime | the graph is run by `tools/worker.py` under the app's Python sidecar (ADR-010), so no ONNX, CUDA or Metal binding is linked |
 
+## External programs
+
+The app runs other programs; it links none of their libraries. `flacify setup` installs
+the sidecar with `uv`, `pip`, `curl` and `tar`, and `flacify play|enhance <url>` fetches
+audio with `yt-dlp`. All of them are located on `PATH` (honouring `PATHEXT` on Windows)
+and each is overridable for tests: `FLACIFY_UV`, `FLACIFY_YTDLP`.
+
+| program | needed for | if it is missing |
+|---|---|---|
+| `yt-dlp` | any URL as a source | the command says how to install it and stops; local files are unaffected |
+| `ffmpeg` | the audio conversion `yt-dlp -x` does | yt-dlp reports it; we ask for FLAC because it is what `symphonia` decodes |
+| `uv`, `curl`, `tar` | `flacify setup` | the install fails with the step name |
+
+Choosing `PATH` over a vendored binary is deliberate: `yt-dlp` changes weekly to keep up
+with the sites it reads, so pinning it here would pin the product's usefulness with it.
+`flacify diagnose` prints where `yt-dlp` was found.
+
+The decode side stays pure Rust and links no `libmpg123`/`ffmpeg`; a fetched file is an
+ordinary input the moment it lands.
+
 ## Model runtime
 
 The decision that matters. Same graph, four ways to run it.

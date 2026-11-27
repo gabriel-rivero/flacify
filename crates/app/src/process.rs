@@ -510,7 +510,10 @@ mod tests {
             env::set_var("PATH", previous);
         }
         let _ = fs::remove_dir_all(&dir);
-        assert_eq!(found, Some(program));
+        // `PATHEXT` spells the extension `.EXE`, so the found path can differ from the
+        // written one in case only; a Windows path compares case-insensitively.
+        let found = found.map(|path| path.to_string_lossy().to_lowercase());
+        assert_eq!(found, Some(program.to_string_lossy().to_lowercase()));
         assert!(missing.is_none());
     }
 

@@ -68,6 +68,9 @@ pub fn is_cancelled(error: &anyhow::Error) -> bool {
 #[derive(Debug)]
 pub struct Finished {
     /// Every line it wrote to stdout, in order, without the newlines.
+    // The setup test mounts this module for its runner alone, and its fetch tests that
+    // read this are unix-only.
+    #[cfg_attr(test, allow(dead_code))]
     pub stdout: Vec<String>,
     /// Its stderr, whole, for a caller that wants more than the tail an error carries.
     // The setup test mounts this module for its runner alone, never reads a warning.
@@ -98,39 +101,56 @@ pub fn run_streaming(
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("running {command}"))?;
-    let mut pipe = std::io::BufReader::new(
-        child
-            .stdout
-            .take()
-            .with_context(|| format!("{command} has no stdout"))?,
-    );
+    let pipe = child
+        .stdout
+        .take()
+        .with_context(|| format!("{command} has no stdout"))?;
     let stderr = child.stderr.take().map(drain);
     // The watchdog kills through this handle rather than by running `kill`, which would
     // need `PATH` and is exactly what a test emptying `PATH` takes away.
     let shared = Arc::new(Mutex::new(child));
     let mut watching = cancel.map(|token| Watchdog::new(Arc::clone(&shared), token));
 
-    let mut lines = Vec::new();
-    let mut raw = Vec::new();
-    let mut read_failed = None;
+    // stdout is read on its own thread and the lines arrive over a channel, so the caller
+    // never blocks in a read it cannot abandon. That matters because killing a child does
+    // not always close its pipe: a background subshell can keep stdout, and a
+    // read on the caller's thread would then wait for it (dash forks; macOS's sh execs,
+    // which is what hid this on the development machine).
+    let (sender, lines) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        let mut pipe = std::io::BufReader::new(pipe);
+        let mut raw = Vec::new();
+        loop {
+            raw.clear();
+            // `read_until`, not `read_line`: one byte of non-UTF-8 (a path in a non-UTF-8
+            // encoding is a realistic yt-dlp output) would make `read_line` return
+            // `InvalidData` and abort a run that would otherwise succeed.
+            match pipe.read_until(b'\n', &mut raw) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    let text = String::from_utf8_lossy(&raw)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_string();
+                    if sender.send(text).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut seen = Vec::new();
     loop {
-        raw.clear();
-        // `read_until`, not `read_line`: one byte of non-UTF-8 (a path in a non-UTF-8
-        // encoding is a realistic yt-dlp output) would make `read_line` return
-        // `InvalidData` and abort a run that would otherwise succeed.
-        match pipe.read_until(b'\n', &mut raw) {
-            Ok(0) => break,
-            Ok(_) => {
-                let text = String::from_utf8_lossy(&raw)
-                    .trim_end_matches(['\r', '\n'])
-                    .to_string();
+        if cancel.is_some_and(Cancel::is_cancelled) {
+            break;
+        }
+        match lines.recv_timeout(POLL) {
+            Ok(text) => {
                 on_line(&text);
-                lines.push(text);
+                seen.push(text);
             }
-            Err(error) => {
-                read_failed = Some(error);
-                break;
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     // Signalled on every path, not just the happy one: a reader error must not leave the
@@ -138,22 +158,26 @@ pub fn run_streaming(
     if let Some(watching) = watching.as_mut() {
         watching.stop();
     }
-    let status = match read_failed {
-        // The watchdog kills a child whose pipe we are trying to read; a reset is that.
-        Some(error) => {
-            reap(&shared);
-            let _ = finish(stderr);
-            if cancel.is_some_and(Cancel::is_cancelled) {
-                return Err(anyhow::Error::new(Cancelled));
-            }
-            return Err(error).with_context(|| format!("reading {command}'s output"));
-        }
-        None => wait_for(&shared, cancel)?,
-    };
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        reap(&shared);
+        // Neither pipe is joined here. A grandchild can hold both open after the child it
+        // belongs to is dead, so joining would wait for a process this call is abandoning.
+        // The drain threads exit when those pipes close, and nothing below needs them.
+        drop(stderr);
+        return Err(anyhow::Error::new(Cancelled));
+    }
+    // The child's own stdout closed, so the reader is about to end; join it so the last
+    // lines are in before the exit status is reported.
+    let _ = reader.join();
+    while let Ok(text) = lines.try_recv() {
+        on_line(&text);
+        seen.push(text);
+    }
+    let status = wait_for(&shared, cancel)?;
     let stderr = finish(stderr);
     if status.success() {
         return Ok(Finished {
-            stdout: lines,
+            stdout: seen,
             stderr,
         });
     }
@@ -335,7 +359,9 @@ mod tests {
     use super::*;
 
     /// Absolute, because a sibling test in another file empties `PATH` to prove a step
-    /// re-downloads `uv`; these tests must not depend on finding a shell.
+    /// re-downloads `uv`; these tests must not depend on finding a shell. Windows has no
+    /// `/bin/sh`, so only the tests below it that ask for a shell are unix-only.
+    #[cfg(unix)]
     fn shell() -> PathBuf {
         let path = Path::new("/bin/sh");
         if path.exists() {
@@ -396,14 +422,48 @@ mod tests {
             token.cancel();
         });
         let started = std::time::Instant::now();
-        let error = run_streaming(&shell(), &["-c", "sleep 30"], Some(&cancel), &mut |_| {})
-            .expect_err("a cancelled child does not return success");
-        // `sleep 30` would end on its own, so the error alone proves nothing: the
+        let error = run_streaming(
+            &shell(),
+            &["-c", "while :; do :; done"],
+            Some(&cancel),
+            &mut |_| {},
+        )
+        .expect_err("a cancelled child does not return success");
+        // The loop never ends on its own, so the error alone proves nothing: the
         // watchdog firing is what makes this fast, and that is what is asserted.
         assert!(is_cancelled(&error), "{error:#}");
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "took {:?}, so the child was not killed",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_a_cancelled_child_whose_output_outlives_it_then_the_caller_does_not_wait() {
+        // The child the caller owns dies, but a process it spawned keeps stdout open. A
+        // read on the caller's thread would wait for that grandchild, which is what made
+        // this hang on Linux while passing on macOS (dash forks a builtin into a child;
+        // macOS's sh execs).
+        let cancel = Cancel::default();
+        let token = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            token.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = run_streaming(
+            &shell(),
+            &["-c", "(while :; do :; done) &"],
+            Some(&cancel),
+            &mut |_| {},
+        )
+        .expect_err("a cancelled run does not succeed");
+        assert!(is_cancelled(&error), "{error:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "waited {:?} on a process it had already killed",
             started.elapsed()
         );
     }

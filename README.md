@@ -143,7 +143,7 @@ any page that drifts.
 ## Start here
 
 ```sh
-cargo test --workspace --all-targets   # 509 tests, no GPU, no audio device, no model, no Python
+cargo test --workspace --all-targets   # 511 tests, no GPU, no audio device, no model, no Python
 python3 tools/check_docs.py --tests    # the docs still describe this tree
 ```
 

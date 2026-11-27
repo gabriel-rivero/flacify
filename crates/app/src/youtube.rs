@@ -670,6 +670,7 @@ mod tests {
     /// A stand-in for yt-dlp: prints the fields the real one does, for a real WAV that a
     /// helper process writes on each call, so the client's contract is exercised with no
     /// network and no ffmpeg.
+    #[cfg(unix)]
     fn fake_ytdlp(dir: &Path, mode: &str) -> PathBuf {
         std::fs::create_dir_all(dir).expect("a temp dir");
         let script = dir.join("fake-yt-dlp.sh");
@@ -703,6 +704,7 @@ printf '%s\t%s\t%s\t%s\n' "FLACIFY-FETCH" "{wav}" "Some Title" "Some Artist"
     }
 
     /// A real one-second silent WAV, so a fetch's output is something the decoder accepts.
+    #[cfg(unix)]
     fn write_wav(path: &Path) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("a target directory");

@@ -10,7 +10,7 @@ on:
       version:
         description: Version to build (must equal the workspace version in Cargo.toml)
         required: true
-        default: "1.1.0"
+        default: "1.1.1"
 
 permissions:
   contents: write
@@ -233,13 +233,21 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           body: |
-            flacify ${{ needs.version.outputs.value }}: audio arrives while it is still happening.
+            flacify ${{ needs.version.outputs.value }}: a URL box in the window.
 
-            **Playlists.** `play` now takes a queue: a folder, an `.m3u`/`.m3u8`/`.pls` file, a
-            YouTube playlist, or `--radio <video>` for that song's recommendations. Tracks advance
-            at the end, `N`/`B` move through them, and the next remote track is fetched while the
-            current one plays. A single file is still a queue of one, and `flacify` with no
-            argument opens the window empty so a queue can be dropped onto it.
+            **Paste a link into the window.** The packaged app launches with no argument, and until
+            now the only way into a remote source was the `play <url>` command, which a Start Menu
+            shortcut cannot give you. Both the empty window and the player now carry a URL field: paste
+            a YouTube or yt-dlp link, press Enter or Play URL, and it becomes the queue. Ticking `radio`
+            seeds the `start_radio` mix from that video instead of playing the one song, which is what
+            `play --radio` does; a playlist URL is always a queue, so `radio` is ignored for it, as
+            `--single` is the CLI's opt-out. The listing and the first download run on a worker thread,
+            so a slow yt-dlp never freezes the window, and a failed listing leaves the track that is
+            playing alone. The transport keys stand down while the field has focus, because `b` in
+            `youtu.be` is a letter, not "previous track".
+
+            Everything the queue could already do applies unchanged: tracks advance at the end, `N`/`B`
+            move through them, and the next remote track is fetched while the current one plays.
 
             - **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) or the raw `flacify.exe`.
             - **macOS:** `flacify.dmg` with `Flacify.app`. Nothing is signed yet; right-click, then Open,
@@ -247,29 +255,9 @@ jobs:
             - **Linux:** `flacify_${{ needs.version.outputs.value }}_amd64.deb` for Debian and Ubuntu, or
               `flacify-bin-${{ needs.version.outputs.value }}-1-x86_64.pkg.tar.zst` for Arch (`pacman -U`).
 
-            **Live mode** (`flacify play --live`) renders while it plays, from bounded rings instead of
-            a whole track in memory, at a latency preset of 0.64, 1.28, 2.56 or 5.12 seconds. When the
-            model falls behind, the playhead keeps going on the original and the status line counts
-            the dropouts; it never stalls and never goes silent.
-
-            **`flacify sink`** (macOS) is the system-wide version: `flacify sink --from "BlackHole 2ch"
-            --to "External Headphones"` enhances whatever you route through a loopback device. It needs
-            a loopback device you install yourself; BlackHole is the documented one, and no driver is
-            bundled or redistributed. Windows loopback capture is not supported in this release.
-
-            **`flacify batch <dir>`** renders a folder, skipping entries that are already complete,
-            resuming after a kill, isolating a bad file instead of stopping, and writing a skip list.
-            The cache now has a 20 GB default cap with LRU eviction, shown by `flacify diagnose`.
-
-            **`flacify ab <file>`** runs blind trials with a randomised order you can replay from a
-            seed. It measures the two sides before the first trial and refuses to score a run whose
-            excerpts are more than 0.5 dB apart, because an unmatched comparison measures loudness,
-            not the model. No blind report is attached to this release: the one run made against it
-            failed that gate by 0.03 dB on a single excerpt.
-
-            The default `flacify play` of a track that has never been rendered still holds the whole
-            track in memory while it renders; `--live` is the bounded path in this release, and making
-            it the default is the next one. Cached playback now draws the waveform and the spectrum.
+            A URL still needs `yt-dlp` on `PATH` (and `ffmpeg` for the FLAC conversion); the window says
+            so by name when it is missing rather than failing silently. Nothing else changed in this
+            release: the pipeline, the cache, the live path and the sink are the 1.1.0 ones.
 
             The weights are the FlashSR author's and carry no stated licence. The app downloads them
             at first run, bundles and redistributes nothing, and this project's MIT licence covers its

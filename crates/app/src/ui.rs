@@ -49,6 +49,26 @@ struct PendingFetch {
     handle: JoinHandle<anyhow::Result<playlist::Resolved>>,
 }
 
+/// A pasted URL being listed on its own thread. A playlist or a radio mix is a
+/// `yt-dlp --flat-playlist` call, and the window has a track to keep playing while it runs.
+struct PendingQueue {
+    label: String,
+    handle: JoinHandle<anyhow::Result<playlist::Queue>>,
+}
+
+/// A pasted URL from the empty window being listed and downloaded on its own thread, so
+/// the window that has nothing to play does not freeze while yt-dlp works.
+struct PendingOpen {
+    label: String,
+    handle: JoinHandle<anyhow::Result<(playlist::Queue, playlist::Resolved)>>,
+}
+
+/// Whether the radio toggle applies to a pasted link: it seeds a mix from one video, and a
+/// playlist URL is a queue of its own.
+fn radio_requested(text: &str, radio_seed: bool) -> bool {
+    radio_seed && youtube::parse(text).is_some() && !youtube::is_playlist_url(text)
+}
+
 /// What the current queue entry is doing.
 enum LoadState {
     Ready,
@@ -100,6 +120,12 @@ pub struct PlayerApp {
     /// Set once an end-of-track has advanced the queue, so a pending fetch is not
     /// advanced again on every frame.
     auto_advanced: bool,
+    /// The URL box: a pasted link becomes the queue, or seeds a radio from its video.
+    url: String,
+    /// Whether the box seeds a radio instead of playing the one video.
+    radio_seed: bool,
+    /// A pasted URL being listed, so the window keeps drawing while yt-dlp works.
+    pending_queue: Option<PendingQueue>,
 }
 
 /// No more waveform bars than this; a pixel is narrower than a bar worth drawing.
@@ -112,6 +138,7 @@ enum TransportSection {
     Heading,
     Toggle,
     Queue,
+    Url,
     Spectrum,
     Waveform,
     KeyHint,
@@ -129,10 +156,11 @@ enum TransportSection {
 
 /// The draw order. Add a variant here as well as to `TransportSection`; a list entry with
 /// no arm is a compile error, an arm with no list entry is a section that never draws.
-const TRANSPORT_SECTIONS: [TransportSection; 16] = [
+const TRANSPORT_SECTIONS: [TransportSection; 17] = [
     TransportSection::Heading,
     TransportSection::Toggle,
     TransportSection::Queue,
+    TransportSection::Url,
     TransportSection::Spectrum,
     TransportSection::Waveform,
     TransportSection::KeyHint,
@@ -191,6 +219,9 @@ impl PlayerApp {
             prefetched: None,
             load_state: LoadState::Ready,
             auto_advanced: false,
+            url: String::new(),
+            radio_seed: false,
+            pending_queue: None,
         }
     }
 
@@ -443,11 +474,55 @@ impl PlayerApp {
                 return;
             }
         };
+        self.adopt_queue(queue);
+    }
+
+    /// A pasted URL becomes the queue, or a radio mix seeded from its video. The listing
+    /// runs on a thread because a playlist or a radio expansion is a `yt-dlp` call, and
+    /// the current track keeps playing while it runs.
+    fn submit_url(&mut self) {
+        let text = self.url.trim().to_string();
+        if text.is_empty() || self.pending_queue.is_some() {
+            return;
+        }
+        if youtube::parse(&text).is_none() {
+            self.error = Some(format!("{text} is not a URL"));
+            return;
+        }
+        let downloads = self.downloads_dir();
+        // A playlist URL is already a queue, so radio applies only to a single video.
+        let radio = radio_requested(&text, self.radio_seed);
+        let label = text.clone();
+        let handle =
+            std::thread::spawn(move || playlist::Queue::from_url(&text, &downloads, radio, false));
+        self.pending_queue = Some(PendingQueue { label, handle });
+        self.error = None;
+    }
+
+    /// Collect a finished listing, once. A failure leaves the queue that is playing alone.
+    fn poll_queue(&mut self) {
+        let Some(pending) = self.pending_queue.as_ref() else {
+            return;
+        };
+        if !pending.handle.is_finished() {
+            return;
+        }
+        let pending = self.pending_queue.take().expect("just checked");
+        match pending.handle.join() {
+            Ok(Ok(queue)) => self.adopt_queue(queue),
+            Ok(Err(error)) => self.error = Some(format!("{error:#}")),
+            Err(_) => self.error = Some(format!("listing {} failed", pending.label)),
+        }
+    }
+
+    /// Play a freshly built queue from its first entry.
+    fn adopt_queue(&mut self, queue: playlist::Queue) {
         if let Some(pending) = self.pending.take() {
             pending.cancel.cancel();
         }
         self.prefetched = None;
         self.queue = Some(queue);
+        self.url.clear();
         self.begin_entry();
     }
 
@@ -488,6 +563,7 @@ impl PlayerApp {
                 TransportSection::Heading => self.draw_heading(ui),
                 TransportSection::Toggle => self.draw_toggle(ui, prepared_frames),
                 TransportSection::Queue => self.draw_queue(ui),
+                TransportSection::Url => self.draw_url(ui),
                 TransportSection::Spectrum => self.draw_spectrum(ui),
                 TransportSection::Waveform => self.draw_waveform(ui),
                 TransportSection::KeyHint => self.draw_key_hint(ui),
@@ -626,6 +702,38 @@ impl PlayerApp {
             .weak()
             .size(11.0),
         );
+    }
+
+    /// The URL box: paste a link and it becomes the queue, or seeds a radio from its
+    /// video. This is the only way into a remote source without a command line, which
+    /// matters for the packaged app that launches with no arguments.
+    fn draw_url(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        let listing = self
+            .pending_queue
+            .as_ref()
+            .map(|pending| format!("listing {}…", pending.label));
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.url)
+                    .hint_text("paste a YouTube or yt-dlp URL")
+                    .desired_width((ui.available_width() - 150.0).max(80.0)),
+            );
+            let entered =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let ready = !self.url.trim().is_empty() && self.pending_queue.is_none();
+            if ui
+                .add_enabled(ready, egui::Button::new("Play URL"))
+                .clicked()
+                || (entered && ready)
+            {
+                self.submit_url();
+            }
+            ui.checkbox(&mut self.radio_seed, "radio");
+        });
+        if let Some(listing) = listing {
+            ui.label(egui::RichText::new(listing).weak().size(11.0));
+        }
     }
 
     /// Play/pause, the playhead, and how much of the file the renderer has reached.
@@ -1410,12 +1518,15 @@ impl eframe::App for PlayerApp {
         }
 
         self.poll_fetch();
+        self.poll_queue();
         self.auto_advance();
         self.maybe_start();
 
         let mut next = false;
         let mut previous = false;
-        {
+        // A focused text field owns the keyboard: `b` in `youtu.be` is a letter, not a
+        // track change, and space in a paste must not toggle the A/B switch.
+        if !ctx.wants_keyboard_input() {
             let engine = &self.engine;
             let controls = &engine.controls;
             ctx.input(|input| {
@@ -1439,11 +1550,12 @@ impl eframe::App for PlayerApp {
                 next = input.key_pressed(egui::Key::N);
                 previous = input.key_pressed(egui::Key::B);
             });
-            if controls.is_playing() {
-                ctx.request_repaint_after(Duration::from_millis(33));
-            } else {
-                ctx.request_repaint_after(Duration::from_millis(250));
-            }
+        }
+        let playing = self.engine.controls.is_playing();
+        if playing || self.pending_queue.is_some() || self.pending.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
         if next {
             self.next_track();
@@ -1492,6 +1604,11 @@ struct EmptyApp {
     splice: bool,
     state: EmptyState,
     error: Option<String>,
+    /// The URL box, the same one the player carries, for the window that launched empty.
+    url: String,
+    radio_seed: bool,
+    /// A pasted URL being listed and fetched, so the window keeps drawing.
+    pending: Option<PendingOpen>,
 }
 
 impl EmptyApp {
@@ -1501,6 +1618,9 @@ impl EmptyApp {
             splice,
             state: EmptyState::Waiting,
             error: None,
+            url: String::new(),
+            radio_seed: false,
+            pending: None,
         }
     }
 
@@ -1526,6 +1646,57 @@ impl EmptyApp {
                 return;
             }
         };
+        self.open_queue(queue, resolved);
+    }
+
+    /// A pasted URL is listed and its first track fetched on a thread; the window that has
+    /// nothing playing is the one place a blocking yt-dlp call is least forgivable.
+    fn submit_url(&mut self) {
+        let text = self.url.trim().to_string();
+        if text.is_empty() || self.pending.is_some() {
+            return;
+        }
+        if youtube::parse(&text).is_none() {
+            self.error = Some(format!("{text} is not a URL"));
+            return;
+        }
+        let downloads = self.paths.downloads_dir();
+        let radio = radio_requested(&text, self.radio_seed);
+        let label = text.clone();
+        let handle = std::thread::spawn(move || {
+            let queue = playlist::Queue::from_url(&text, &downloads, radio, false)?;
+            let resolved = match queue.current() {
+                Some(entry) => playlist::resolve(entry, &downloads, None)?,
+                None => anyhow::bail!("the queue is empty"),
+            };
+            Ok((queue, resolved))
+        });
+        self.pending = Some(PendingOpen { label, handle });
+        self.error = None;
+    }
+
+    /// Collect a finished listing, once.
+    fn poll_open(&mut self) {
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        if !pending.handle.is_finished() {
+            return;
+        }
+        let pending = self.pending.take().expect("just checked");
+        match pending.handle.join() {
+            Ok(Ok((queue, resolved))) => {
+                self.url.clear();
+                self.open_queue(queue, resolved);
+            }
+            Ok(Err(error)) => self.error = Some(format!("{error:#}")),
+            Err(_) => self.error = Some(format!("listing {} failed", pending.label)),
+        }
+    }
+
+    /// Open the queue's first track and hand the window to the player, or to setup when the
+    /// model is what the track needs.
+    fn open_queue(&mut self, queue: playlist::Queue, resolved: playlist::Resolved) {
         let session = match Session::new(&self.paths, self.splice) {
             Ok(session) => session,
             Err(error) => {
@@ -1570,6 +1741,8 @@ impl eframe::App for EmptyApp {
             EmptyState::Waiting => {}
         }
 
+        self.poll_open();
+
         let dropped: Vec<PathBuf> = ctx.input(|input| {
             input
                 .raw
@@ -1592,11 +1765,43 @@ impl eframe::App for EmptyApp {
                 egui::RichText::new("drop an audio file, a folder, or an .m3u/.pls playlist")
                     .weak(),
             );
+            ui.add_space(10.0);
+            let listing = self
+                .pending
+                .as_ref()
+                .map(|pending| format!("listing and fetching {}…", pending.label));
+            let busy = self.pending.is_some();
+            ui.horizontal(|ui| {
+                let response = ui.add_enabled(
+                    !busy,
+                    egui::TextEdit::singleline(&mut self.url)
+                        .hint_text("or paste a YouTube or yt-dlp URL")
+                        .desired_width((ui.available_width() - 150.0).max(80.0)),
+                );
+                let entered =
+                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                let ready = !busy && !self.url.trim().is_empty();
+                if ui
+                    .add_enabled(ready, egui::Button::new("Play URL"))
+                    .clicked()
+                    || (entered && ready)
+                {
+                    self.submit_url();
+                }
+                ui.add_enabled(!busy, egui::Checkbox::new(&mut self.radio_seed, "radio"));
+            });
+            if let Some(listing) = listing {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(listing).weak().size(11.0));
+            }
             if let Some(error) = &self.error {
                 ui.add_space(6.0);
                 ui.colored_label(egui::Color32::from_rgb(220, 90, 90), error);
             }
         });
+        if self.pending.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
     }
 }
 
@@ -1925,6 +2130,22 @@ mod tests {
     }
 
     #[test]
+    fn given_a_video_url_with_radio_on_when_asked_then_the_mix_is_requested() {
+        assert!(radio_requested("https://youtu.be/dQw4w9WgXcQ", true));
+        assert!(!radio_requested("https://youtu.be/dQw4w9WgXcQ", false));
+    }
+
+    #[test]
+    fn given_a_playlist_url_when_asked_for_radio_then_it_is_not_a_seed() {
+        // A playlist URL is already a queue; seeding radio from it would replace that.
+        assert!(!radio_requested(
+            "https://www.youtube.com/playlist?list=PL1",
+            true
+        ));
+        assert!(!radio_requested("song.mp3", true));
+    }
+
+    #[test]
     fn given_a_worker_device_when_asked_then_only_cpu_is_the_slow_case() {
         assert!(is_cpu_device("cpu"));
         assert!(!is_cpu_device("cuda"));
@@ -1942,6 +2163,7 @@ mod tests {
                 Heading,
                 Toggle,
                 Queue,
+                Url,
                 Spectrum,
                 Waveform,
                 KeyHint,

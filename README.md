@@ -3,7 +3,7 @@
 A desktop player that reconstructs the high frequencies an MP3 threw away, and lets
 you hear the difference on a single keystroke.
 
-Status: **1.1**, playable on macOS, Linux and Windows. `flacify setup` installs the
+Status: **1.1.1**, playable on macOS, Linux and Windows. `flacify setup` installs the
 Python sidecar and the model, `flacify enhance` renders a file, `flacify play` opens a
 window with an instant A/B switch, and `flacify play --live` renders a file while it plays
 from bounded memory. `flacify sink` does the same for system audio on macOS. The Rust side
@@ -49,7 +49,7 @@ cargo build --release
 ./target/release/flacify setup --cuda          # the CUDA torch wheel on an NVIDIA machine
 ./target/release/flacify probe song.mp3        # cutoff, verdict, wait
 ./target/release/flacify enhance song.mp3      # -> song.mp3.flacify.wav
-./target/release/flacify                       # open the window; drop a file, folder or playlist
+./target/release/flacify                       # open the window; drop a file, folder, playlist or paste a URL
 ./target/release/flacify play song.mp3         # window: space toggles, p plays, drag to seek, drop more
 ./target/release/flacify play ~/Music          # every audio file under a folder, in path order
 ./target/release/flacify play mix.m3u          # an .m3u/.m3u8/pls playlist
@@ -74,7 +74,9 @@ cargo build --release
 `--radio <video>` for that song's recommendations. Tracks advance at the end, `N`/`B` move
 through them, and the next remote track is fetched while the current one plays. A single
 file is a queue of one. `flacify` with no argument opens the same window empty so a queue
-can be dropped onto it.
+can be dropped onto it, and both the empty window and the player carry a URL box: paste a
+link and it becomes the queue, or — with `radio` ticked — seeds a mix from its video, which
+is how the packaged app reaches a YouTube source with no command line.
 
 `flacify sink` captures one device, enhances it, and plays it on another: it is the same
 bounded path as `play --live`, with the capture stream as the feed. macOS has no loopback of
@@ -106,9 +108,9 @@ which builds and attaches:
 
 - **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) and the raw `flacify.exe`.
 - **macOS:** `flacify.dmg` containing `Flacify.app`.
-- **Debian and Ubuntu:** `flacify_1.1.0_amd64.deb` (`sudo apt install ./flacify_1.1.0_amd64.deb`).
-- **Arch and CachyOS:** `flacify-bin-1.1.0-1-x86_64.pkg.tar.zst`
-  (`sudo pacman -U flacify-bin-1.1.0-1-x86_64.pkg.tar.zst`). The binary needs only alsa,
+- **Debian and Ubuntu:** `flacify_1.1.1_amd64.deb` (`sudo apt install ./flacify_1.1.1_amd64.deb`).
+- **Arch and CachyOS:** `flacify-bin-1.1.1-1-x86_64.pkg.tar.zst`
+  (`sudo pacman -U flacify-bin-1.1.1-1-x86_64.pkg.tar.zst`). The binary needs only alsa,
   libc and libgcc to link; GL, X11 and Wayland are opened when the window starts.
 
 Nothing is signed or notarised yet: on macOS, right-click → Open (or
@@ -154,7 +156,7 @@ any page that drifts.
 ## Start here
 
 ```sh
-cargo test --workspace --all-targets   # 527 tests, no GPU, no audio device, no model, no Python
+cargo test --workspace --all-targets   # 529 tests, no GPU, no audio device, no model, no Python
 python3 tools/check_docs.py --tests    # the docs still describe this tree
 ```
 

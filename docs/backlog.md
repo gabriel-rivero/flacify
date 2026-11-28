@@ -152,6 +152,7 @@ A session queue, deliberately not a library.
 | E11-3 | Window queue: strip, auto-advance, next/previous | a track ending advances once; `N`/`B` move through the queue; the strip names `3 / 12`, the next track, and a fetch in progress |
 | E11-4 | No-argument launch | `flacify` opens the window with no track; dropping a file, folder or playlist starts a queue |
 | E11-5 | Remote prefetch | the next remote entry downloads while the current one plays; a failed fetch is a stated state, not a silent stop |
+| E11-6 | URL box in the window | the empty window and the player both take a pasted URL; `radio` seeds a mix from one video and a playlist URL stays a queue; the listing runs off the UI thread so the window never freezes on yt-dlp |
 
 ## State of the scaffold (2026-11-12)
 

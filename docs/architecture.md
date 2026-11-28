@@ -1,6 +1,6 @@
 # Architecture
 
-Status: current for v1.0, checked against the code 2026-11-27. Where the ADRs described
+Status: current for v1.0, checked against the code 2026-11-28. Where the ADRs described
 a plan the code has since replaced (ADR-002's ONNX Runtime, for one), this page records
 what the code does and names the ADR that changed it; the decisions themselves are in
 [`decisions.md`](decisions.md).
@@ -509,6 +509,12 @@ desktop form.
 - **Transport**: play/pause, seek, A/B, gain, next/previous (`N`/`B`). A queue strip shows
   the position (`3 / 12`), the next track, and a remote fetch in progress. A single file is
   a queue of one, which hides the strip.
+- **URL box**: a text field in the window (empty state and player alike) turns a pasted
+  link into a queue, or seeds a radio from its video when `radio` is ticked; a playlist URL
+  is always a queue. The listing and the first fetch run on a thread, so the window that
+  had nothing playing does not freeze on yt-dlp; a failed listing leaves the current track
+  alone. This is the packaged app's only way to a remote source, and the transport keys
+  stand down while the field has focus so `b` in `youtu.be` is a letter.
 - **Status**: RTF, buffer depth, dropout count, backend. Small, monospace, always
   visible. This is the credibility surface.
 - **A/B**: one key (`A`), one button, and optionally "hold to hear original" which is

@@ -148,7 +148,9 @@ def check_adr(files):
 
 def workspace():
     root = tomllib.load(open(os.path.join(ROOT, "Cargo.toml"), "rb"))
-    members = {os.path.relpath(os.path.normpath(os.path.join(ROOT, m)), ROOT): m
+    # A member key is compared with a path written in the docs, which uses `/` on every
+    # platform; `os.path.relpath` gives `crates\\app` on Windows and would never match.
+    members = {os.path.relpath(os.path.normpath(os.path.join(ROOT, m)), ROOT).replace(os.sep, "/"): m
                for m in root["workspace"]["members"]}
     internal = {name for name in root["workspace"]["dependencies"] if name.startswith("flacify-")}
     return root, members, internal
@@ -385,6 +387,9 @@ def self_test():
     assert slug("The sink, end to end (A3), 2026-11-18") == "the-sink-end-to-end-a3-2026-11-18"
     text = "## Crates\n\n| a | b |\n|---|---|\n| `crates/x` | y |\n"
     assert table_rows(text, "## Crates") == [["`crates/x`", "y"]]
+    # A member key is a forward-slash path on every platform, so the workspace table
+    # matches the docs it is compared with on Windows too.
+    assert os.path.join("crates", "app").replace(os.sep, "/") == "crates/app"
     # A table with no `|---|` separator still has a real first row, which must survive.
     headerless = "## Crates\n\n| `crates/x` | y |\n| `crates/z` | w |\n"
     assert table_rows(headerless, "## Crates") == [["`crates/x`", "y"], ["`crates/z`", "w"]]

@@ -12,7 +12,7 @@ use crate::live;
 use crate::playlist;
 use crate::session::{needs_setup, Playback, Session};
 use crate::setup;
-use crate::ui;
+use crate::ui::{self, START_BUDGET_SECS};
 use crate::youtube;
 
 /// What `play` was asked for, one field per flag group.
@@ -165,7 +165,13 @@ pub(crate) fn run(request: Request<'_>) -> Result<()> {
     let result = if playback.live.is_some() {
         report_live(&mut playback, request.watch_secs)
     } else {
-        report(&playback, started, request.watch_secs, request.seek_secs)
+        report(
+            &playback,
+            session.worker(),
+            started,
+            request.watch_secs,
+            request.seek_secs,
+        )
     };
     playback.cancel();
     result
@@ -343,6 +349,7 @@ fn seek_to(playback: &Playback, seconds: f64, rate: u32) -> SeekOutcome {
 
 fn report(
     playback: &Playback,
+    worker: std::sync::Arc<flacify_infer::WorkerSession>,
     started: Instant,
     watch_secs: f64,
     seek_secs: Option<f64>,
@@ -352,13 +359,17 @@ fn report(
     let rate = engine.device_rate as usize;
 
     let prebuffer = 2 * rate;
-    let patience = 30.0;
+    // The window itself waits out a model load (`PlayerApp::maybe_start`); this is the
+    // measurement, so it reports the deadline rather than pretending the frontier arrived.
+    let patience = START_BUDGET_SECS;
+    let mut gave_up = true;
     while started.elapsed().as_secs_f64() < patience {
         let ready = match &playback.frontier {
             Some(frontier) => frontier.ready_frames(),
             None => usize::MAX,
         };
         if ready >= prebuffer {
+            gave_up = false;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -395,8 +406,13 @@ fn report(
 
     let frames = engine.controls.position_frames();
     println!(
-        "first     {:.2} s to first audio (prebuffer included)",
-        first_audio.as_secs_f64()
+        "first     {:.2} s to first audio (prebuffer included){}",
+        first_audio.as_secs_f64(),
+        if gave_up {
+            format!(" — gave up: the frontier never reached {prebuffer} frames in {patience:.0} s")
+        } else {
+            String::new()
+        }
     );
     println!(
         "device    \"{}\" {} Hz x {} ch",
@@ -415,7 +431,13 @@ fn report(
     if let Some(seek) = seek {
         println!("{}", seek_line(&seek, engine.device_rate));
     }
-    println!("model     {}", info.device);
+    // `info.device` is a snapshot taken when the file opened, which on a cold start is
+    // before the worker has loaded. The window re-reads it every frame; this report runs
+    // once, so it asks the session directly instead of printing that stale "rendering".
+    println!(
+        "model     {}",
+        worker.device().unwrap_or_else(|| info.device.clone())
+    );
     println!(
         "generated {:.1} s ready of {:.1} s",
         peak_ready as f64 / f64::from(engine.device_rate),

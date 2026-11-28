@@ -983,6 +983,33 @@ deleting anything by hand:
 | `source.json` says `flacify-source-1` | `flacify-source-2` |
 | `src-000001.flac` 52.9 MB, decodes 1380224 frames | 20.2 MB, decodes 1384320 |
 
+## When the model finishes loading (2026-11-28)
+
+Reported after 1.1.4 fixed the cache: "generating stuck at 0, no GPU usage, and no blue
+waveform, yet playback started", then "it suddenly jumped and now it works". There was no
+race; there was a 30 s wall-clock budget on a load that takes longer than that on a cold
+start. Same Windows box, RTX 4060 Ti, torch 2.15.0+cu132, `cuda` device.
+
+| what | measured |
+|---|---|
+| `import torch` | 2.5–2.9 s |
+| `Worker` construction (weights + patches) | 16.9–23.9 s over four runs |
+| weights load alone, as the worker reports it | 16.1–18.3 s |
+| first window after load (warmup) | 2.5 s |
+| **total to the first generated audio** | **25.9–30.1 s** |
+
+The budget was 30 s and applied to wall-clock time from file open, so it sat exactly on
+the boundary: runs that crossed it started playback on the original, with the toggle still
+reading "Generating… 0 s" because the first window had not been produced, and the status
+line reporting `model rendering` because the device snapshot predated the load. That is
+the report, reproduced.
+
+Fixed in `should_start`: while the model is still loading, playback waits however long it
+takes; the budget applies only once it has loaded. After the change, on the same box and
+the same track, cold: `first 25.96 s to first audio` with no "gave up" marker, `model
+cuda`, and the toggle offered at 26.1 s — inside the budget, on the generated band.
+
+
 
 Not verified: whether any block size above 2304 is safe for other content. The check in
 `write` covers that — a bad encode now fails loudly — but the numbers above are one track.

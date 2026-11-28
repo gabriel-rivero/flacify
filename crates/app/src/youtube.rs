@@ -19,6 +19,13 @@ use crate::process::{self, Cancel};
 /// Overrides where `yt-dlp` is found, the way `FLACIFY_UV` does for `uv`.
 const YTDLP_ENV: &str = "FLACIFY_YTDLP";
 
+/// Set (to anything) to ignore the copy under `FLACIFY_HOME`.
+///
+/// Only the tests set it: a developer machine has the app installed, so a test that means
+/// "nothing is installed" must be able to say so without touching the real home. Nothing
+/// in the app reads it.
+const NO_MANAGED_ENV: &str = "FLACIFY_NO_MANAGED_TOOLS";
+
 /// The container we ask for when ffmpeg is available. FLAC is in `symphonia`'s feature
 /// list, is lossless so nothing is thrown away before the model sees it, and is written by
 /// the `ffmpeg` yt-dlp already needs. The default (`bestaudio`) is WebM/Opus, which this
@@ -305,6 +312,21 @@ pub fn resolve(input: &Path, downloads: &Path, cancel: Option<&Cancel>) -> Resul
 /// there: a machine with a broken older yt-dlp on `PATH` would otherwise keep using it.
 /// `None` means the error is worth raising, not that a download should be skipped.
 pub fn find_ytdlp() -> Option<PathBuf> {
+    let managed = crate::setup::Paths::discover()
+        .ok()
+        .map(|paths| paths.managed_ytdlp());
+    find_ytdlp_with(managed.as_deref())
+}
+
+/// [`find_ytdlp`] with the managed path supplied.
+///
+/// The managed copy lives under `FLACIFY_HOME`, so a lookup inside a test must not fall
+/// back to the real one: a machine with the app installed has a working `yt-dlp` in
+/// `~/AppData/Local/flacify/runtime/bin`, and a test that only emptied `PATH` would find
+/// it, reach the network and download a real video. `FLACIFY_HOME` pointed at a temp
+/// directory is what keeps that from happening, and `FLACIFY_NO_MANAGED_TOOLS` turns the
+/// managed lookup off entirely for a test that must see "nothing installed".
+fn find_ytdlp_with(managed: Option<&Path>) -> Option<PathBuf> {
     if let Some(program) = std::env::var_os(YTDLP_ENV) {
         let path = PathBuf::from(program);
         if path.components().count() > 1 {
@@ -312,10 +334,11 @@ pub fn find_ytdlp() -> Option<PathBuf> {
         }
         return process::find_on_path(&path.to_string_lossy());
     }
-    if let Ok(paths) = crate::setup::Paths::discover() {
-        let managed = paths.managed_ytdlp();
-        if process::is_executable(&managed) {
-            return Some(managed);
+    if std::env::var_os(NO_MANAGED_ENV).is_none() {
+        if let Some(managed) = managed {
+            if process::is_executable(managed) {
+                return Some(managed.to_path_buf());
+            }
         }
     }
     process::find_on_path("yt-dlp")
@@ -767,25 +790,33 @@ mod tests {
     }
 
     #[test]
-    fn given_no_ytdlp_when_looking_for_it_then_nothing_is_found_and_the_error_says_how() {
+    fn given_no_ytdlp_anywhere_when_looking_for_it_then_nothing_is_found() {
         let _guard = env_lock();
         let empty = temp_root("no-ytdlp");
         std::fs::create_dir_all(&empty).expect("a temp dir");
         let path = std::env::var_os("PATH");
         let over = std::env::var_os(YTDLP_ENV);
+        let managed_env = std::env::var_os(NO_MANAGED_ENV);
         std::env::set_var("PATH", &empty);
         std::env::remove_var(YTDLP_ENV);
+        // A developer machine has the app installed, so its real `runtime/bin/yt-dlp` would
+        // be found here and a fetch would reach the network. Say "nothing installed".
+        std::env::set_var(NO_MANAGED_ENV, "1");
 
         let dir = temp_root("no-ytdlp-target");
         let request = parse("https://youtu.be/dQw4w9WgXcQ").expect("a URL");
         let error = fetch(&request, &dir, None).expect_err("no yt-dlp, no fetch");
 
         std::env::remove_var("PATH");
+        std::env::remove_var(NO_MANAGED_ENV);
         if let Some(path) = path {
             std::env::set_var("PATH", path);
         }
         if let Some(over) = over {
             std::env::set_var(YTDLP_ENV, over);
+        }
+        if let Some(managed) = managed_env {
+            std::env::set_var(NO_MANAGED_ENV, managed);
         }
         let _ = std::fs::remove_dir_all(&empty);
         assert!(
@@ -959,18 +990,24 @@ mod tests {
         std::fs::create_dir_all(&empty).expect("a temp dir");
         let path = std::env::var_os("PATH");
         let over = std::env::var_os(YTDLP_ENV);
+        let managed_env = std::env::var_os(NO_MANAGED_ENV);
         std::env::set_var("PATH", &empty);
         std::env::remove_var(YTDLP_ENV);
+        std::env::set_var(NO_MANAGED_ENV, "1");
 
         let error = enumerate("https://www.youtube.com/playlist?list=PL1", None)
             .expect_err("no yt-dlp, no listing");
 
         std::env::remove_var("PATH");
+        std::env::remove_var(NO_MANAGED_ENV);
         if let Some(path) = path {
             std::env::set_var("PATH", path);
         }
         if let Some(over) = over {
             std::env::set_var(YTDLP_ENV, over);
+        }
+        if let Some(managed) = managed_env {
+            std::env::set_var(NO_MANAGED_ENV, managed);
         }
         let _ = std::fs::remove_dir_all(&empty);
         assert!(

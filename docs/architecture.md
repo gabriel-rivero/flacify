@@ -529,6 +529,31 @@ desktop form.
 
 Rendering is on the UI thread at 60 Hz; nothing on the audio thread depends on it.
 
+## When playback starts
+
+The window starts when the generated band exists for the first note, not when the file
+opens. `should_start` in `ui.rs` is the whole rule:
+
+| state | start? |
+|---|---|
+| nothing to generate (full-band file, a cache hit) | at once |
+| the frontier holds the prebuffer (2 s) | at once, already enhanced |
+| the model is **still loading** | no, however long it takes |
+| the model is loaded and the frontier is still behind, past 30 s | yes, on the original |
+
+The distinction the last two rows draw is the lesson from 1.1.4: a cold load measured
+23.9 s on the Windows/CUDA box (16.9 s of weights, 2.5 s of warmup, then the first
+window), so a 30 s wall-clock timer fired *while the weights were still loading* and
+started on the original with the toggle showing "Generating… 0 s" and no GPU work. That
+looked like a stall and was reported as one. Loading is not slowness; only a renderer
+that is loaded and genuinely behind gets the budget.
+
+The status line had the same shape of bug. `info.device` is a snapshot taken when the file
+opens, and it is filled from `WorkerSession::device()`, whose `try_lock` fails for the
+whole of a forward pass — so a poll that missed once kept saying `model rendering` while
+the GPU was busy. The device is now recorded when the worker loads and served without the
+lock, so the panel and the `--smoke` report both name the accelerator.
+
 ## Failure policy
 
 One state machine, four terminal states. Every failure maps to one of them, and none

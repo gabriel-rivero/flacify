@@ -10,7 +10,7 @@ on:
       version:
         description: Version to build (must equal the workspace version in Cargo.toml)
         required: true
-        default: "1.1.4"
+        default: "1.1.5"
 
 permissions:
   contents: write
@@ -233,33 +233,35 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           body: |
-            flacify ${{ needs.version.outputs.value }}: 1.1.3 stops failing on the tracks it was meant to fix.
+            flacify ${{ needs.version.outputs.value }}: playback waits for the model instead of starting without it.
 
-            **1.1.3 fixed the encoder but not the cache.** Changing the FLAC block size stopped new
-            tracks from being written badly, but a source tier the old encoder had already written
-            was still accepted: its manifest said `flacify-source-1`, and 1.1.3 still read version 1.
-            So the same file failed with the same frame-count error and it looked like the fix had
-            not shipped at all.
+            **"Generating stuck at 0, no GPU, no blue waveform, yet playback started."** There was no
+            race: a cold model load measured 25.9–30.1 s on the reference box (16–24 s of weights,
+            2.5 s of warmup, then the first window), and the window's patience budget was a flat 30 s
+            from the moment the file opened. Runs that crossed it started playback on the original
+            while the weights were still loading, which is why the toggle read "Generating… 0 s" and
+            the status said `rendering` — both were describing a load, not a stall.
 
-            Both on-disk formats are now bumped — `flacify-source-2` and `flacify-cache-10` — so
-            anything an older encoder wrote is a miss and is rebuilt on the next play. **No manual
-            deletion:** play the file and the tier rebuilds itself.
+            Loading is not slowness. The window now waits however long a model load takes, and the
+            30 s budget applies only to a renderer that has *loaded* and is still behind — the CPU
+            case it was written for. The toggle says "Loading the model… 24 s" while that is what is
+            happening, instead of "Generating… 0 s".
 
-            Measured on the exact cache directory that kept failing, without touching it by hand:
+            After the change, same box, same track, cold: first audio at 25.96 s with the prebuffer
+            reached, `model cuda`, toggle offered at 26.1 s — on the generated band, as intended.
 
-            | before | after |
-            |---|---|
-            | `source.json` says `flacify-source-1` | `flacify-source-2` |
-            | `src-000001.flac` 52.9 MB, decodes 1380224 frames | 20.2 MB, decodes 1384320 |
-
-            Everything from 1.1.3 is unchanged: `flac::BLOCK` is 2304, and every segment is decoded
-            back and refused if its frame count disagrees.
+            Also fixed: the status line reported `model rendering` for the whole track, because it
+            was a snapshot taken before the worker loaded. The window re-reads it; the `--smoke`
+            report now asks the session directly.
 
             - **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) or the raw `flacify.exe`.
             - **macOS:** `flacify.dmg` with `Flacify.app`. Nothing is signed yet; right-click, then Open,
               or run `xattr -dr com.apple.quarantine /Applications/Flacify.app`.
             - **Linux:** `flacify_${{ needs.version.outputs.value }}_amd64.deb` for Debian and Ubuntu, or
               `flacify-bin-${{ needs.version.outputs.value }}-1-x86_64.pkg.tar.zst` for Arch (`pacman -U`).
+
+            Everything from 1.1.4 is unchanged: the source cache rebuilds itself, and `flac::BLOCK`
+            is 2304 with every segment decoded back before it is accepted.
 
             The weights are the FlashSR author's and carry no stated licence. The app downloads them
             at first run, bundles and redistributes nothing, and this project's MIT licence covers its

@@ -131,6 +131,11 @@ pub struct PlayerApp {
 /// No more waveform bars than this; a pixel is narrower than a bar worth drawing.
 const WAVEFORM_MAX_BARS: usize = 512;
 
+/// How long a loaded renderer may take to reach the prebuffer before the window starts on
+/// the original anyway. It applies only once the model has finished loading: a cold load is
+/// not slowness, and waiting on it is what the product promises.
+pub(crate) const START_BUDGET_SECS: f64 = 30.0;
+
 /// The parts of the window, in the order they draw. The match in `draw_transport` is
 /// exhaustive, so a new variant does not compile until its drawing exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -550,7 +555,8 @@ impl PlayerApp {
 
     fn draw_transport(&mut self, ui: &mut egui::Ui) {
         // The first progressive render cannot know the device until the worker has loaded;
-        // once it does, replace "rendering" with the truth so the gate below can fire.
+        // the panel keeps asking so the status line says `cuda` once it does instead of
+        // reporting "rendering" for the life of the track.
         if self.info.device == "rendering" {
             if let Some(device) = self.session.worker().device() {
                 self.info.device = device;
@@ -603,8 +609,16 @@ impl PlayerApp {
         let generated_here =
             prepared_frames >= controls.position_frames() + self.promote_margin.min(48_000);
         let live = controls.is_enhanced();
+        // "0.0 s ready" while the weights load is indistinguishable from a wedged renderer,
+        // so the loading state says what is actually happening instead.
+        let loading = self.frontier.is_some() && !self.session.worker().is_loaded();
         let label = if !controls.has_enhanced() {
             "Full-band source".to_string()
+        } else if loading {
+            format!(
+                "Loading the model… {:.0} s",
+                self.opened_at.elapsed().as_secs_f64()
+            )
         } else if !generated_here {
             format!(
                 "Generating… {:.0} s ready",
@@ -995,19 +1009,56 @@ impl PlayerApp {
 }
 
 impl PlayerApp {
-    /// Start once there is something worth hearing, or after a patience budget so a
-    /// slow machine still gets the original rather than silence.
+    /// Start once there is something worth hearing.
+    ///
+    /// The normal case is a frontier that reaches the prebuffer and plays already enhanced.
+    /// The patience budget exists for a machine that will never get there, and it is only a
+    /// fallback for being **slow**, not for being **not ready**: a cold model load measured
+    /// 22.8 s on a CUDA box (16.9 s of weights + 2.5 s of warmup), so a 30 s wall-clock
+    /// timer sat right on the boundary and sometimes started on the original only because
+    /// the weights were still loading. Starting without the generated band was never the
+    /// intent, so while the model is still loading the window waits however long it takes;
+    /// the budget applies only once it has loaded and the renderer is genuinely behind.
     fn maybe_start(&mut self) {
         if self.started {
             return;
         }
         let ready = self.ready_frames();
-        let patient = self.opened_at.elapsed().as_secs_f64() > 30.0;
-        if ready >= self.prebuffer_frames || patient || self.frontier.is_none() {
+        // A frontier is only present when this track has to render, and the model loads
+        // lazily on that path, so "no device yet" and "still loading" are the same state.
+        let model_loading = self.frontier.is_some() && !self.session.worker().is_loaded();
+        if should_start(
+            ready,
+            self.prebuffer_frames,
+            self.frontier.is_some(),
+            model_loading,
+            self.opened_at.elapsed().as_secs_f64(),
+        ) {
             self.started = true;
             self.engine.controls.set_playing(true);
         }
     }
+}
+
+/// Whether playback may begin, given what exists and whether the model is still loading.
+///
+/// Split out from [`PlayerApp::maybe_start`] so the rule `AGENTS.md` asks about — the one
+/// that started on the original because the weights were still loading — is testable
+/// without a device, a window or a model.
+fn should_start(
+    ready_frames: usize,
+    prebuffer_frames: usize,
+    has_frontier: bool,
+    model_loading: bool,
+    elapsed_secs: f64,
+) -> bool {
+    // Nothing to generate (a full-band file, a cache hit) starts at once.
+    !has_frontier
+        // The product: the generated band exists for the first note.
+        || ready_frames >= prebuffer_frames
+        // Only a renderer that is loaded and still behind is "slow". Loading is not slow;
+        // it is not ready, and waiting out a 24 s weight load is what was promised.
+        || (elapsed_secs > START_BUDGET_SECS && !model_loading)
 }
 
 impl PlayerApp {
@@ -2143,6 +2194,47 @@ mod tests {
             true
         ));
         assert!(!radio_requested("song.mp3", true));
+    }
+
+    #[test]
+    fn given_a_loading_model_past_the_budget_when_the_start_is_decided_then_it_keeps_waiting() {
+        // The reported bug: "generating stuck at 0, no GPU, no blue waveform, yet playback
+        // started". A cold load measured 23.9 s on this box (16.9 s weights + 2.5 s warmup
+        // + the first window), so a 30 s wall-clock timer fired while the weights were still
+        // loading. Loading is not slowness: the window must wait, however long it takes.
+        assert!(
+            !should_start(0, 96_000, true, true, 31.0),
+            "a model still loading must not start playback on the original"
+        );
+        assert!(
+            !should_start(0, 96_000, true, true, 5_000.0),
+            "there is no timeout on being not ready yet"
+        );
+    }
+
+    #[test]
+    fn given_a_loaded_renderer_behind_the_budget_when_deciding_then_it_starts_on_the_original() {
+        // The case the budget exists for: a CPU box at RTF 7.7 will never fill the
+        // prebuffer, and silence would be worse than the original.
+        assert!(should_start(0, 96_000, true, false, 31.0));
+        assert!(
+            !should_start(0, 96_000, true, false, 10.0),
+            "inside the budget it keeps waiting for the generated band"
+        );
+    }
+
+    #[test]
+    fn given_a_frontier_at_the_prebuffer_when_deciding_then_it_starts_already_enhanced() {
+        // The normal path, and the one the product promises: the first note is generated.
+        assert!(should_start(96_000, 96_000, true, true, 0.0));
+        assert!(should_start(120_000, 96_000, true, true, 0.0));
+    }
+
+    #[test]
+    fn given_no_frontier_when_deciding_then_it_starts_at_once() {
+        // A full-band file or a cache hit has nothing to generate, so there is nothing to
+        // wait for and no model is loading.
+        assert!(should_start(0, 96_000, false, false, 0.0));
     }
 
     #[test]

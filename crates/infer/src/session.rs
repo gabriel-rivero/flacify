@@ -25,6 +25,10 @@ pub struct WorkerSession {
     /// Only the fake worker uses these; the real sidecar takes none.
     extra_args: Vec<String>,
     worker: Mutex<Option<PythonWorker>>,
+    /// The device the first load reported. Set once and never changed, so a poll taken
+    /// during a render — when the worker lock is held for the whole forward pass — still
+    /// answers instead of reporting "not known".
+    device: std::sync::OnceLock<String>,
 }
 
 impl WorkerSession {
@@ -40,6 +44,7 @@ impl WorkerSession {
             config,
             extra_args,
             worker: Mutex::new(None),
+            device: std::sync::OnceLock::new(),
         })
     }
 
@@ -57,11 +62,21 @@ impl WorkerSession {
 
     /// The accelerator the worker chose, once it has started (`cuda`, `mps`, `cpu`).
     ///
-    /// `try_lock` on purpose: the window calls this while a load may be in flight, and a
-    /// 20-second weight load must not freeze the UI thread. `None` then means "not yet".
+    /// `try_lock` is not enough on its own: a window holds the lock for its whole forward
+    /// pass, so a poll during a render would miss and report "not known" for the rest of
+    /// the track. The answer never changes once known, so it is recorded the first time it
+    /// is read and served from there — the same reason the window re-reads instead of
+    /// keeping the value it got at open, when there was nothing to read.
     pub fn device(&self) -> Option<String> {
+        if let Some(known) = self.device.get() {
+            return Some(known.clone());
+        }
         let worker = self.worker.try_lock().ok()?;
-        worker.as_ref().map(|worker| worker.hello().device.clone())
+        let device = worker
+            .as_ref()
+            .map(|worker| worker.hello().device.clone())?;
+        let _ = self.device.set(device.clone());
+        Some(device)
     }
 
     /// Whether the child is loaded right now. The lazy spawn is what makes this worth
@@ -82,6 +97,9 @@ impl WorkerSession {
         // start their own child and then race to replace it.
         let started = PythonWorker::spawn_with_args(&self.config, &self.extra_args)?;
         let hello = started.hello().clone();
+        // Recorded at the moment it is known, not on first poll: a poll during the first
+        // window would find the lock held and report "not known" forever after.
+        let _ = self.device.set(hello.device.clone());
         *worker = Some(started);
         Ok(hello)
     }
@@ -208,6 +226,18 @@ mod tests {
         let session = WorkerSession::new(config());
         assert!(!session.is_loaded());
         assert!(session.device().is_none());
+    }
+
+    #[test]
+    fn given_a_recorded_device_when_the_worker_lock_is_busy_then_it_still_answers() {
+        // A window holds the worker lock for its whole forward pass, so `try_lock` during a
+        // render fails and `device()` would report "not known" for the life of the track —
+        // which is exactly how the status line said `model rendering` while the GPU worked.
+        // Once known, the device is recorded and served without the lock.
+        let session = WorkerSession::new(config());
+        assert!(session.device.set("cuda".to_string()).is_ok());
+        let _held = session.worker.lock().expect("holding the worker lock");
+        assert_eq!(session.device().as_deref(), Some("cuda"));
     }
 
     #[test]

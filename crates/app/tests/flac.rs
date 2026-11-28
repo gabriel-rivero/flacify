@@ -144,10 +144,13 @@ fn given_a_signal_that_fills_whole_blocks_when_round_tripped_then_no_block_is_lo
 
 #[test]
 fn given_the_source_tier_segment_length_when_round_tripped_then_no_block_is_lost() {
-    // The exact length the source tier writes into one segment: 337 full blocks plus a
-    // 3968-frame tail. Pins the writer at the real segment size, not a convenient one.
+    // The exact length the source tier writes into one segment, many blocks plus a tail.
     let frames = 1_384_320;
-    assert_eq!(frames % flac::BLOCK, 3968, "the tail this case is about");
+    assert!(
+        frames / flac::BLOCK > 300,
+        "the point is many blocks, got {}",
+        frames / flac::BLOCK
+    );
     let planar = unrepresentable_signal(frames);
     let file = TempFlac::new("tier-segment");
     write_signal(&file, &planar);
@@ -163,9 +166,28 @@ fn given_the_source_tier_segment_length_when_round_tripped_then_no_block_is_lost
 }
 
 #[test]
+fn given_a_written_segment_when_it_is_decoded_back_then_it_holds_every_frame_it_was_given() {
+    // The guard `flac::write` runs on every segment: decode what was written and require
+    // the same frame count. `flacenc` 0.5.1 drops a frame on some inputs — 4096, 3456 and
+    // 3072 each lost one on a single real track (2026-11-28) — so this is the property
+    // that keeps a bad encode from becoming a track that will not play.
+    let frames = 6_912;
+    let planar = unrepresentable_signal(frames);
+    let path = std::env::temp_dir().join(format!("flacify-guard-{}.flac", std::process::id()));
+    flac::write(&path, 48_000, 2, &planar).expect("writing a FLAC that verifies");
+    let bytes = std::fs::read(&path).expect("reading the written flac");
+    let _ = std::fs::remove_file(&path);
+
+    let decoded = decode::decode_bytes(&bytes).expect("the written stream decodes");
+    assert_eq!(decoded.frames, frames, "the writer accepted a short stream");
+    assert_eq!(decoded.sample_rate, 48_000);
+    assert_eq!(decoded.channels, 2);
+}
+
+#[test]
 fn given_a_signal_that_is_one_block_short_of_whole_when_round_tripped_then_the_count_holds() {
     // The neighbouring case: the short tail must survive too.
-    let frames = 338 * flac::BLOCK - flac::BLOCK;
+    let frames = 300 * flac::BLOCK - flac::BLOCK;
     let planar = unrepresentable_signal(frames);
     let file = TempFlac::new("short-tail");
     write_signal(&file, &planar);

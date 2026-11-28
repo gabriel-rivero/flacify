@@ -425,8 +425,11 @@ problem, and it buys seek, instant replay, and a zero-GPU second listen.
   not list is not part of the entry, and its `state` says whether the table is the whole
   track yet.
 - **Format**: FLAC, 24-bit. This is what FLAC is for: lossless storage of the
-  generated signal. Output f32 rounded to 24-bit is transparent (−144 dB quantisation
-  floor) and roughly half the size of raw float.
+  generated signal. Output f32 rounded to 24-bit is transparent (−144 dBFS quantisation
+  floor) and roughly half the size of raw float. The encoder's block size is 2304, not
+  its default 4096: `flacenc` 0.5.1 drops a frame on some inputs at 4096, 3456 and 3072,
+  and the writer decodes every segment back before accepting it. See
+  [`measurements.md`](measurements.md#an-aac-backed-segment-that-reads-short--fixed-root-cause-was-flacenc-2026-11-28).
 - **Source tier**: `cache/source/<source_hash>/source.json` plus `src-000000.flac` …,
   the decoded 48 kHz stereo source in segments of the same 7-step length. One sequential
   decode+resample pass writes it; `source.json` records the native rate and channels, the

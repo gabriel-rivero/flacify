@@ -70,3 +70,23 @@ python3 tools/check_docs.py --tests
 ```
 
 Paste the result, do not summarise it as "passes". If a check was skipped, say so.
+
+## Green tests are not "it works"
+
+The suite proves the units agree with each other; it does not prove the feature does the
+thing a person bought it for. So a change is also done when **the real path has been run
+on real input** and the output was inspected, not inferred:
+
+- Run the binary, not only the tests. `flacify play` on an actual file, `flacify setup`
+  on a clean home, the command the bug report used.
+- Use the input that prompted the change. A synthetic sine is not a substitute for the
+  file that failed: the track that broke FLAC writing here was ordinary music whose
+  samples sat at both rails, and every synthetic signal round-tripped perfectly.
+- Check the artifact, not the exit code. A segment that decodes to the wrong length, a
+  window that renders once, a download that plays nothing — all of these exit 0.
+- Reproduce the bug before fixing it, and reproduce it again after. "I changed the
+  message" is not a fix, and "it compiles" is not evidence.
+
+A release ships this evidence, so a fix is not ready on the strength of a passing test
+run alone. What was run by hand, on what input, with what result, belongs in the commit
+body and in `measurements.md` when it is a number.

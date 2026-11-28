@@ -297,6 +297,76 @@ pub fn decode(path: &Path) -> Result<Decoded> {
     })
 }
 
+/// Decode a FLAC stream already in memory, reporting the frame count even when it is
+/// zero.
+///
+/// [`decode`] is for a file a caller is about to play, so it treats "no frames" as the
+/// error it is there. This one exists for a writer checking its own output, where the
+/// only question is how many frames the decoder found — zero is an answer, not a
+/// failure, and the caller says what it means.
+pub fn decode_bytes(bytes: &[u8]) -> Result<Decoded> {
+    let source = std::io::Cursor::new(bytes.to_vec());
+    let stream = MediaSourceStream::new(Box::new(source), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("flac");
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            stream,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .context("probing the FLAC bytes")?;
+    let mut reader = probed.format;
+    let track = reader
+        .default_track()
+        .context("the FLAC stream has no track")?;
+    let track_id = track.id;
+    let spec = track.codec_params.clone();
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&spec, &DecoderOptions::default())
+        .context("building the FLAC decoder")?;
+
+    let channels = spec
+        .channels
+        .map(|channels| channels.count())
+        .context("the FLAC stream states no channel count")?;
+    let sample_rate = spec.sample_rate.context("the FLAC stream states no rate")?;
+
+    let mut planes: Vec<Vec<f32>> = vec![Vec::new(); channels];
+    loop {
+        let packet = match reader.next_packet() {
+            Ok(packet) => packet,
+            // `UnexpectedEof` here is how symphonia reports the end of a well-formed
+            // stream, not a truncation; [`AudioStream::pull`] treats it as `None` too. A
+            // truncated frame instead surfaces from `decode` below.
+            Err(SymphoniaError::IoError(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break
+            }
+            Err(error) => return Err(error).context("reading the FLAC bytes"),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = decoder.decode(&packet).context("decoding a FLAC packet")?;
+        let chunk = chunk_from(decoded);
+        for (channel, plane) in planes.iter_mut().enumerate() {
+            let start = channel * chunk.frames;
+            plane.extend_from_slice(&chunk.planar[start..start + chunk.frames]);
+        }
+    }
+
+    let frames = planes.first().map_or(0, Vec::len);
+    Ok(Decoded {
+        sample_rate,
+        channels,
+        frames,
+        planar: planes.concat(),
+    })
+}
+
 /// Map to stereo, then polyphase-resample to 48 kHz.
 ///
 /// The result is `2 * frames` planar samples, left then right. Audio already at 48 kHz is

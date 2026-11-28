@@ -10,7 +10,7 @@ on:
       version:
         description: Version to build (must equal the workspace version in Cargo.toml)
         required: true
-        default: "1.1.2"
+        default: "1.1.3"
 
 permissions:
   contents: write
@@ -233,24 +233,25 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           body: |
-            flacify ${{ needs.version.outputs.value }}: a pasted URL works with nothing else installed.
+            flacify ${{ needs.version.outputs.value }}: a YouTube track that would not play, now plays.
 
-            **The app installs its own `yt-dlp`.** The URL box shipped in 1.1.1, but on a machine
-            that had no `yt-dlp` it stopped with "install it first", and on a machine that had one
-            but no `ffmpeg` it downloaded the audio and then failed the conversion with
-            `ffprobe and ffmpeg not found` — after spending the bytes. `flacify setup` now fetches a
-            standalone `yt-dlp` into the app's own directory, so a pasted link works without
-            anything on your `PATH`.
+            **The FLAC writer was producing unreadable segments on some tracks.** One real 236 s
+            track failed with "src-000001.flac holds 1380224 frames, source.json says 1384320", and
+            the cause was the encoder, not the decoder or the source tier: `flacenc` 0.5.1 drops a
+            whole frame on some inputs, and which block size trips it depends on the data. At the
+            crate's default block 4096 that track lost 4096 frames and wrote 33.6 MB of stream that
+            decodes to nothing; 3456 lost a frame on another segment, 3072 on another. 2304 and
+            below were exact on all nine segments.
 
-            **And a URL no longer needs `ffmpeg` at all.** yt-dlp only needs it to remux or
-            transcode, so when there is no `ffmpeg` the fetch asks for the container YouTube
-            already serves (AAC in MP4) and skips postprocessing entirely. When `ffmpeg` is present
-            it still asks for a lossless FLAC. Nothing is added to your `PATH`, nothing is
-            installed system-wide, and no elevation is asked for.
+            So the block size is now 2304, and **the writer decodes every segment back and refuses
+            to accept one whose frame count disagrees**. The second part is the real fix: a wrong
+            block size is one encoder bug, but no track should ever be built from a segment that
+            cannot be read.
 
-            `yt-dlp` is not part of the model install: an install that only plays local files is
-            complete without it and is never sent to the setup screen for a URL tool.
-            `flacify diagnose` now says where `ffmpeg` was found as well as `yt-dlp`.
+            If you tried a URL in 1.1.1 or 1.1.2 and saw a frame-count error, re-fetching or playing
+            it again with this build rebuilds the source tier correctly. The old cache directory
+            names the path; deleting it forces a rebuild, and the new build will not create a bad
+            one.
 
             - **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) or the raw `flacify.exe`.
             - **macOS:** `flacify.dmg` with `Flacify.app`. Nothing is signed yet; right-click, then Open,
@@ -258,11 +259,8 @@ jobs:
             - **Linux:** `flacify_${{ needs.version.outputs.value }}_amd64.deb` for Debian and Ubuntu, or
               `flacify-bin-${{ needs.version.outputs.value }}-1-x86_64.pkg.tar.zst` for Arch (`pacman -U`).
 
-            **Known issue, unchanged from 1.1.1:** some AAC sources produce a source-tier segment
-            that reads back one block short of what its manifest records, which stops playback of
-            that file with a frame-count message. It is deterministic per file and was reproduced on
-            the 1.1.1 binary with `ffmpeg` absent, so it predates this change; it is under
-            investigation, and the error now says which directory to delete to rebuild the tier.
+            Everything from 1.1.2 is unchanged: the app still installs its own `yt-dlp`, and a URL
+            still needs no `ffmpeg`.
 
             The weights are the FlashSR author's and carry no stated licence. The app downloads them
             at first run, bundles and redistributes nothing, and this project's MIT licence covers its

@@ -927,24 +927,43 @@ for `140` (AAC in MP4) writes the file as served. `symphonia` in this build deco
 names for macOS and Linux (only the Windows name was executed — the others are read from
 the release listing, not run).
 
-### An AAC-backed segment that reads short (open, 2026-11-28)
+### An AAC-backed segment that reads short — FIXED, root cause was `flacenc` (2026-11-28)
 
-One specific AAC source — `https://www.youtube.com/watch?v=X_YHXdCcmVc` — fails after the
-fetch with `src-000001.flac holds 1380224 frames, source.json says 1384320`. Findings:
+`https://www.youtube.com/watch?v=X_YHXdCcmVc` used to fail with `src-000001.flac holds
+1380224 frames, source.json says 1384320`. The cause was not the decoder, the source tier
+or the resampler: **`flacenc` 0.5.1 drops a whole frame on some inputs, and which block
+size trips it depends on the data.**
 
-- **Deterministic**, byte-identical across repeated runs, fresh caches included.
-- **Reproduces on the released 1.1.1 binary** with `ffmpeg` absent, so it is not caused by
-  the no-ffmpeg fetch path.
-- **Not the writer or the decoder in isolation**: round-tripping 1 384 320 frames (337
-  full 4096 blocks plus a 3968 tail) through `flac::write` and `decode::decode` returns the
-  exact count (`crates/app/tests/flac.rs`).
-- **Not the source tier in general**: a 48 kHz WAV and a 44.1 kHz WAV of the same duration
-  both build clean, and a different YouTube m4a (634 s) produced 23 uniformly sized
-  segments with no mismatch.
-- The bad segment is **52.9 MB** where 7.9 MB is all 24-bit stereo for its frames, and its
-  `STREAMINFO` records `total_samples = 1384320` — so the header claims the full length
-  and the stream holds roughly a block less of audio plus a great deal more bytes.
+Measured on this Windows box (Ryzen 9 5900XT, yt-dlp 2026.11.23, no ffmpeg), encoding
+each of the nine 1 384 320-frame segments of the track at seven block sizes:
 
-Narrowed to "this stream's samples break the FLAC encoder", not yet to the sample values.
-Open, tracked as a follow-up to ADR-016.
+| block size | result |
+|---|---|
+| 4096 (the crate default) | segment 1 lost 4096 frames, wrote 33 624 078 bytes (≈ `4096 × 4096 × 2`) of unreadable stream |
+| 3456 | segment 6 lost 3456 frames |
+| 3072 | segment 7 lost 3072 frames |
+| 2304 | **all 9 segments exactly right** |
+| 2048, 1152, 1024 | all 9 segments exactly right |
+
+The failures are always *exactly one block* short, so the encoder is dropping the frame
+that contains a particular sample rather than truncating a file.
+
+How it was narrowed, for whoever hits the next one: the writer and the decoder were
+cleared first (`flac::write` → `decode::decode` at 1 384 320 frames returned the exact
+count for every synthetic signal tried — sine, noise, silence, both rails), and a
+different YouTube track (634 s) produced 23 uniformly sized segments. The remaining
+variable was the encoder's own block size, which the table above settles.
+
+Fix, both pinned by tests in `crates/app/tests/flac.rs`:
+
+- `flac::BLOCK` is **2304**, the largest size that verified on every segment.
+- `flac::write` decodes what it wrote and refuses to publish a stream whose frame count
+  disagrees, so the next input that trips this fails a write instead of a track.
+
+Verified after the change: all nine segments decode to exactly 1384320 frames (the last
+to 260494), the tier totals 11 335 054 frames, and `flacify play` on the file reaches the
+model check with no frame mismatch instead of stopping in the source tier.
+
+Not verified: whether any block size above 2304 is safe for other content. The check in
+`write` covers that — a bad encode now fails loudly — but the numbers above are one track.
 

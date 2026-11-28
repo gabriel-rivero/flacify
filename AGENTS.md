@@ -82,6 +82,11 @@ on real input** and the output was inspected, not inferred:
 - Use the input that prompted the change. A synthetic sine is not a substitute for the
   file that failed: the track that broke FLAC writing here was ordinary music whose
   samples sat at both rails, and every synthetic signal round-tripped perfectly.
+- Use the **state** that prompted the change, not just the input. A fresh `FLACIFY_HOME`
+  hid the second half of that same bug: the encoder was fixed but the cache entry the old
+  encoder had written was still accepted, so the report reproduced unchanged. If a fix
+  changes what a cache, manifest or file on disk *contains*, bump its version so existing
+  copies are rebuilt — and test the fix against the directory the report came from.
 - Check the artifact, not the exit code. A segment that decodes to the wrong length, a
   window that renders once, a download that plays nothing — all of these exit 0.
 - Reproduce the bug before fixing it, and reproduce it again after. "I changed the

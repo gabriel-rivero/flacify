@@ -3,7 +3,7 @@
 A desktop player that reconstructs the high frequencies an MP3 threw away, and lets
 you hear the difference on a single keystroke.
 
-Status: **1.1.3**, playable on macOS, Linux and Windows. `flacify setup` installs the
+Status: **1.1.4**, playable on macOS, Linux and Windows. `flacify setup` installs the
 Python sidecar and the model, `flacify enhance` renders a file, `flacify play` opens a
 window with an instant A/B switch, and `flacify play --live` renders a file while it plays
 from bounded memory. `flacify sink` does the same for system audio on macOS. The Rust side
@@ -112,9 +112,9 @@ which builds and attaches:
 
 - **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) and the raw `flacify.exe`.
 - **macOS:** `flacify.dmg` containing `Flacify.app`.
-- **Debian and Ubuntu:** `flacify_1.1.3_amd64.deb` (`sudo apt install ./flacify_1.1.3_amd64.deb`).
-- **Arch and CachyOS:** `flacify-bin-1.1.3-1-x86_64.pkg.tar.zst`
-  (`sudo pacman -U flacify-bin-1.1.3-1-x86_64.pkg.tar.zst`). The binary needs only alsa,
+- **Debian and Ubuntu:** `flacify_1.1.4_amd64.deb` (`sudo apt install ./flacify_1.1.4_amd64.deb`).
+- **Arch and CachyOS:** `flacify-bin-1.1.4-1-x86_64.pkg.tar.zst`
+  (`sudo pacman -U flacify-bin-1.1.4-1-x86_64.pkg.tar.zst`). The binary needs only alsa,
   libc and libgcc to link; GL, X11 and Wayland are opened when the window starts.
 
 Nothing is signed or notarised yet: on macOS, right-click → Open (or
@@ -160,7 +160,7 @@ any page that drifts.
 ## Start here
 
 ```sh
-cargo test --workspace --all-targets   # 537 tests, no GPU, no audio device, no model, no Python
+cargo test --workspace --all-targets   # 538 tests, no GPU, no audio device, no model, no Python
 python3 tools/check_docs.py --tests    # the docs still describe this tree
 ```
 

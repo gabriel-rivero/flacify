@@ -20,7 +20,13 @@ use crate::cache::{now, source_claim, InUse, Segment, CLAIMS};
 use crate::decode::{self, AudioStream};
 
 /// The entry layout's own version. A manifest from another version is rebuilt, not read.
-pub const VERSION: &str = "flacify-source-1";
+///
+/// Bumped to 2 when `flac::BLOCK` went from 4096 to 2304 (2026-11-28): `flacenc` 0.5.1
+/// drops a frame on some inputs at 4096, and a version-1 entry's segments were written by
+/// that encoder, so some of them cannot be read back. The layout did not change; the bytes
+/// did, and that is enough to require a rebuild. A reader that trusts a stale manifest is
+/// how a fixed encoder kept failing on the same file.
+pub const VERSION: &str = "flacify-source-2";
 
 /// The one file in an entry that is not audio.
 const MANIFEST: &str = "source.json";
@@ -1020,6 +1026,39 @@ mod tests {
 
         assert_eq!(rebuilt.meta().version, VERSION);
         assert!(rebuilt.meta().created_at > 0);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn given_a_previous_version_entry_with_a_corrupt_segment_when_opened_then_it_is_rebuilt_not_read(
+    ) {
+        // The bug this exists for: `flac::BLOCK` changed because `flacenc` 0.5.1 wrote
+        // unreadable segments at 4096. A segment written by that version is a landmine, so
+        // an older manifest must be a rebuild even when it parses and its files are there —
+        // otherwise a fixed encoder keeps failing on the same file, which is exactly what
+        // the user hit after 1.1.3.
+        let fixture = Fixture::new("stale-corrupt", 48_000, 2, 12_345);
+        let mut meta = fixture.stored_meta();
+        meta.version = "flacify-source-1".into();
+        fixture.store_meta(&meta);
+        // A segment the old version left that cannot decode to its length.
+        let doomed = fixture.entry.dir.join(super::segment_name(0));
+        std::fs::write(&doomed, b"not a flac at all").expect("writing a bad segment");
+
+        let rebuilt = fixture
+            .tier
+            .build_or_reuse(&fixture.source, "hash")
+            .expect("an old entry is rebuilt, never read");
+
+        assert_eq!(rebuilt.meta().version, VERSION);
+        assert_ne!(VERSION, "flacify-source-1", "the bump is the fix");
+        // And the segment that was there is gone, replaced by one that reads.
+        let decoded = decode::decode(&doomed).expect("the rebuilt segment decodes");
+        assert_eq!(
+            decoded.frames,
+            rebuilt.meta().segments[0].frames,
+            "the rebuilt segment holds what the manifest says"
+        );
         fixture.cleanup();
     }
 

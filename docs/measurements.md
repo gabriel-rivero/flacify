@@ -964,6 +964,26 @@ Verified after the change: all nine segments decode to exactly 1384320 frames (t
 to 260494), the tier totals 11 335 054 frames, and `flacify play` on the file reaches the
 model check with no frame mismatch instead of stopping in the source tier.
 
+**The first fix was incomplete, and the second was the shipping one.** Changing the block
+size fixed the encoder but left the segments the old encoder had already written. A
+1.1.2 cache entry recorded `flacify-source-1`, which the fixed build still accepted, so
+the same file failed again with the same message — the fix looked like it had not
+shipped. The version is now `flacify-source-2` (and `flacify-cache-10` for the render
+cache), so every entry an older encoder wrote is a miss and is rebuilt.
+
+The lesson is the one now in `AGENTS.md`: the test was run against a fresh `FLACIFY_HOME`
+and never against the cache the bug report came from. Reproducing the report's *state*,
+not only its input, is part of reproducing the bug.
+
+Measured after the version bump, on the cache directory the failing report used, without
+deleting anything by hand:
+
+| before | after |
+|---|---|
+| `source.json` says `flacify-source-1` | `flacify-source-2` |
+| `src-000001.flac` 52.9 MB, decodes 1380224 frames | 20.2 MB, decodes 1384320 |
+
+
 Not verified: whether any block size above 2304 is safe for other content. The check in
 `write` covers that — a bad encode now fails loudly — but the numbers above are one track.
 

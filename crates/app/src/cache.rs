@@ -53,7 +53,14 @@ use crate::render::Render;
 ///
 /// 9 (2026-11-17): the manifest records whether its segments are the whole track, so a
 /// killed render resumes instead of starting over. Every v8 entry misses.
-pub const CACHE_VERSION: &str = "flacify-cache-9";
+///
+/// 10 (2026-11-28): `flac::BLOCK` changed from 4096 to 2304, because `flacenc` 0.5.1 drops
+/// a frame on some inputs at 4096 and the segment then cannot be read back. The segments a
+/// v9 entry holds were written by the old encoder, so they may be unreadable; they miss
+/// now even though the manifest parses. A layout change is not the only reason to bump
+/// this: anything that changes the bytes a segment decodes to has to invalidate the
+/// segments that already exist.
+pub const CACHE_VERSION: &str = "flacify-cache-10";
 
 /// Steps per segment. A segment has to start on a multiple of `window - overlap`, so its
 /// length is derived from the settings and is not a wall-clock 30 s.
@@ -2956,8 +2963,10 @@ mod tests {
         assert_eq!(a, key("source", 245_760, 48_000, "model", false));
         assert_eq!(a, fields().key());
         // Pinned so a change to the hash inputs shows up as a changed key, not as a silent
-        // reuse of every v9 entry. The value is run-independent: blake3 over the six parts.
-        assert_eq!(a, "fa3eb48f3cfa0fc219872eb40939f0c3");
+        // reuse of every previous entry. The value is run-independent: blake3 over the six
+        // parts, the first of which is `CACHE_VERSION` — so bumping the version moves this
+        // by design, and updating the constant here is part of making that bump.
+        assert_eq!(a, "6fc321f519d45ae9c51bdaa467f94376");
         assert_ne!(a, key("source", 122_880, 48_000, "model", false));
         assert_ne!(a, key("source", 245_760, 24_000, "model", false));
         assert_ne!(a, key("source", 245_760, 48_000, "other-model", false));

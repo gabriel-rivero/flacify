@@ -10,7 +10,7 @@ on:
       version:
         description: Version to build (must equal the workspace version in Cargo.toml)
         required: true
-        default: "1.1.3"
+        default: "1.1.4"
 
 permissions:
   contents: write
@@ -233,34 +233,33 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           body: |
-            flacify ${{ needs.version.outputs.value }}: a YouTube track that would not play, now plays.
+            flacify ${{ needs.version.outputs.value }}: 1.1.3 stops failing on the tracks it was meant to fix.
 
-            **The FLAC writer was producing unreadable segments on some tracks.** One real 236 s
-            track failed with "src-000001.flac holds 1380224 frames, source.json says 1384320", and
-            the cause was the encoder, not the decoder or the source tier: `flacenc` 0.5.1 drops a
-            whole frame on some inputs, and which block size trips it depends on the data. At the
-            crate's default block 4096 that track lost 4096 frames and wrote 33.6 MB of stream that
-            decodes to nothing; 3456 lost a frame on another segment, 3072 on another. 2304 and
-            below were exact on all nine segments.
+            **1.1.3 fixed the encoder but not the cache.** Changing the FLAC block size stopped new
+            tracks from being written badly, but a source tier the old encoder had already written
+            was still accepted: its manifest said `flacify-source-1`, and 1.1.3 still read version 1.
+            So the same file failed with the same frame-count error and it looked like the fix had
+            not shipped at all.
 
-            So the block size is now 2304, and **the writer decodes every segment back and refuses
-            to accept one whose frame count disagrees**. The second part is the real fix: a wrong
-            block size is one encoder bug, but no track should ever be built from a segment that
-            cannot be read.
+            Both on-disk formats are now bumped — `flacify-source-2` and `flacify-cache-10` — so
+            anything an older encoder wrote is a miss and is rebuilt on the next play. **No manual
+            deletion:** play the file and the tier rebuilds itself.
 
-            If you tried a URL in 1.1.1 or 1.1.2 and saw a frame-count error, re-fetching or playing
-            it again with this build rebuilds the source tier correctly. The old cache directory
-            names the path; deleting it forces a rebuild, and the new build will not create a bad
-            one.
+            Measured on the exact cache directory that kept failing, without touching it by hand:
+
+            | before | after |
+            |---|---|
+            | `source.json` says `flacify-source-1` | `flacify-source-2` |
+            | `src-000001.flac` 52.9 MB, decodes 1380224 frames | 20.2 MB, decodes 1384320 |
+
+            Everything from 1.1.3 is unchanged: `flac::BLOCK` is 2304, and every segment is decoded
+            back and refused if its frame count disagrees.
 
             - **Windows:** `flacify-setup.exe` (per-user install, Start Menu shortcut) or the raw `flacify.exe`.
             - **macOS:** `flacify.dmg` with `Flacify.app`. Nothing is signed yet; right-click, then Open,
               or run `xattr -dr com.apple.quarantine /Applications/Flacify.app`.
             - **Linux:** `flacify_${{ needs.version.outputs.value }}_amd64.deb` for Debian and Ubuntu, or
               `flacify-bin-${{ needs.version.outputs.value }}-1-x86_64.pkg.tar.zst` for Arch (`pacman -U`).
-
-            Everything from 1.1.2 is unchanged: the app still installs its own `yt-dlp`, and a URL
-            still needs no `ffmpeg`.
 
             The weights are the FlashSR author's and carry no stated licence. The app downloads them
             at first run, bundles and redistributes nothing, and this project's MIT licence covers its

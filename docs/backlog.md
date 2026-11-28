@@ -153,6 +153,7 @@ A session queue, deliberately not a library.
 | E11-4 | No-argument launch | `flacify` opens the window with no track; dropping a file, folder or playlist starts a queue |
 | E11-5 | Remote prefetch | the next remote entry downloads while the current one plays; a failed fetch is a stated state, not a silent stop |
 | E11-6 | URL box in the window | the empty window and the player both take a pasted URL; `radio` seeds a mix from one video and a playlist URL stays a queue; the listing runs off the UI thread so the window never freezes on yt-dlp |
+| E11-7 | The app installs its own `yt-dlp` (ADR-016) | `flacify setup` puts a standalone binary in `runtime/bin`; a URL plays on a machine with no `yt-dlp` or `ffmpeg` on `PATH`; a local-only install is `ready` without it |
 
 ## State of the scaffold (2026-11-12)
 

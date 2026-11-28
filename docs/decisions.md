@@ -1,6 +1,6 @@
 # Decisions
 
-Status: current, 2026-11-27. One page per decision: context, decision, consequences.
+Status: current, 2026-11-28. One page per decision: context, decision, consequences.
 Reopen a decision by adding a superseding ADR, not by editing the old one.
 
 **ADR-009 is unresolved.** No record of what it was meant to decide exists in this repo
@@ -386,6 +386,62 @@ persistent collection.
   strip says "fetching" rather than pretending it is instant.
 - The earlier "no playlist" line protected against becoming a mediocre music manager.
   Refusing the library keeps that guard while allowing the queue.
+
+---
+
+## ADR-016 — The app installs its own yt-dlp, and needs no ffmpeg for a URL
+
+**Status:** accepted, 2026-11-28. Supersedes the `yt-dlp`/`ffmpeg` rows of
+[`dependencies.md`](dependencies.md#external-programs), which said both were user-supplied
+and that a missing ffmpeg was simply reported.
+
+**Context:** a packaged app launches with no command line, so a user who installs it and
+pastes a YouTube link hits whatever the machine already had. Measured on one Windows box
+(2026-11-28): `yt-dlp` was present on `PATH` because some unrelated Python install put it
+there, and `ffmpeg` was absent. The fetch asked yt-dlp for `-x --audio-format flac`, which
+is what this build decodes, and yt-dlp downloaded the audio and then failed the
+postprocessing step with `ffprobe and ffmpeg not found` — the bytes already spent. The
+error named yt-dlp, not the missing tool, and the message suggested installing yt-dlp.
+
+Two things were wrong with "user-supplied": the app can provision 6 GB of Python and
+weights but asked a user to find a 24 MB binary themselves, and the FLAC request assumed a
+toolchain the app never checked for.
+
+**Decision:**
+
+- **`yt-dlp` is installed by `flacify setup`**, as a standalone per-platform binary from
+  its `latest` release into `<home>/runtime/bin`. Not a pip package: a URL then works on a
+  machine that never installed the model, because it needs no Python or venv.
+- **It is not a `required` step.** `is_ready` ignores it, so an install that plays local
+  files is complete without it; `flacify setup` adds it, and a local-only user is never
+  sent to a setup screen for a URL tool.
+- **The app's copy is tried before `PATH`**, and `FLACIFY_YTDLP` overrides both. The
+  binary's path is known, so nothing depends on the user `PATH` — which a GUI process
+  cannot see change on Windows or macOS anyway.
+- **ffmpeg is not installed.** Instead the fetch asks for a container YouTube already
+  serves (`NATIVE_FORMAT`: AAC/MP4) when `ffmpeg` is not found, because yt-dlp only needs
+  it to remux or transcode. With ffmpeg present it keeps asking for FLAC.
+- **No `PATH` mutation and no elevation.** No winget/brew/apt/pacman, and no static ffmpeg
+  binary. Dropping a binary in the app's own directory is the whole mechanism.
+
+**Consequences:**
+
+- A pasted URL works after `flacify setup` with no other tool installed. Measured on the
+  same Windows box (2026-11-28): yt-dlp 2026.11.23 installed to `runtime/bin`, then a
+  634.6 s video fetched and played with `ffmpeg` absent from `PATH`.
+- **The no-ffmpeg path keeps the source's own AAC** rather than transcoding to FLAC. A
+  lossy source is what a lossy-streaming service holds anyway, so nothing is lost that was
+  not already lost; the cost is that a FLAC-only square-off is not available without
+  ffmpeg. The format string falls back in order and every pick is a container
+  `DECODABLE` lists, so a download cannot land in a container this build cannot read.
+- **A static ffmpeg is not shipped**, deliberately: the only macOS build found
+  (Evermeet, 9.1) is x86_64-only, so bundling it would break native Apple Silicon, and
+  BtbN has no macOS build at all. Installing via a package manager would need elevation on
+  Linux and a manager that may be absent — a worse failure than "keeps the AAC".
+- `flacify diagnose` now prints where `ffmpeg` was found, next to `yt-dlp`, because it
+  decides which format a fetch asks for.
+- `is_ready` is about the model, so `plan()` steps carry `required`; a future step that
+  only serves one feature follows the same rule instead of making the install look broken.
 
 ---
 

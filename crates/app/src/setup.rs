@@ -31,6 +31,7 @@ const STEP_WHEELS: &str = "wheels";
 const STEP_FLASHSR: &str = "flashsr";
 const STEP_WORKER: &str = "worker";
 const STEP_WEIGHTS: &str = "weights";
+const STEP_YTDLP: &str = "yt-dlp";
 
 const HOME_ENV: &str = "FLACIFY_HOME";
 const UV_ENV: &str = "FLACIFY_UV";
@@ -49,6 +50,11 @@ const UV_BYTES: u64 = 20_000_000;
 const PYTHON_BYTES: u64 = 30_000_000;
 const VENV_BYTES: u64 = 1_000_000;
 const WHEELS_BYTES: u64 = 2_500_000_000;
+
+/// The standalone yt-dlp binary, about the size of the Windows build. It is a single
+/// self-contained executable, not a pip package: a URL then needs no Python and no venv,
+/// which is what lets a machine that never installed the model still play a link.
+const YTDLP_BYTES: u64 = 24_000_000;
 
 /// The three weight files and their sizes in the upstream dataset repo.
 const WEIGHT_FILES: [(&str, u64); 3] = [
@@ -248,7 +254,7 @@ impl Paths {
         self.root.join("models")
     }
 
-    /// Where a fetched URL lands, one directory per id. Outside `cache/` on purpose: the
+    /// Where fetched audio lands, one directory per id. Outside `cache/` on purpose: the
     /// cache scan sweeps a directory it cannot read as an entry, and a download is not one.
     // The state-machine test mounts this module without the commands, so it cannot use it.
     #[cfg_attr(test, allow(dead_code))]
@@ -256,16 +262,35 @@ impl Paths {
         self.root.join("downloads")
     }
 
+    /// Where the app's own tools live: the `uv` it installed, and yt-dlp. On `PATH` for a
+    /// child process we spawn, never in the user's environment.
+    pub fn bin_dir(&self) -> PathBuf {
+        self.runtime_dir().join("bin")
+    }
+
+    /// The yt-dlp this app installed, if it did.
+    pub fn managed_ytdlp(&self) -> PathBuf {
+        let name = if cfg!(windows) {
+            "yt-dlp.exe"
+        } else {
+            "yt-dlp"
+        };
+        self.bin_dir().join(name)
+    }
+
     /// The sidecar entry point.
     pub fn worker_script(&self) -> PathBuf {
         self.runtime_dir().join("worker.py")
     }
 
-    /// True when every step is recorded as done and its output is still on disk.
+    /// True when every step the model needs is recorded as done and its output is on disk.
+    ///
+    /// Only `required` steps count: yt-dlp serves URLs, so an install without it is still
+    /// a ready player for local files, and must not be sent to the setup screen.
     pub fn is_ready(&self) -> bool {
         let state = State::load(self);
         let uv = uv_on_disk(self);
-        plan().iter().all(|step| {
+        plan().iter().filter(|step| step.required).all(|step| {
             state.is_done(step.id)
                 && step_outputs_exist(
                     step.id,
@@ -326,6 +351,10 @@ pub struct Step {
     pub id: &'static str,
     pub label: &'static str,
     pub bytes: u64,
+    /// Whether the model needs it. `is_ready` is about the model, so a tool that only a
+    /// URL uses must not make a working install look incomplete — or send a local-only
+    /// user to a 6 GB setup screen to fetch a 24 MB binary.
+    pub required: bool,
 }
 
 /// The provisioning steps in order. Pure: callers sum `bytes` to show the total first.
@@ -335,36 +364,51 @@ pub fn plan() -> Vec<Step> {
             id: STEP_UV,
             label: "uv package manager",
             bytes: UV_BYTES,
+            required: true,
         },
         Step {
             id: STEP_PYTHON,
             label: "Python 3.12",
             bytes: PYTHON_BYTES,
+            required: true,
         },
         Step {
             id: STEP_VENV,
             label: "virtual environment",
             bytes: VENV_BYTES,
+            required: true,
         },
         Step {
             id: STEP_WHEELS,
             label: "PyTorch and inference wheels",
             bytes: WHEELS_BYTES,
+            required: true,
         },
         Step {
             id: STEP_FLASHSR,
             label: "FlashSR inference sources",
             bytes: 40_000_000,
+            required: true,
         },
         Step {
             id: STEP_WORKER,
             label: "sidecar sources",
             bytes: 0,
+            required: true,
         },
         Step {
             id: STEP_WEIGHTS,
             label: "FlashSR weights",
             bytes: WEIGHTS_BYTES,
+            required: true,
+        },
+        // Not required by the model: only a URL uses it, and it is the one step a
+        // local-only install can skip without losing anything.
+        Step {
+            id: STEP_YTDLP,
+            label: "yt-dlp (fetching a URL)",
+            bytes: YTDLP_BYTES,
+            required: false,
         },
     ]
 }
@@ -433,6 +477,7 @@ fn step_root(id: &str, paths: &Paths) -> PathBuf {
         STEP_VENV | STEP_WHEELS => paths.venv_dir(),
         STEP_FLASHSR => paths.flashsr_dir(),
         STEP_WEIGHTS => paths.models_dir(),
+        STEP_YTDLP => paths.bin_dir(),
         _ => paths.runtime_dir(),
     }
 }
@@ -588,6 +633,7 @@ fn run_step(id: &str, paths: &Paths, runner: &dyn Runner, uv: &mut Option<PathBu
         STEP_FLASHSR => install_flashsr(paths, runner, uv),
         STEP_WORKER => write_worker(paths, runner),
         STEP_WEIGHTS => download_weights(paths, runner),
+        STEP_YTDLP => install_ytdlp(paths, runner),
         other => bail!("no step named {other:?}"),
     }
 }
@@ -765,6 +811,73 @@ fn download_weights(paths: &Paths, runner: &dyn Runner) -> Result<()> {
     Ok(())
 }
 
+/// The yt-dlp release asset for this platform, from its `latest` release.
+///
+/// The standalone build, not the pip package: a URL then works with no Python and no
+/// venv, so the 24 MB binary is the whole cost of "fetch a link". The names are the ones
+/// the yt-dlp release actually publishes per platform and architecture.
+fn ytdlp_release_url() -> Result<String> {
+    let asset =
+        ytdlp_asset().context("yt-dlp publishes no build for this platform; install it on PATH")?;
+    Ok(format!(
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/{asset}"
+    ))
+}
+
+fn ytdlp_asset() -> Option<&'static str> {
+    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some("yt-dlp.exe")
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        Some("yt-dlp_arm64.exe")
+    } else if cfg!(all(target_os = "windows", target_arch = "x86")) {
+        Some("yt-dlp_x86.exe")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        // The plain `yt-dlp_macos` is the universal build; there is no separate arm one.
+        Some("yt-dlp_macos")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("yt-dlp_macos")
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("yt-dlp_linux")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some("yt-dlp_linux_aarch64")
+    } else if cfg!(all(target_os = "linux", target_arch = "arm")) {
+        Some("yt-dlp_linux_armv7l")
+    } else {
+        None
+    }
+}
+
+/// Download the standalone yt-dlp into the app's own `bin/`.
+///
+/// curl writes straight to the destination and `chmod` makes it runnable on unix; Windows
+/// has no execute bit. The step is skipped when a binary is already there, because the
+/// step's own existence check is what decides whether it runs at all.
+fn install_ytdlp(paths: &Paths, runner: &dyn Runner) -> Result<()> {
+    let url = ytdlp_release_url()?;
+    let target = paths.managed_ytdlp();
+    runner.create_dir_all(&paths.bin_dir())?;
+    let target_arg = target.to_string_lossy().into_owned();
+    runner.run(
+        Path::new("curl"),
+        &[
+            "-fsSL",
+            "--retry",
+            "3",
+            "-o",
+            target_arg.as_str(),
+            url.as_str(),
+        ],
+    )?;
+    // `is_none_or` is 1.82; the workspace MSRV is 1.80.
+    if !matches!(runner.size(&target), Some(size) if size > 0) {
+        bail!("yt-dlp was not downloaded to {}", target.display());
+    }
+    if !cfg!(windows) {
+        runner.run(Path::new("chmod"), &["755", target_arg.as_str()])?;
+    }
+    Ok(())
+}
+
 /// Where a usable `uv` comes from, before anything runs.
 enum UvSource {
     /// `FLACIFY_UV`, trusted as given.
@@ -882,6 +995,9 @@ fn step_outputs_exist(
         STEP_WEIGHTS => WEIGHT_FILES
             .iter()
             .all(|(name, bytes)| has_size(runner, &paths.models_dir().join(name), *bytes)),
+        STEP_YTDLP => runner
+            .size(&paths.managed_ytdlp())
+            .is_some_and(|size| size > 0),
         _ => false,
     }
 }

@@ -19,10 +19,22 @@ use crate::process::{self, Cancel};
 /// Overrides where `yt-dlp` is found, the way `FLACIFY_UV` does for `uv`.
 const YTDLP_ENV: &str = "FLACIFY_YTDLP";
 
-/// The container we ask for. FLAC is in `symphonia`'s feature list, is lossless so nothing
-/// is thrown away before the model sees it, and is written by the `ffmpeg` yt-dlp already
-/// needs. The default (`bestaudio`) is WebM/Opus, which this build cannot decode.
+/// The container we ask for when ffmpeg is available. FLAC is in `symphonia`'s feature
+/// list, is lossless so nothing is thrown away before the model sees it, and is written by
+/// the `ffmpeg` yt-dlp already needs. The default (`bestaudio`) is WebM/Opus, which this
+/// build cannot decode.
 const AUDIO_FORMAT: &str = "flac";
+
+/// The format we ask for when ffmpeg is absent: YouTube's own AAC in its own MP4, which
+/// needs no postprocessing at all. `symphonia` decodes `mp4a` (AAC-LC) with the features
+/// this build enables, verified by `flacify probe` on a real download (2026-11-28).
+///
+/// This is the difference between "a URL works after one 24 MB binary" and "a URL needs a
+/// full ffmpeg install": yt-dlp only needs ffmpeg to remux or transcode, and asking it for
+/// a format it can deliver untouched skips that step entirely. The cost is a lossy
+/// source — which is what a lossy-streaming service holds anyway — instead of a FLAC that
+/// was transcoded from it.
+const NATIVE_FORMAT: &str = "140/bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio";
 
 /// The containers the pipeline can actually decode, so a download it cannot read is named
 /// here rather than failing later inside the decoder.
@@ -287,8 +299,11 @@ pub fn resolve(input: &Path, downloads: &Path, cancel: Option<&Cancel>) -> Resul
     Ok(track)
 }
 
-/// Where `yt-dlp` is: the override, then `PATH`. `None` means the error is worth raising,
-/// not that a download should be skipped.
+/// Where `yt-dlp` is: the override, then the copy this app installed, then `PATH`.
+///
+/// The managed copy comes before `PATH` because it is the one `flacify setup` just put
+/// there: a machine with a broken older yt-dlp on `PATH` would otherwise keep using it.
+/// `None` means the error is worth raising, not that a download should be skipped.
 pub fn find_ytdlp() -> Option<PathBuf> {
     if let Some(program) = std::env::var_os(YTDLP_ENV) {
         let path = PathBuf::from(program);
@@ -297,7 +312,63 @@ pub fn find_ytdlp() -> Option<PathBuf> {
         }
         return process::find_on_path(&path.to_string_lossy());
     }
+    if let Ok(paths) = crate::setup::Paths::discover() {
+        let managed = paths.managed_ytdlp();
+        if process::is_executable(&managed) {
+            return Some(managed);
+        }
+    }
     process::find_on_path("yt-dlp")
+}
+
+/// The yt-dlp arguments for one fetch, which depend on whether ffmpeg can be found.
+///
+/// With ffmpeg: ask for FLAC, which is lossless and is what `symphonia` decodes; yt-dlp
+/// transcodes the source into it. Without ffmpeg: ask for a format YouTube already serves
+/// as a decodable container, so no postprocessor runs. Asking for FLAC without ffmpeg is
+/// the exact failure this avoids — yt-dlp downloads the audio and then dies at the
+/// conversion step with "ffprobe and ffmpeg not found", having thrown the bytes away.
+fn fetch_args<'a>(template: &'a str, fields: &'a str, url: &'a str) -> Vec<&'a str> {
+    fetch_args_with(template, fields, url, has_ffmpeg())
+}
+
+/// The same arguments with the ffmpeg decision supplied, so both branches are testable
+/// without a machine that has (or lacks) ffmpeg.
+fn fetch_args_with<'a>(
+    template: &'a str,
+    fields: &'a str,
+    url: &'a str,
+    ffmpeg: bool,
+) -> Vec<&'a str> {
+    let mut args = vec![
+        "--no-playlist",
+        "--no-warnings",
+        "--no-continue",
+        "--newline",
+        "-o",
+        template,
+        "--print",
+        fields,
+        url,
+    ];
+    if ffmpeg {
+        args.splice(
+            4..4,
+            ["-x", "--audio-format", AUDIO_FORMAT, "--audio-quality", "0"],
+        );
+    } else {
+        args.splice(4..4, ["-f", NATIVE_FORMAT]);
+    }
+    args
+}
+
+/// Whether an ffmpeg any yt-dlp will find is on `PATH`.
+///
+/// Not a `--version` spawn: yt-dlp does its own lookup, and all this decides is which
+/// format to ask for. A wrong answer here costs a re-fetch, never a wrong file — the
+/// fetched file is probed by [`check_decodable`] before anything trusts it.
+pub fn has_ffmpeg() -> bool {
+    process::find_on_path("ffmpeg").is_some()
 }
 
 /// The file a fetch of `request` produced, or the one an earlier fetch already left.
@@ -339,22 +410,7 @@ pub fn fetch(request: &Request, dir: &Path, cancel: Option<&Cancel>) -> Result<T
     let fields =
         format!("after_move:{SENTINEL}\t%(filepath)s\t%(title)s\t%(artist,uploader,channel)s");
     let template = template.to_string_lossy().into_owned();
-    let args = [
-        "--no-playlist",
-        "--no-warnings",
-        "--no-continue",
-        "--newline",
-        "-x",
-        "--audio-format",
-        AUDIO_FORMAT,
-        "--audio-quality",
-        "0",
-        "-o",
-        &template,
-        "--print",
-        &fields,
-        &request.url,
-    ];
+    let args = fetch_args(&template, &fields, &request.url);
     let finished = process::run_streaming(&program, &args, cancel, &mut |line| {
         // Downloads report as `[download]  12.3% of ...`. Only progress is shown, so a
         // person watching a terminal sees the fetch move without a line per fragment.
@@ -635,6 +691,48 @@ mod tests {
         assert_eq!(loaded.title.as_deref(), Some("a\tb\nc\\d"));
         assert_eq!(loaded.artist.as_deref(), Some("x\ty"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn given_a_fetch_when_ffmpeg_is_present_then_it_asks_for_a_transcode_to_flac() {
+        // The FLAC request only works with a postprocessor, so the two must move together:
+        // asking for FLAC without ffmpeg is the "ffprobe and ffmpeg not found" failure.
+        let args = fetch_args_with("out.%(ext)s", "fields", "https://youtu.be/x", true);
+        assert!(args.contains(&"-x"), "{args:?}");
+        assert!(args.contains(&"--audio-format"), "{args:?}");
+        assert!(args.contains(&AUDIO_FORMAT), "{args:?}");
+        assert!(
+            !args.contains(&"-f"),
+            "a transcode does not need an explicit format: {args:?}"
+        );
+    }
+
+    #[test]
+    fn given_a_fetch_without_ffmpeg_then_it_asks_for_a_format_that_needs_no_postprocessing() {
+        // No `-x` and no `--audio-format`: yt-dlp writes the container as served, which is
+        // the only way a download succeeds with no ffmpeg on the machine.
+        let args = fetch_args_with("out.%(ext)s", "fields", "https://youtu.be/x", false);
+        assert!(!args.contains(&"-x"), "{args:?}");
+        assert!(!args.contains(&"--audio-format"), "{args:?}");
+        assert!(args.contains(&"-f"), "{args:?}");
+        assert!(args.contains(&NATIVE_FORMAT), "{args:?}");
+    }
+
+    #[test]
+    fn given_the_native_format_choices_then_each_names_a_container_we_decode() {
+        // The string falls back in order; every pick must be a container `DECODABLE`
+        // knows, or the audio is downloaded and then thrown away by the decoder.
+        for pick in NATIVE_FORMAT.split('/') {
+            let ext = pick
+                .rsplit_once("ext=")
+                .map(|(_, ext)| ext.trim_end_matches(']'))
+                // A bare format id (`140`) is the m4a one documented in `NATIVE_FORMAT`.
+                .unwrap_or("m4a");
+            assert!(
+                DECODABLE.contains(&ext),
+                "{pick:?} yields {ext:?}, which this build cannot decode"
+            );
+        }
     }
 
     #[test]

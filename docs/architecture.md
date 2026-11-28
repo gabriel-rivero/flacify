@@ -340,7 +340,7 @@ what it is; this table is the map to those lines.
 | `ab.rs` | the blind A/B run: seeded plan, answers, level gate, report |
 | `batch.rs` | a folder rendered one file at a time |
 | `diagnose.rs` | one text file with the facts an issue needs |
-| `setup.rs` | first-run provisioning: `uv`, CPython, wheels, weights, resumable state |
+| `setup.rs` | first-run provisioning: `uv`, CPython, wheels, weights, `yt-dlp`, resumable state |
 | `process.rs` | running another program: one child, its output read as it arrives, killed on cancel |
 | `youtube.rs` | a URL as a source: `yt-dlp` fetches the audio or lists a playlist, then the pipeline gets a file |
 | `playlist.rs` | the queue: folder, `.m3u`/`.m3u8`/`.pls` and yt-dlp listings as entries, one cursor |
@@ -477,9 +477,13 @@ local file.
 - **One file per id**: the file named after the id wins over any other decodable file in
   the directory, because `flacify enhance <url>` used to write its render beside the source;
   it now writes to the working directory for a URL.
-- **Container**: the fetch asks for FLAC. `symphonia` here has no Opus and no ALAC codec, so
-  yt-dlp's default WebM/Opus would not decode, and `youtube::DECODABLE` names only the
-  containers whose codec is always one this build has.
+- **Container**: with ffmpeg, the fetch asks for FLAC, which is lossless and is what
+  `symphonia` decodes. Without it, it asks for a container YouTube already serves
+  (`NATIVE_FORMAT`: AAC in MP4), because yt-dlp only needs ffmpeg to remux or transcode —
+  asking for FLAC on a machine that has none downloads the audio and then dies at the
+  conversion step. `symphonia` here has no Opus and no ALAC codec, so yt-dlp's default
+  WebM/Opus would not decode, and `youtube::DECODABLE` names only the containers whose
+  codec is always one this build has.
 - **Reuse**: a file keyed by id is trusted without asking yt-dlp again, but it is decoded
   before it is trusted, so a truncated file left by an interrupted run re-fetches rather
   than failing forever.

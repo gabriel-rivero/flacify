@@ -124,6 +124,57 @@ fn given_a_signal_not_exact_at_24_bits_when_round_tripped_then_no_sample_is_off_
 }
 
 #[test]
+fn given_a_signal_that_fills_whole_blocks_when_round_tripped_then_no_block_is_lost() {
+    // Exactly 338 blocks of 4096: a whole multiple, the boundary a short tail does not
+    // exercise. The writer patches both STREAMINFO block sizes, and this is the shape
+    // that would expose a tail being miscounted as absent.
+    let frames = 338 * flac::BLOCK;
+    let planar = unrepresentable_signal(frames);
+    let file = TempFlac::new("whole-blocks");
+    write_signal(&file, &planar);
+
+    let decoded = decode::decode(file.path()).expect("decoding the written flac");
+    assert_eq!(
+        decoded.frames,
+        frames,
+        "a whole-block signal lost {} frames",
+        frames as i64 - decoded.frames as i64
+    );
+}
+
+#[test]
+fn given_the_source_tier_segment_length_when_round_tripped_then_no_block_is_lost() {
+    // The exact length the source tier writes into one segment: 337 full blocks plus a
+    // 3968-frame tail. Pins the writer at the real segment size, not a convenient one.
+    let frames = 1_384_320;
+    assert_eq!(frames % flac::BLOCK, 3968, "the tail this case is about");
+    let planar = unrepresentable_signal(frames);
+    let file = TempFlac::new("tier-segment");
+    write_signal(&file, &planar);
+
+    let decoded = decode::decode(file.path()).expect("decoding the written flac");
+    assert_eq!(
+        decoded.frames,
+        frames,
+        "lost {} frames, one block is {}",
+        frames as i64 - decoded.frames as i64,
+        flac::BLOCK
+    );
+}
+
+#[test]
+fn given_a_signal_that_is_one_block_short_of_whole_when_round_tripped_then_the_count_holds() {
+    // The neighbouring case: the short tail must survive too.
+    let frames = 338 * flac::BLOCK - flac::BLOCK;
+    let planar = unrepresentable_signal(frames);
+    let file = TempFlac::new("short-tail");
+    write_signal(&file, &planar);
+
+    let decoded = decode::decode(file.path()).expect("decoding the written flac");
+    assert_eq!(decoded.frames, frames);
+}
+
+#[test]
 fn given_a_written_file_when_streaminfo_is_read_then_both_block_sizes_equal_the_written_block() {
     let frames = 9_000;
     let file = TempFlac::new("streaminfo");

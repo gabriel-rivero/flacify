@@ -184,6 +184,17 @@ impl Runner for FakeRunner {
                 SystemRunner::default().write(&dir.join(name), b"uv (fake)\n")?;
             }
         }
+        if args.first() == Some(&"-fsSL") {
+            // curl -o <dest> <url>: the yt-dlp step downloads a binary rather than running
+            // the venv, so the double has to leave the file the step's size check wants.
+            if let Some(dest) = args
+                .iter()
+                .position(|arg| *arg == "-o")
+                .and_then(|i| args.get(i + 1))
+            {
+                SystemRunner::default().write(Path::new(dest), b"yt-dlp (fake)\n")?;
+            }
+        }
         // The flashsr step runs the extractor script; its contract is that the marker
         // file exists afterwards, so that is what the double produces.
         if let Some(marker) = args.iter().find(|arg| arg.ends_with("FlashSR/FlashSR.py")) {
@@ -244,7 +255,9 @@ fn write_state(paths: &Paths, done: &[&str]) {
     );
 }
 
-/// Every output the six steps produce, as the app would leave them.
+/// Every output the seven required steps produce, as the app would leave them. yt-dlp is
+/// included: it is not required for the model, but a complete install has it, and the
+/// resume tests must not see a step with nothing on disk.
 fn create_complete_install(paths: &Paths) {
     write_file(&paths.python_receipt(), b"python 3.12\n");
     write_file(&paths.venv_python(), b"#!/bin/sh\n");
@@ -253,6 +266,7 @@ fn create_complete_install(paths: &Paths) {
     write_file(&paths.worker_script(), b"print('worker')\n");
     write_file(&paths.flashsr_script(), b"print('flashsr')\n");
     write_file(&paths.worker_receipt(), setup::worker_manifest().as_bytes());
+    write_file(&paths.managed_ytdlp(), b"yt-dlp (fake)\n");
     for (name, bytes) in WEIGHT_SIZES {
         sparse_file(&paths.models_dir().join(name), bytes);
     }
@@ -263,6 +277,16 @@ fn position(commands: &[String], needle: &str) -> usize {
         .iter()
         .position(|command| command.contains(needle))
         .unwrap_or_else(|| panic!("no {needle:?} in {commands:#?}"))
+}
+
+/// The commands a fresh install runs: six that reach the network or the venv, plus the
+/// yt-dlp download and the `chmod` that makes it runnable on unix.
+fn expected_run_commands() -> usize {
+    if cfg!(windows) {
+        7
+    } else {
+        8
+    }
 }
 
 #[test]
@@ -282,16 +306,20 @@ fn given_an_empty_home_when_ensure_runs_then_every_step_executes_in_order() {
     ensure_with(&paths, &runner, progress).expect("a fresh install");
 
     let commands = runner.take_commands();
-    // torch, then the rest of the wheels, then the two downloads; python and venv run
-    // the interpreter and the environment they set up.
+    // torch, the rest of the wheels, the two downloads, and yt-dlp's curl + chmod; python
+    // and venv run the interpreter and the environment they set up.
     assert_eq!(
         commands.len(),
-        6,
+        expected_run_commands(),
         "one command per networked step: {commands:#?}"
     );
     assert!(position(&commands, "python install") < position(&commands, "venv --python"));
     assert!(position(&commands, "venv --python") < position(&commands, "pip install"));
     assert!(position(&commands, "pip install") < position(&commands, "FlashSR_weights"));
+    assert!(
+        position(&commands, "FlashSR_weights") < position(&commands, "yt-dlp"),
+        "yt-dlp downloads last: {commands:#?}"
+    );
 
     let state = fs::read_to_string(paths.state_file()).expect("reading the state file");
     let ids: Vec<&str> = plan().iter().map(|step| step.id).collect();
@@ -442,7 +470,9 @@ fn given_all_weights_present_when_the_weights_step_runs_then_nothing_downloads()
     create_complete_install(&paths);
     write_state(
         &paths,
-        &["uv", "python", "venv", "wheels", "flashsr", "worker"],
+        &[
+            "uv", "python", "venv", "wheels", "flashsr", "worker", "yt-dlp",
+        ],
     );
     let runner = FakeRunner::new(&paths);
 
@@ -539,6 +569,37 @@ fn given_a_done_state_when_an_output_is_missing_then_only_that_step_runs() {
 }
 
 #[test]
+fn given_a_complete_model_install_without_ytdlp_when_ready_is_asked_then_it_is_true() {
+    // The point of `required`: a user who only plays local files must never be sent to
+    // the setup screen for a 24 MB URL tool.
+    let home = Home::new("no-ytdlp-ready");
+    let paths = home.paths();
+    let ids: Vec<&str> = plan()
+        .iter()
+        .filter(|step| step.required)
+        .map(|step| step.id)
+        .collect();
+    create_complete_install(&paths);
+    fs::remove_file(paths.managed_ytdlp()).expect("removing yt-dlp");
+    write_state(&paths, &ids);
+
+    assert!(
+        paths.is_ready(),
+        "a model install without yt-dlp is ready for local files"
+    );
+
+    // But when it runs, the missing step is the one that executes.
+    let runner = FakeRunner::new(&paths);
+    ensure_with(&paths, &runner, Progress::default()).expect("adding the missing tool");
+    let commands = runner.take_commands();
+    assert!(
+        commands.iter().all(|command| command.contains("yt-dlp")),
+        "only the yt-dlp step should have run: {commands:#?}"
+    );
+    assert!(paths.managed_ytdlp().exists(), "yt-dlp was not installed");
+}
+
+#[test]
 fn given_a_done_state_when_a_file_is_missing_then_is_ready_is_false() {
     let home = Home::new("ready");
     let paths = home.paths();
@@ -563,7 +624,7 @@ fn given_the_plan_when_summed_then_it_reports_the_size_the_screen_shows() {
     let ids: Vec<&str> = steps.iter().map(|step| step.id).collect();
     assert_eq!(
         ids,
-        ["uv", "python", "venv", "wheels", "flashsr", "worker", "weights"]
+        ["uv", "python", "venv", "wheels", "flashsr", "worker", "weights", "yt-dlp"]
     );
     assert!(steps.iter().all(|step| !step.label.is_empty()));
 
@@ -580,11 +641,29 @@ fn given_the_plan_when_summed_then_it_reports_the_size_the_screen_shows() {
         .expect("a worker step");
     assert_eq!(worker.bytes, 0, "the sources are embedded, not downloaded");
 
-    let total: u64 = steps.iter().map(|step| step.bytes).sum();
+    // yt-dlp serves URLs only: a local-only install is ready without it, and the setup
+    // screen must not claim the model needs it.
+    let ytdlp = steps
+        .iter()
+        .find(|step| step.id == "yt-dlp")
+        .expect("a yt-dlp step");
+    assert!(!ytdlp.required, "yt-dlp is not a model step");
+    assert!(
+        steps
+            .iter()
+            .filter(|step| step.required)
+            .all(|step| step.id != "yt-dlp"),
+        "no other step is optional"
+    );
+    let required: u64 = steps
+        .iter()
+        .filter(|step| step.required)
+        .map(|step| step.bytes)
+        .sum();
     assert_eq!(
-        total,
+        required,
         20_000_000 + 30_000_000 + 1_000_000 + 2_500_000_000 + 40_000_000 + 3_316_519_586,
-        "the setup screen prints this total"
+        "the setup screen prints the required total"
     );
 }
 

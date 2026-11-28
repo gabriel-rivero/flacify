@@ -103,13 +103,23 @@ Windows); the two we can be pointed elsewhere for a test are `FLACIFY_UV` and
 
 | program | needed for | if it is missing |
 |---|---|---|
-| `yt-dlp` | any URL as a source | the command says how to install it and stops; local files are unaffected |
-| `ffmpeg` | the audio conversion `yt-dlp -x` does | yt-dlp reports it; we ask for FLAC because it is what `symphonia` decodes |
+| `yt-dlp` | any URL as a source | `flacify setup` installs a standalone copy into `<home>/runtime/bin`; a `PATH` one is used if the app's is absent, and `FLACIFY_YTDLP` overrides both |
+| `ffmpeg` | the lossless `yt-dlp -x` conversion | not installed by us. Without it a fetch asks for the container YouTube already serves (AAC/MP4), which needs no postprocessing, so a URL still works — at the source's own quality rather than a FLAC transcode |
 | `uv`, `curl`, `tar` | `flacify setup` | the install fails with the step name |
 
-Choosing `PATH` over a vendored binary is deliberate: `yt-dlp` changes weekly to keep up
-with the sites it reads, so pinning it here would pin the product's usefulness with it.
-`flacify diagnose` prints where `yt-dlp` was found.
+The app's own tools live in `<home>/runtime/bin`, which is put in front of `PATH` for the
+child processes only — never in the user's environment. That is deliberate: changing the
+user `PATH` would not reach the process that made the change on Windows or macOS, so the
+app points yt-dlp at a binary it knows the path of instead.
+
+`yt-dlp` is not required for the model. `flacify setup` installs it and `is_ready` ignores
+it, so an install that only plays local files is complete without it and is never sent to
+the setup screen for a 24 MB URL tool.
+
+Choosing `PATH`/a managed copy over a vendored binary is deliberate: `yt-dlp` changes
+weekly to keep up with the sites it reads, so pinning it here would pin the product's
+usefulness with it. `flacify diagnose` prints where `yt-dlp` was found and whether
+`ffmpeg` was.
 
 The decode side stays pure Rust and links no `libmpg123`/`ffmpeg`; a fetched file is an
 ordinary input the moment it lands.

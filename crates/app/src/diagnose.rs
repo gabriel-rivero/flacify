@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 
 use crate::cache::{human_bytes, Cache, Usage, CACHE_VERSION, DEFAULT_CAP_BYTES};
 use crate::device;
+use crate::process;
 use crate::setup::{self, Paths};
 use crate::youtube;
 
@@ -68,6 +69,12 @@ pub fn report_devices(paths: &Paths, devices: Result<device::DeviceList>) -> Str
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "missing (only a URL needs it)".to_string());
     let _ = writeln!(text, "yt-dlp   {ytdlp}");
+    // ffmpeg decides whether a fetch asks for a FLAC transcode or the container as served,
+    // so a bug report about a URL needs it as much as yt-dlp's own path.
+    let ffmpeg = process::find_on_path("ffmpeg")
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "missing (a fetch keeps the source's AAC then)".to_string());
+    let _ = writeln!(text, "ffmpeg   {ffmpeg}");
     let _ = writeln!(
         text,
         "downloads {} bytes",

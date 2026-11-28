@@ -343,11 +343,14 @@ impl Entry {
         );
         anyhow::ensure!(
             decoded.frames == segment.frames,
-            "{} holds {} frames, {} says {}",
+            "{} holds {} frames, {} says {} ({} short). The segment was written from the \
+             decoded source; delete {} to have it rebuilt.",
             path.display(),
             decoded.frames,
             self.manifest().display(),
-            segment.frames
+            segment.frames,
+            segment.frames as i64 - decoded.frames as i64,
+            self.dir.display(),
         );
         Ok(decoded)
     }

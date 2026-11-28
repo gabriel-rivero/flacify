@@ -905,3 +905,46 @@ The session queue (ADR-015) has no end-to-end number here yet. `yt-dlp --flat-pl
 listing time and the first-track download were **not** timed against a real playlist when
 the queue landed, so this file makes no claim about how long a radio mix takes to start.
 A run on the M1, with the playlist source and the date, is the next row.
+
+## A URL with no yt-dlp and no ffmpeg installed (2026-11-28)
+
+The provisioning in ADR-016, measured on the same Windows box as the W-numbers: Ryzen 9
+5900XT, 39 GB, Windows 11, yt-dlp **2026.11.23** installed by the app, `ffmpeg` **absent
+from `PATH`** for every run.
+
+| what | measured |
+|---|---|
+| `flacify setup`, yt-dlp step only | one `curl` of 23 627 865 bytes into `<home>\runtime\bin\yt-dlp.exe`; step reports done |
+| fetch with no ffmpeg, `-f` branch | `aqz-KE-bpKQ.m4a`, 9.8 MB, no postprocessing step, no error |
+| playback of that download, `--smoke` | played; 634.6 s track, source tier built from AAC, no frame-count mismatch |
+| fresh home, no setup run | the old error, naming yt-dlp and how to install it — the message is worth keeping |
+
+The second row is the point: yt-dlp needs ffmpeg only to remux or transcode, so asking it
+for `140` (AAC in MP4) writes the file as served. `symphonia` in this build decodes it —
+`flacify probe` reports 44 100 Hz, 2 ch, 634.62 s.
+
+**Not verified:** the FLAC branch, which needs an ffmpeg on `PATH`; the yt-dlp asset
+names for macOS and Linux (only the Windows name was executed — the others are read from
+the release listing, not run).
+
+### An AAC-backed segment that reads short (open, 2026-11-28)
+
+One specific AAC source — `https://www.youtube.com/watch?v=X_YHXdCcmVc` — fails after the
+fetch with `src-000001.flac holds 1380224 frames, source.json says 1384320`. Findings:
+
+- **Deterministic**, byte-identical across repeated runs, fresh caches included.
+- **Reproduces on the released 1.1.1 binary** with `ffmpeg` absent, so it is not caused by
+  the no-ffmpeg fetch path.
+- **Not the writer or the decoder in isolation**: round-tripping 1 384 320 frames (337
+  full 4096 blocks plus a 3968 tail) through `flac::write` and `decode::decode` returns the
+  exact count (`crates/app/tests/flac.rs`).
+- **Not the source tier in general**: a 48 kHz WAV and a 44.1 kHz WAV of the same duration
+  both build clean, and a different YouTube m4a (634 s) produced 23 uniformly sized
+  segments with no mismatch.
+- The bad segment is **52.9 MB** where 7.9 MB is all 24-bit stereo for its frames, and its
+  `STREAMINFO` records `total_samples = 1384320` — so the header claims the full length
+  and the stream holds roughly a block less of audio plus a great deal more bytes.
+
+Narrowed to "this stream's samples break the FLAC encoder", not yet to the sample values.
+Open, tracked as a follow-up to ADR-016.
+
